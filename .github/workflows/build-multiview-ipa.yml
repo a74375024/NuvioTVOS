@@ -33,7 +33,19 @@ jobs:
         uses: jdx/mise-action@v2
 
       - name: Build unsigned IPA
-        run: bash scripts/build-ipa.sh
+        shell: bash
+        run: |
+          set +e
+          bash scripts/build-ipa.sh 2>&1 | tee build.log
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            # Surface compiler errors as one annotation (readable via the API).
+            errors=$(grep -E "error:|fatal error|Undefined symbol" build.log | sed 's#^.*/Sources/##' | sort -u | head -80)
+            [ -z "$errors" ] && errors=$(tail -60 build.log)
+            encoded=$(printf '%s' "$errors" | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}')
+            echo "::error title=Build errors::${encoded}"
+          fi
+          exit $status
 
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
