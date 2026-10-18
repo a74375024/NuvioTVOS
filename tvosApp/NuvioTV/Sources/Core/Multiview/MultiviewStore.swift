@@ -90,7 +90,11 @@ final class MultiviewTile: ObservableObject, Identifiable {
 
     let channel: MultiviewChannel
     let engine: AetherEngine?
-    var id: String { channel.id }
+    nonisolated var id: String { channel.id }
+
+    /// Explicit rather than inferred from the tag: the grid can promote a
+    /// secondary tile when the primary one is removed (applies on next load).
+    var role: SharedOutputRole = .secondary
 
     @Published private(set) var status: Status = .loading
     @Published private(set) var isAudible = false
@@ -109,14 +113,15 @@ final class MultiviewTile: ObservableObject, Identifiable {
         }
     }
 
-    func start(index: Int) {
+    func start(tag: String, role: SharedOutputRole) {
         guard let engine else { return }
         isStopped = false
-        engine.logTag = "tile\(index + 1)"
+        self.role = role
+        engine.logTag = tag
         // Every tile starts silent; the grid makes the focused one audible.
         engine.volume = isAudible ? 1 : 0
         observe(engine)
-        load(engine: engine, role: index == 0 ? .primary : .secondary)
+        load(engine: engine)
     }
 
     func setAudible(_ audible: Bool) {
@@ -127,7 +132,8 @@ final class MultiviewTile: ObservableObject, Identifiable {
     func retry() {
         guard let engine, !isStopped else { return }
         status = .loading
-        load(engine: engine, role: engine.logTag == "tile1" ? .primary : .secondary)
+        fullReloadAttempts = 0
+        load(engine: engine)
     }
 
     /// Every engine must be stopped before release, or the shared audio
@@ -140,7 +146,8 @@ final class MultiviewTile: ObservableObject, Identifiable {
         engine?.stop()
     }
 
-    private func load(engine: AetherEngine, role: SharedOutputRole) {
+    private func load(engine: AetherEngine) {
+        let role = self.role
         loadTask?.cancel()
         let url = channel.url
         let lowered = url.absoluteString.lowercased()
@@ -187,7 +194,13 @@ final class MultiviewTile: ObservableObject, Identifiable {
                 guard let self, !self.isStopped else { return }
                 switch state {
                 case .error(let message):
-                    self.status = .failed(message)
+                    // Live origins drop often; rejoin a few times before
+                    // showing the error and handing retry to the viewer.
+                    if self.fullReloadAttempts < 3, self.status == .playing {
+                        self.scheduleRecovery()
+                    } else {
+                        self.status = .failed(message)
+                    }
                 case .ended:
                     // A live feed that "ends" has usually dropped; try to rejoin.
                     self.scheduleRecovery()
@@ -221,7 +234,7 @@ final class MultiviewTile: ObservableObject, Identifiable {
             }
             self.fullReloadAttempts += 1
             self.status = .loading
-            self.load(engine: engine, role: engine.logTag == "tile1" ? .primary : .secondary)
+            self.load(engine: engine)
         }
     }
 }

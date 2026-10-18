@@ -7,6 +7,7 @@ import AetherEngine
 final class MultiviewSession: ObservableObject {
     @Published private(set) var tiles: [MultiviewTile] = []
     let wakeLockOwnerID = UUID()
+    private var nextTagNumber = 1
 
     func sync(with channels: [MultiviewChannel]) {
         let wanted = Set(channels.map(\.id))
@@ -19,9 +20,16 @@ final class MultiviewSession: ObservableObject {
                 next.append(existing)
             } else {
                 let tile = MultiviewTile(channel: channel)
-                tile.start(index: next.count)
+                let hasPrimary = next.contains { $0.role == .primary }
+                    || tiles.contains { $0.role == .primary && wanted.contains($0.id) }
+                tile.start(tag: "tile\(nextTagNumber)", role: hasPrimary ? .secondary : .primary)
+                nextTagNumber += 1
                 next.append(tile)
             }
+        }
+        // Keep exactly one primary: promote the first tile if its owner left.
+        if !next.contains(where: { $0.role == .primary }) {
+            next.first?.role = .primary
         }
         tiles = next
     }
