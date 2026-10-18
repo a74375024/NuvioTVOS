@@ -489,6 +489,8 @@ struct ContentView: View {
                 // card (tvOS focus memory) -- instead of rebuilding it from
                 // scratch and snapping back to the first card.
                 appContainer
+                    // Live Multiview grid; opened from the live player controls.
+                    .modifier(MultiviewPresenter())
                     .transition(.opacity)
             }
 

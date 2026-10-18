@@ -628,7 +628,8 @@ extension PlayerView {
                 isNextEpisodeFocused: nextEpisodeFocused || cancelAutoPlayFocused,
                 requestedFocus: $requestedControlFocus,
                 onFocusSkipSegment: { focusSkipSegment() },
-                onFocusNextEpisode: { focusNextEpisode(allowWhenControlsVisible: true) }
+                onFocusNextEpisode: { focusNextEpisode(allowWhenControlsVisible: true) },
+                onOpenMultiview: { openMultiview() }
             )
             .offset(y: viewModel.showScenePanel ? -160 : 0)
             .opacity(

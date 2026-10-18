@@ -6675,3 +6675,29 @@ private enum PlayerTrackSelectionStore {
         ProfileSettings.current.set(json, forKey: SettingsKey.playbackTrackSelections)
     }
 }
+
+// MARK: - Multiview
+
+extension PlayerViewModel {
+    /// Whether the in-player Multiview button applies: live streams only.
+    var canAddToMultiview: Bool {
+        isLiveStream && multiviewChannel != nil
+    }
+
+    /// The stream on screen right now, captured for a Multiview tile. Uses the
+    /// active URL and headers so a mid-session source switch is respected.
+    var multiviewChannel: MultiviewChannel? {
+        guard let meta = activeMeta,
+              let urlString = activeStreamURL,
+              let url = URL(string: urlString) else { return nil }
+        let artwork = (meta.posterUrl ?? meta.backgroundUrl).flatMap(URL.init(string:))
+        return MultiviewChannel(
+            id: urlString,
+            title: meta.name,
+            subtitle: meta.description?.split(separator: "\n").first.map(String.init),
+            url: url,
+            httpHeaders: activeHTTPHeaders,
+            artworkURL: artwork
+        )
+    }
+}

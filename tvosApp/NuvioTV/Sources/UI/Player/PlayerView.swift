@@ -148,3 +148,18 @@ struct PlayerView: View {
         }
     }
 }
+
+// MARK: - Multiview
+
+extension PlayerView {
+    /// Hands the current live stream to Multiview: the full-screen player
+    /// closes first (stopping its engine), then the grid opens with this
+    /// channel added beside any already there.
+    func openMultiview() {
+        guard let channel = viewModel.multiviewChannel else { return }
+        let store = MultiviewStore.shared
+        store.add(channel)
+        onBack()
+        store.presentAfterPlayerTeardown()
+    }
+}

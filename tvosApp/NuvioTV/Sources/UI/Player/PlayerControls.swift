@@ -8,6 +8,7 @@ enum PlayerControlFocus: Hashable {
     case sources
     case subtitles
     case audio
+    case multiview
     case settings
     case timeline
 }
@@ -19,6 +20,7 @@ struct PlayerControls: View {
     @Binding var requestedFocus: PlayerControlFocus?
     var onFocusSkipSegment: () -> Void = {}
     var onFocusNextEpisode: () -> Void = {}
+    var onOpenMultiview: () -> Void = {}
 
     @FocusState private var focusedControl: PlayerControlFocus?
 
@@ -224,6 +226,7 @@ struct PlayerControls: View {
         if viewModel.canShowSourcesPanel && playerShowSources { order.append(.sources) }
         if canShowSubtitlePicker && playerShowSubtitles { order.append(.subtitles) }
         if canShowAudioPicker && playerShowAudio { order.append(.audio) }
+        if viewModel.canAddToMultiview { order.append(.multiview) }
         order.append(.settings)
         return order
     }
@@ -477,6 +480,21 @@ struct PlayerControls: View {
                 .onMoveCommand { direction in
                     handleMove(direction, from: .audio)
                 }
+            }
+
+            if viewModel.canAddToMultiview {
+                glassIconButton(
+                    size: 70,
+                    iconSize: 28,
+                    focusKey: .multiview,
+                    isFocused: focusedControl == .multiview
+                ) {
+                    onOpenMultiview()
+                } icon: {
+                    Image(systemName: "rectangle.split.2x2")
+                }
+                .id("multiview_button")
+                .accessibilityLabel(Text(L10n.string("multiview_player_button", fallback: "Multiview")))
             }
 
             glassIconButton(

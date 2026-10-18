@@ -1,0 +1,56 @@
+name: Build Multiview IPA
+
+# Builds an unsigned tvOS .ipa from this fork so it can be sideloaded
+# (Feather, Sideloadly, etc. re-sign it on install).
+on:
+  workflow_dispatch:
+  push:
+    branches: [multiview]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-multiview-ipa
+  cancel-in-progress: true
+
+jobs:
+  build:
+    # Same GitHub-hosted Xcode 27 image the upstream test workflow uses.
+    runs-on: xcode-27
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          xcrun --sdk appletvos --show-sdk-version
+
+      - name: Install pinned Tuist
+        uses: jdx/mise-action@v2
+
+      - name: Build unsigned IPA
+        run: bash scripts/build-ipa.sh
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: NuvioTV-multiview-ipa
+          path: build-ipa/NuvioTV-unsigned.ipa
+          if-no-files-found: error
+
+      - name: Publish to the multiview-latest pre-release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: multiview-latest
+          name: Multiview build (${{ github.sha }})
+          prerelease: true
+          make_latest: false
+          target_commitish: ${{ github.sha }}
+          body: |
+            Unsigned tvOS build of the `multiview` branch, commit ${{ github.sha }}.
+            Install with your sideloading tool; it re-signs the app on install.
+          files: build-ipa/NuvioTV-unsigned.ipa
