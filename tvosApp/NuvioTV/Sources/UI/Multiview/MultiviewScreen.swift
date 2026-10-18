@@ -262,7 +262,7 @@ private struct MultiviewTileView: View {
             Color.black
 
             if let engine = tile.engine {
-                AetherPlayerSurface(engine: engine)
+                MultiviewEngineSurface(engine: engine)
             }
 
             statusOverlay
@@ -373,4 +373,18 @@ private struct MultiviewAddSlotView: View {
         .scaleEffect(isFocused ? 1.03 : 1)
         .animation(.easeOut(duration: 0.18), value: isFocused)
     }
+}
+
+/// Binds a tile's engine to its own layer host. (The app's `AetherPlayerSurface`
+/// wraps the full-screen controller and shadows the engine's view of that name.)
+private struct MultiviewEngineSurface: UIViewRepresentable {
+    let engine: AetherEngine
+
+    func makeUIView(context: Context) -> AetherPlayerView {
+        let view = AetherPlayerView()
+        engine.bind(view: view)
+        return view
+    }
+
+    func updateUIView(_ uiView: AetherPlayerView, context: Context) {}
 }
