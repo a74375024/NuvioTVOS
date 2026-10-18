@@ -72,35 +72,60 @@ struct MultiviewScreen: View {
 
     private static let addSlotID = "multiview.add"
     private static let chromeIdleSeconds: Double = 4
+    /// Tiles narrower than this use the compact label and add-slot styling.
+    private static let compactWidth: CGFloat = 700
+
+    private var isSpotlight: Bool { store.layout == .spotlight }
+
+    /// The tile in the large spotlight slot: the stored pick, else the first.
+    private var spotlightTileID: String? {
+        if let id = store.spotlightID, session.tiles.contains(where: { $0.id == id }) {
+            return id
+        }
+        return session.tiles.first?.id
+    }
 
     var body: some View {
         GeometryReader { proxy in
-            let frames = slotFrames(in: proxy.size)
+            let layout = computeLayout(in: proxy.size)
             ZStack(alignment: .topLeading) {
                 Color.black.ignoresSafeArea()
 
-                ForEach(Array(session.tiles.enumerated()), id: \.element.id) { index, tile in
+                ForEach(session.tiles) { tile in
                     let isExpanded = expandedID == tile.id
                     let isHidden = expandedID != nil && !isExpanded
                     let frame = isExpanded
                         ? CGRect(origin: .zero, size: proxy.size)
-                        : (index < frames.count ? frames[index] : .zero)
-                    tileButton(tile, isExpanded: isExpanded)
-                        .frame(width: frame.width, height: frame.height)
-                        .position(x: frame.midX, y: frame.midY)
-                        .opacity(isHidden ? 0 : 1)
-                        .disabled(isHidden)
-                        .zIndex(isExpanded ? 2 : 1)
+                        : (layout.tiles[tile.id] ?? .zero)
+                    tileButton(
+                        tile,
+                        isExpanded: isExpanded,
+                        isCompact: !isExpanded && frame.width < Self.compactWidth
+                    )
+                    .frame(width: frame.width, height: frame.height)
+                    .position(x: frame.midX, y: frame.midY)
+                    .opacity(isHidden ? 0 : 1)
+                    .disabled(isHidden)
+                    .zIndex(isExpanded ? 2 : 1)
                 }
 
-                if expandedID == nil, session.tiles.count < MultiviewStore.maxTiles,
-                   let frame = frames.last, frames.count > session.tiles.count {
-                    addSlot
+                if expandedID == nil, let frame = layout.addSlot {
+                    addSlot(isCompact: frame.width < Self.compactWidth)
                         .frame(width: frame.width, height: frame.height)
                         .position(x: frame.midX, y: frame.midY)
                 }
+
+                if expandedID == nil, showsChrome, session.tiles.count > 1 {
+                    layoutHint
+                        .frame(width: proxy.size.width)
+                        .position(x: proxy.size.width / 2, y: proxy.size.height - 34)
+                        .transition(.opacity)
+                        .zIndex(3)
+                }
             }
-            .animation(.easeInOut(duration: 0.25), value: expandedID)
+            .animation(.easeInOut(duration: 0.3), value: expandedID)
+            .animation(.easeInOut(duration: 0.3), value: store.layout)
+            .animation(.easeInOut(duration: 0.3), value: store.spotlightID)
             .animation(.easeInOut(duration: 0.25), value: session.tiles.map(\.id))
         }
         .ignoresSafeArea()
@@ -108,9 +133,8 @@ struct MultiviewScreen: View {
         .onAppear {
             PlaybackWakeLock.acquire(ownerID: session.wakeLockOwnerID)
             session.sync(with: store.channels)
-            let first = session.tiles.first?.id
-            audibleID = first
-            session.setAudible(id: first)
+            let first = isSpotlight ? spotlightTileID : session.tiles.first?.id
+            makeAudible(first)
             DispatchQueue.main.async { focusedSlot = first ?? Self.addSlotID }
             revealChrome()
         }
@@ -125,22 +149,28 @@ struct MultiviewScreen: View {
                 self.expandedID = nil
             }
             if let audibleID, !channels.contains(where: { $0.id == audibleID }) {
-                makeAudible(channels.first?.id)
-                DispatchQueue.main.async { focusedSlot = channels.first?.id ?? Self.addSlotID }
+                let next = isSpotlight ? spotlightTileID : channels.first?.id
+                makeAudible(next)
+                DispatchQueue.main.async { focusedSlot = next ?? Self.addSlotID }
             }
         }
         .onChange(of: focusedSlot) { _, slot in
             revealChrome()
-            // Sound follows focus; the add slot keeps whatever was playing.
-            guard let slot, slot != Self.addSlotID else { return }
+            // Grid: sound follows focus. Spotlight: sound stays with the big
+            // tile while you glance around. The add slot never takes sound.
+            guard !isSpotlight, let slot, slot != Self.addSlotID else { return }
             makeAudible(slot)
         }
         .onPlayPauseCommand {
             revealChrome()
+            guard expandedID == nil, !session.tiles.isEmpty else { return }
+            toggleLayout()
         }
         .onExitCommand {
             revealChrome()
             if let expandedID {
+                // Whatever you were watching full screen becomes the main game.
+                if isSpotlight { store.spotlightID = expandedID }
                 self.expandedID = nil
                 DispatchQueue.main.async { focusedSlot = expandedID }
             } else {
@@ -151,12 +181,17 @@ struct MultiviewScreen: View {
 
     // MARK: - Tiles
 
-    private func tileButton(_ tile: MultiviewTile, isExpanded: Bool) -> some View {
-        Button {
+    private func tileButton(_ tile: MultiviewTile, isExpanded: Bool, isCompact: Bool) -> some View {
+        let isMain = isSpotlight && tile.id == spotlightTileID
+        return Button {
             revealChrome()
             if case .failed = tile.status {
                 tile.retry()
-            } else if !isExpanded {
+            } else if isExpanded {
+                return
+            } else if isSpotlight && !isMain {
+                promote(tile.id)
+            } else {
                 expandedID = tile.id
                 makeAudible(tile.id)
             }
@@ -165,6 +200,7 @@ struct MultiviewScreen: View {
                 tile: tile,
                 isFocused: focusedSlot == tile.id && !isExpanded,
                 isExpanded: isExpanded,
+                isCompact: isCompact,
                 showsChrome: showsChrome
             )
         }
@@ -180,11 +216,27 @@ struct MultiviewScreen: View {
         }
         .contextMenu {
             if !isExpanded {
+                if isSpotlight && !isMain {
+                    Button {
+                        promote(tile.id)
+                    } label: {
+                        Label(L10n.string("multiview_make_main", fallback: "Make Main Game"), systemImage: "star")
+                    }
+                }
                 Button {
                     expandedID = tile.id
                     makeAudible(tile.id)
                 } label: {
                     Label(L10n.string("multiview_full_screen", fallback: "Full Screen"), systemImage: "arrow.up.left.and.arrow.down.right")
+                }
+                Button {
+                    toggleLayout()
+                } label: {
+                    if isSpotlight {
+                        Label(L10n.string("multiview_grid_view", fallback: "Grid View"), systemImage: "square.grid.2x2")
+                    } else {
+                        Label(L10n.string("multiview_spotlight_view", fallback: "Spotlight View"), systemImage: "rectangle.leadinghalf.inset.filled")
+                    }
                 }
             }
             Button(role: .destructive) {
@@ -195,11 +247,11 @@ struct MultiviewScreen: View {
         }
     }
 
-    private var addSlot: some View {
+    private func addSlot(isCompact: Bool) -> some View {
         Button {
             store.dismiss()
         } label: {
-            MultiviewAddSlotView(isFocused: focusedSlot == Self.addSlotID)
+            MultiviewAddSlotView(isFocused: focusedSlot == Self.addSlotID, isCompact: isCompact)
         }
         .buttonStyle(PosterCardButtonStyle())
         .focused($focusedSlot, equals: Self.addSlotID)
@@ -213,6 +265,23 @@ struct MultiviewScreen: View {
         }
     }
 
+    /// A small reminder of what Play/Pause does; fades with the tile labels.
+    private var layoutHint: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "playpause.fill")
+            Text(isSpotlight
+                 ? L10n.string("multiview_hint_grid", fallback: "Grid view")
+                 : L10n.string("multiview_hint_spotlight", fallback: "Spotlight view"))
+        }
+        .font(.system(size: 20, weight: .semibold))
+        .foregroundColor(.white)
+        .padding(.horizontal, 18)
+        .padding(.vertical, 8)
+        .background(Capsule().fill(Color.black.opacity(0.6)))
+    }
+
+    // MARK: - Actions
+
     private func revealChrome() {
         if !showsChrome {
             withAnimation(.easeOut(duration: 0.2)) { showsChrome = true }
@@ -223,6 +292,30 @@ struct MultiviewScreen: View {
             guard !Task.isCancelled else { return }
             withAnimation(.easeInOut(duration: 0.6)) { showsChrome = false }
         }
+    }
+
+    private func toggleLayout() {
+        if isSpotlight {
+            // Back to the grid; sound and focus stay on the main game.
+            store.layout = .grid
+            let main = audibleID
+            DispatchQueue.main.async { focusedSlot = main ?? session.tiles.first?.id }
+        } else {
+            // The game you're listening to becomes the main one.
+            store.spotlightID = audibleID ?? session.tiles.first?.id
+            store.layout = .spotlight
+            let main = spotlightTileID
+            makeAudible(main)
+            DispatchQueue.main.async { focusedSlot = main }
+        }
+    }
+
+    /// Swaps a small tile into the spotlight. Only the sizes change, so no
+    /// tile reloads; sound moves with the new main game.
+    private func promote(_ id: String) {
+        store.spotlightID = id
+        makeAudible(id)
+        DispatchQueue.main.async { focusedSlot = id }
     }
 
     private func makeAudible(_ id: String?) {
@@ -250,10 +343,71 @@ struct MultiviewScreen: View {
 
     // MARK: - Layout
 
-    /// Slots include the trailing "add" slot while there is room for a tile.
-    private func slotFrames(in size: CGSize) -> [CGRect] {
-        let tileCount = session.tiles.count
-        let slots = min(tileCount + 1, MultiviewStore.maxTiles)
+    private struct LayoutFrames {
+        var tiles: [String: CGRect] = [:]
+        var addSlot: CGRect?
+    }
+
+    private func computeLayout(in size: CGSize) -> LayoutFrames {
+        let hasAddSlot = session.tiles.count < MultiviewStore.maxTiles
+        if isSpotlight, let mainID = spotlightTileID {
+            let others = session.tiles.map(\.id).filter { $0 != mainID }
+            return spotlightFrames(in: size, mainID: mainID, others: others, hasAddSlot: hasAddSlot)
+        }
+        let ids = session.tiles.map(\.id)
+        let slots = gridSlots(in: size, count: min(ids.count + (hasAddSlot ? 1 : 0), MultiviewStore.maxTiles))
+        var frames = LayoutFrames()
+        for (index, id) in ids.enumerated() where index < slots.count {
+            frames.tiles[id] = slots[index]
+        }
+        if hasAddSlot, slots.count > ids.count {
+            frames.addSlot = slots.last
+        }
+        return frames
+    }
+
+    /// One large 16:9 tile on the left; up to three small ones stacked on the
+    /// right, sized so the stack of three is exactly as tall as the big tile.
+    private func spotlightFrames(in size: CGSize, mainID: String, others: [String], hasAddSlot: Bool) -> LayoutFrames {
+        let gap: CGFloat = 28
+        let columnSlots: CGFloat = 3
+        // Solve bigWidth + smallWidth + 3 gaps == width, with
+        // 3 * smallHeight + 2 gaps == bigHeight, all 16:9.
+        var bigWidth = (size.width - 3 * gap + (columnSlots - 1) * gap * 16 / 9 / columnSlots)
+            / (1 + 1 / columnSlots)
+        var bigHeight = bigWidth * 9 / 16
+        if bigHeight > size.height - 2 * gap {
+            bigHeight = size.height - 2 * gap
+            bigWidth = bigHeight * 16 / 9
+        }
+        let smallHeight = (bigHeight - (columnSlots - 1) * gap) / columnSlots
+        let smallWidth = smallHeight * 16 / 9
+        let totalWidth = bigWidth + gap + smallWidth
+        let originX = (size.width - totalWidth) / 2
+        let originY = (size.height - bigHeight) / 2
+
+        var frames = LayoutFrames()
+        frames.tiles[mainID] = CGRect(x: originX, y: originY, width: bigWidth, height: bigHeight)
+        let columnX = originX + bigWidth + gap
+        func slot(_ index: Int) -> CGRect {
+            CGRect(
+                x: columnX,
+                y: originY + CGFloat(index) * (smallHeight + gap),
+                width: smallWidth,
+                height: smallHeight
+            )
+        }
+        for (index, id) in others.enumerated() {
+            frames.tiles[id] = slot(index)
+        }
+        if hasAddSlot, others.count < Int(columnSlots) {
+            frames.addSlot = slot(others.count)
+        }
+        return frames
+    }
+
+    /// Even grid: two side by side, or 2x2 for three or four slots.
+    private func gridSlots(in size: CGSize, count slots: Int) -> [CGRect] {
         let gap: CGFloat = 28
         let aspect: CGFloat = 16.0 / 9.0
 
@@ -293,6 +447,7 @@ private struct MultiviewTileView: View {
     @ObservedObject var tile: MultiviewTile
     let isFocused: Bool
     let isExpanded: Bool
+    var isCompact: Bool = false
     let showsChrome: Bool
 
     var body: some View {
@@ -341,30 +496,30 @@ private struct MultiviewTileView: View {
         case .failed(let message):
             VStack(spacing: 10) {
                 Image(systemName: "exclamationmark.triangle.fill")
-                    .font(.system(size: 40))
+                    .font(.system(size: isCompact ? 28 : 40))
                 Text(message)
-                    .font(.system(size: 22, weight: .medium))
+                    .font(.system(size: isCompact ? 17 : 22, weight: .medium))
                     .multilineTextAlignment(.center)
-                    .lineLimit(3)
+                    .lineLimit(isCompact ? 2 : 3)
                 Text(L10n.string("multiview_select_to_retry", fallback: "Press Select to retry"))
-                    .font(.system(size: 20))
+                    .font(.system(size: isCompact ? 16 : 20))
                     .foregroundColor(.white.opacity(0.7))
             }
             .foregroundColor(.white)
-            .padding(24)
+            .padding(isCompact ? 12 : 24)
         }
     }
 
     private var label: some View {
-        HStack(spacing: 12) {
+        HStack(spacing: isCompact ? 8 : 12) {
             Image(systemName: tile.isAudible ? "speaker.wave.2.fill" : "speaker.slash.fill")
-                .font(.system(size: 22, weight: .semibold))
+                .font(.system(size: isCompact ? 16 : 22, weight: .semibold))
                 .foregroundColor(tile.isAudible ? .white : .white.opacity(0.55))
             VStack(alignment: .leading, spacing: 2) {
                 Text(tile.channel.title)
-                    .font(.system(size: 26, weight: .semibold))
+                    .font(.system(size: isCompact ? 18 : 26, weight: .semibold))
                     .lineLimit(1)
-                if let subtitle = tile.channel.subtitle, !subtitle.isEmpty {
+                if !isCompact, let subtitle = tile.channel.subtitle, !subtitle.isEmpty {
                     Text(subtitle)
                         .font(.system(size: 20))
                         .foregroundColor(.white.opacity(0.7))
@@ -374,8 +529,8 @@ private struct MultiviewTileView: View {
             Spacer(minLength: 0)
         }
         .foregroundColor(.white)
-        .padding(.horizontal, 22)
-        .padding(.vertical, 16)
+        .padding(.horizontal, isCompact ? 12 : 22)
+        .padding(.vertical, isCompact ? 8 : 16)
         .background(
             LinearGradient(
                 colors: [.clear, .black.opacity(0.75)],
@@ -388,21 +543,24 @@ private struct MultiviewTileView: View {
 
 private struct MultiviewAddSlotView: View {
     let isFocused: Bool
+    var isCompact: Bool = false
 
     var body: some View {
-        VStack(spacing: 16) {
+        VStack(spacing: isCompact ? 8 : 16) {
             Image(systemName: "plus.rectangle.on.rectangle")
-                .font(.system(size: 54, weight: .regular))
+                .font(.system(size: isCompact ? 32 : 54, weight: .regular))
             Text(L10n.string("multiview_add_title", fallback: "Add a Channel"))
-                .font(.system(size: 30, weight: .semibold))
-            Text(L10n.string(
+                .font(.system(size: isCompact ? 20 : 30, weight: .semibold))
+            if !isCompact {
+                Text(L10n.string(
                 "multiview_add_hint",
                 fallback: "Open another live channel, then choose Multiview in the player controls."
             ))
-            .font(.system(size: 22))
-            .foregroundColor(.white.opacity(0.7))
-            .multilineTextAlignment(.center)
-            .padding(.horizontal, 40)
+                .font(.system(size: 22))
+                .foregroundColor(.white.opacity(0.7))
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 40)
+            }
         }
         .foregroundColor(.white)
         .frame(maxWidth: .infinity, maxHeight: .infinity)

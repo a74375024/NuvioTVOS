@@ -16,6 +16,13 @@ struct MultiviewChannel: Identifiable, Equatable {
     let artworkURL: URL?
 }
 
+/// How the grid arranges its tiles. Spotlight gives one game most of the
+/// screen with the rest stacked beside it.
+enum MultiviewLayout: Equatable {
+    case grid
+    case spotlight
+}
+
 /// Session-scoped list of Multiview channels plus the presentation flag the
 /// root view binds its full-screen cover to. Nothing is persisted: live links
 /// usually expire, so a stale grid after relaunch would only show errors.
@@ -29,6 +36,10 @@ final class MultiviewStore: ObservableObject {
 
     @Published private(set) var channels: [MultiviewChannel] = []
     @Published var isPresented = false
+    /// Remembered across visits so adding a channel keeps the chosen layout.
+    @Published var layout: MultiviewLayout = .grid
+    /// The channel in the large spotlight tile; nil means the first tile.
+    @Published var spotlightID: String?
 
     private var presentTask: Task<Void, Never>?
 
@@ -50,6 +61,7 @@ final class MultiviewStore: ObservableObject {
 
     func remove(id: String) {
         channels.removeAll { $0.id == id }
+        if spotlightID == id { spotlightID = nil }
         if channels.isEmpty {
             isPresented = false
         }
@@ -57,6 +69,7 @@ final class MultiviewStore: ObservableObject {
 
     func clear() {
         channels.removeAll()
+        spotlightID = nil
         isPresented = false
     }
 
