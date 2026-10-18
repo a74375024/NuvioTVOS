@@ -64,8 +64,14 @@ struct MultiviewScreen: View {
     @FocusState private var focusedSlot: String?
     @State private var expandedID: String?
     @State private var audibleID: String?
+    /// Titles, speaker badges and the focus ring fade out after a few idle
+    /// seconds so they never cover a score bug or clock; any remote input
+    /// brings them back.
+    @State private var showsChrome = true
+    @State private var chromeHideTask: Task<Void, Never>?
 
     private static let addSlotID = "multiview.add"
+    private static let chromeIdleSeconds: Double = 4
 
     var body: some View {
         GeometryReader { proxy in
@@ -106,8 +112,10 @@ struct MultiviewScreen: View {
             audibleID = first
             session.setAudible(id: first)
             DispatchQueue.main.async { focusedSlot = first ?? Self.addSlotID }
+            revealChrome()
         }
         .onDisappear {
+            chromeHideTask?.cancel()
             session.stopAll()
             PlaybackWakeLock.release(ownerID: session.wakeLockOwnerID)
         }
@@ -122,11 +130,16 @@ struct MultiviewScreen: View {
             }
         }
         .onChange(of: focusedSlot) { _, slot in
+            revealChrome()
             // Sound follows focus; the add slot keeps whatever was playing.
             guard let slot, slot != Self.addSlotID else { return }
             makeAudible(slot)
         }
+        .onPlayPauseCommand {
+            revealChrome()
+        }
         .onExitCommand {
+            revealChrome()
             if let expandedID {
                 self.expandedID = nil
                 DispatchQueue.main.async { focusedSlot = expandedID }
@@ -140,6 +153,7 @@ struct MultiviewScreen: View {
 
     private func tileButton(_ tile: MultiviewTile, isExpanded: Bool) -> some View {
         Button {
+            revealChrome()
             if case .failed = tile.status {
                 tile.retry()
             } else if !isExpanded {
@@ -150,13 +164,17 @@ struct MultiviewScreen: View {
             MultiviewTileView(
                 tile: tile,
                 isFocused: focusedSlot == tile.id && !isExpanded,
-                isExpanded: isExpanded
+                isExpanded: isExpanded,
+                showsChrome: showsChrome
             )
         }
         .buttonStyle(PosterCardButtonStyle())
         .focused($focusedSlot, equals: tile.id)
         .focusEffectDisabledIfAvailable()
         .onMoveCommand { direction in
+            // Fires on every press, including toward an edge with nothing
+            // there, so the labels come back even when focus can't move.
+            revealChrome()
             guard isExpanded else { return }
             cycleExpanded(direction)
         }
@@ -192,6 +210,18 @@ struct MultiviewScreen: View {
             } label: {
                 Label(L10n.string("multiview_clear", fallback: "Clear Multiview"), systemImage: "trash")
             }
+        }
+    }
+
+    private func revealChrome() {
+        if !showsChrome {
+            withAnimation(.easeOut(duration: 0.2)) { showsChrome = true }
+        }
+        chromeHideTask?.cancel()
+        chromeHideTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: UInt64(Self.chromeIdleSeconds * 1_000_000_000))
+            guard !Task.isCancelled else { return }
+            withAnimation(.easeInOut(duration: 0.6)) { showsChrome = false }
         }
     }
 
@@ -263,9 +293,13 @@ private struct MultiviewTileView: View {
     @ObservedObject var tile: MultiviewTile
     let isFocused: Bool
     let isExpanded: Bool
+    let showsChrome: Bool
 
     var body: some View {
         let corner: CGFloat = isExpanded ? 0 : 18
+        // Idle: no title bar, no lift, and only a hairline marking the focused
+        // tile so it can't hide on-screen graphics.
+        let ringWidth: CGFloat = isFocused ? (showsChrome ? 6 : 2) : 0
         ZStack {
             Color.black
 
@@ -275,21 +309,23 @@ private struct MultiviewTileView: View {
 
             statusOverlay
 
-            if !isExpanded || isFocused {
+            if showsChrome {
                 VStack {
                     Spacer()
                     label
                 }
+                .transition(.opacity)
             }
         }
         .clipShape(RoundedRectangle(cornerRadius: corner, style: .continuous))
         .overlay {
             RoundedRectangle(cornerRadius: corner, style: .continuous)
-                .strokeBorder(Color.white, lineWidth: isFocused ? 6 : 0)
+                .strokeBorder(Color.white.opacity(showsChrome ? 1 : 0.55), lineWidth: ringWidth)
         }
-        .scaleEffect(isFocused ? 1.03 : 1)
-        .shadow(color: .black.opacity(isFocused ? 0.6 : 0), radius: 24, y: 10)
+        .scaleEffect(isFocused && showsChrome ? 1.03 : 1)
+        .shadow(color: .black.opacity(isFocused && showsChrome ? 0.6 : 0), radius: 24, y: 10)
         .animation(.easeOut(duration: 0.18), value: isFocused)
+        .animation(.easeInOut(duration: 0.4), value: showsChrome)
     }
 
     @ViewBuilder
