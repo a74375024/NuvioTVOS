@@ -88,7 +88,7 @@ struct SceneActorCard: View {
             }
             .padding(.vertical, 16)
             .padding(.horizontal, 12)
-            .frame(width: 184, height: 236)
+            .frame(width: 184, height: 256)
             .modifier(TvDetailsGlassBackground(filled: isCardFocused, shape: RoundedRectangle(cornerRadius: 32, style: .continuous)))
             .shadow(color: Color.black.opacity(isCardFocused ? 0.22 : 0.25), radius: isCardFocused ? 10 : 6, y: isCardFocused ? 5 : 3)
         }

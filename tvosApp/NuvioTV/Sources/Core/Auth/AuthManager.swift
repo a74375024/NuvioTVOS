@@ -8,11 +8,15 @@
 //
 
 import SwiftUI
+import Combine
 import UIKit
 import Security
 
 @MainActor
 final class AuthManager: ObservableObject {
+    /// Synchronous boundary for transient, account-bound consumers. Emit before replacing
+    /// credentials or backend storage; a queued SwiftUI auth-state observer is too late.
+    let contextWillChange = PassthroughSubject<Void, Never>()
     private struct AuthOperation: Equatable {
         let generation: Int
         let backendIdentity: String
@@ -36,7 +40,11 @@ final class AuthManager: ObservableObject {
     /// this flag it stops *silently*: every request answers "JWT expired", the
     /// pull never applies anything, and Home renders an account that looks empty
     /// rather than one that needs signing in again.
-    @Published private(set) var sessionNeedsReauthentication = false
+    @Published private(set) var sessionNeedsReauthentication = false {
+        willSet {
+            if newValue && !sessionNeedsReauthentication { contextWillChange.send(()) }
+        }
+    }
 
     // QR login UI state.
     @Published var qrImage: UIImage?
@@ -248,6 +256,7 @@ final class AuthManager: ObservableObject {
 
     private func apply(session: AuthSession) {
         guard isSession(session, for: currentAuthOperation()) else { return }
+        if currentSession?.userId != session.userId { contextWillChange.send(()) }
         currentSession = session
         // A working session, however it was obtained, retires the warning.
         sessionNeedsReauthentication = false
@@ -274,6 +283,7 @@ final class AuthManager: ObservableObject {
     }
 
     func signOut() {
+        contextWillChange.send(())
         let operation = beginAuthOperation()
         let service = makeService()
         pollTask?.cancel()
@@ -327,6 +337,7 @@ final class AuthManager: ObservableObject {
 
     @discardableResult
     func activateCustomConfiguration(_ configuration: ServerConfiguration) -> Bool {
+        contextWillChange.send(())
         invalidateAuthOperations()
         clearQrState()
         discoveredServer = nil
@@ -344,6 +355,7 @@ final class AuthManager: ObservableObject {
     }
 
     func useOfficialServer() {
+        contextWillChange.send(())
         invalidateAuthOperations()
         clearQrState()
         currentSession = nil

@@ -133,7 +133,9 @@ struct MasterFallbackPositionTests {
             .appendingPathComponent("Sources/AetherEngine/AetherEngine.swift")
         let text = try #require(try? String(contentsOf: source, encoding: .utf8))
         let fn = try #require(text.range(of: "func fallBackToMediaPlaylist("))
-        let body = String(text[fn.lowerBound...].prefix(4000))
+        // 7.42 adds scrub-preview shutdown and display-fallback telemetry to this method; keep the
+        // source check wide enough to include the fallback call near its end.
+        let body = String(text[fn.lowerBound...].prefix(6000))
         #expect(body.contains("host.mountedStartPosition"))
     }
 }

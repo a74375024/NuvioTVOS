@@ -33,4 +33,43 @@ struct FrameDecodeContextClampTests {
         // Rounding can put the last-frame request a hair past the reported duration; that must not clamp.
         #expect(FrameDecodeContext.clampSeekSeconds(requested: 76.7, duration: 76.64) == 76.7)
     }
+
+    @Test("elapsed preview targets map onto the raw presentation timeline and back")
+    func elapsedPreviewTimelineMapping() throws {
+        let origin = FrameDecodeContext.previewPresentationOrigin(
+            formatStartTime: 600_000_000, streamStartSeconds: 590)
+        #expect(origin == 600)
+        let mapping = try #require(FrameDecodeContext.elapsedPreviewSeek(
+            requested: 650, duration: 1_000, origin: origin))
+        #expect(mapping.elapsedSeconds == 650)
+        #expect(mapping.rawSeekSeconds == 1_250)
+        #expect(FrameDecodeContext.elapsedPreviewTime(rawSeconds: 1_250, origin: origin) == 650)
+
+        let clamped = try #require(FrameDecodeContext.elapsedPreviewSeek(
+            requested: 611.25, duration: 76, origin: origin))
+        #expect(clamped.elapsedSeconds == 75)
+        #expect(clamped.rawSeekSeconds == 675)
+    }
+
+    @Test("elapsed preview origin falls back safely and rejects non-finite mappings")
+    func elapsedPreviewOriginAndNonFiniteInputs() {
+        #expect(FrameDecodeContext.previewPresentationOrigin(
+            formatStartTime: Int64.min, streamStartSeconds: -12.5) == -12.5)
+        #expect(FrameDecodeContext.previewPresentationOrigin(
+            formatStartTime: Int64.min, streamStartSeconds: nil) == 0)
+        #expect(FrameDecodeContext.previewPresentationOrigin(
+            formatStartTime: Int64.min, streamStartSeconds: .infinity) == 0)
+        #expect(FrameDecodeContext.previewPresentationOrigin(
+            formatStartTime: -1_500_000, streamStartSeconds: 60) == -1.5)
+
+        #expect(FrameDecodeContext.elapsedPreviewSeek(
+            requested: .nan, duration: 1_000, origin: 0) == nil)
+        #expect(FrameDecodeContext.elapsedPreviewSeek(
+            requested: 1, duration: 1_000, origin: .infinity) == nil)
+        #expect(FrameDecodeContext.elapsedPreviewSeek(
+            requested: Double.greatestFiniteMagnitude,
+            duration: 0,
+            origin: Double.greatestFiniteMagnitude) == nil)
+        #expect(FrameDecodeContext.elapsedPreviewTime(rawSeconds: .nan, origin: 0) == nil)
+    }
 }

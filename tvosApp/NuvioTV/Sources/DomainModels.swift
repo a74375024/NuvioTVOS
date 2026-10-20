@@ -542,8 +542,14 @@ typealias ProfileType = ProfileTypeStub
 
 @MainActor
 public class ProfileViewModel: ObservableObject {
+    /// Account-bound transient work must stop before settings/watch stores change scope.
+    /// Same-profile metadata refreshes deliberately do not cross this boundary.
+    public let contextWillChange = PassthroughSubject<Void, Never>()
     @Published public var profiles: [Profile] = []
     @Published public var activeProfile: Profile? {
+        willSet {
+            if newValue?.id != activeProfile?.id { contextWillChange.send(()) }
+        }
         didSet {
             if let id = activeProfile?.id {
                 lastActiveProfileId = id
@@ -729,10 +735,17 @@ public class ProfileViewModel: ObservableObject {
         }
     }
 
+    private func prepareProfileContextChange(to id: String?) {
+        if activeProfile?.id != id || ProfileSettings.activeProfileID != id {
+            contextWillChange.send(())
+        }
+    }
+
     public func loadActiveProfile() {
         guard let manager = profileManager else {
             let profile = profiles.first
             // Scope watch history and settings to this profile before the UI reads them.
+            prepareProfileContextChange(to: profile?.id)
             ProfileSettings.setActiveProfile(profile?.id, isPrimary: profile?.isAdmin)
             ContinueWatchingStore.setActiveProfile(profile?.id)
             LibraryStore.setActiveProfile(profile?.id)
@@ -747,6 +760,7 @@ public class ProfileViewModel: ObservableObject {
         do {
             let profile = try manager.getActiveProfile()
             // Scope watch history and settings to this profile before the UI reads them.
+            prepareProfileContextChange(to: profile?.id)
             ProfileSettings.setActiveProfile(profile?.id, isPrimary: profile?.isAdmin)
             ContinueWatchingStore.setActiveProfile(profile?.id)
             LibraryStore.setActiveProfile(profile?.id)
@@ -1006,6 +1020,7 @@ public class ProfileViewModel: ObservableObject {
             remoteProfiles.first(where: { $0.id == preferredId })
         } ?? remoteProfiles.first
 
+        prepareProfileContextChange(to: profile?.id)
         ProfileSettings.setActiveProfile(profile?.id, isPrimary: profile?.isAdmin)
         ContinueWatchingStore.setActiveProfile(profile?.id)
         LibraryStore.setActiveProfile(profile?.id)
@@ -1021,6 +1036,8 @@ public class ProfileViewModel: ObservableObject {
     }
 
     public func resetForSignedOut() {
+        // Even a repeated reset of the same guest erases its stores.
+        contextWillChange.send(())
         let guest = Profile(
             id: "guest",
             name: "Nuvio Guest",

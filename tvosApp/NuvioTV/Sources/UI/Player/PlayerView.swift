@@ -17,7 +17,7 @@ import Combine
 // resulting view tree is unchanged.
 
 struct PlayerView: View {
-    @StateObject var viewModel = PlayerViewModel()
+    @StateObject var viewModel: PlayerViewModel
     @Environment(\.scenePhase) var scenePhase
 
     let url: URL
@@ -26,6 +26,7 @@ struct PlayerView: View {
     let httpHeaders: [String: String]
     let externalSubtitles: [NuvioSubtitle]
     let resumeFrom: Double?
+    var isActionPlaybackSession: Bool = false
     var playbackOrigin: PlaybackOrigin = .main
     var bingeGroup: String? = nil
     var addonName: String? = nil
@@ -65,8 +66,98 @@ struct PlayerView: View {
     var onPlayRecommendation: ((_ meta: NuvioMeta, _ playManually: Bool) -> Void)? = nil
     var onOpenRecommendationDetails: ((_ meta: NuvioMeta) -> Void)? = nil
     var onBack: () -> Void
+    let partyPlayback: WatchPartyPlayerMount?
+    let partyPlaybackIdentity: UUID?
+    let watchPartyOwner: WatchPartyAppOwner?
+    let isCurrentPlayerSurface: @MainActor () -> Bool
+    let onOpenWatchPartyLobby: () -> Void
+
+    /// An explicit runtime can retain the same model across fullscreen / PiP surfaces.
+    /// Existing callers keep lazy StateObject creation. A checked Party mount supplies its
+    /// own model and lifecycle; a standalone viewModel argument supplies only the model.
+    @MainActor
+    init(
+        url: URL,
+        meta: NuvioMeta,
+        subtitle: String,
+        httpHeaders: [String: String],
+        externalSubtitles: [NuvioSubtitle],
+        resumeFrom: Double?,
+        isActionPlaybackSession: Bool = false,
+        playbackOrigin: PlaybackOrigin = .main,
+        bingeGroup: String? = nil,
+        addonName: String? = nil,
+        provider: String? = nil,
+        filename: String? = nil,
+        videoSize: Int64? = nil,
+        videoHash: String? = nil,
+        cacheFileIdentity: PlaybackCacheFileIdentity? = nil,
+        sourceID: String? = nil,
+        trickplayURL: URL? = nil,
+        episodes: [NuvioVideo] = [],
+        currentEpisode: NuvioVideo? = nil,
+        initialStartupBenchmarkToken: UUID? = nil,
+        autoPlayNextEnabled: Bool = true,
+        autoPlayNextCountdownSeconds: Int = 10,
+        resolveNextStream: ((NuvioVideo, UUID?) async -> PreparedNextStream?)? = nil,
+        reloadCurrentStream: ((NuvioVideo?, [String]) async -> PreparedNextStream?)? = nil,
+        fetchPlaybackSources: ((String, String) -> AsyncStream<[NuvioStream]>)? = nil,
+        resolvePlaybackStream: ((NuvioStream, String, String, UUID?) async -> PreparedNextStream?)? = nil,
+        onRequestSources: (() -> Void)? = nil,
+        onFinished: (() -> Void)? = nil,
+        onPlaybackStarted: (() -> Void)? = nil,
+        onPlayRecommendation: ((NuvioMeta, Bool) -> Void)? = nil,
+        onOpenRecommendationDetails: ((NuvioMeta) -> Void)? = nil,
+        viewModel: PlayerViewModel? = nil,
+        partyPlayback: WatchPartyPlayerMount? = nil,
+        partyPlaybackIdentity: UUID? = nil,
+        watchPartyOwner: WatchPartyAppOwner? = nil,
+        isCurrentPlayerSurface: @escaping @MainActor () -> Bool = { true },
+        onOpenWatchPartyLobby: @escaping () -> Void = {},
+        onBack: @escaping () -> Void
+    ) {
+        _viewModel = StateObject(wrappedValue: partyPlayback?.viewModel ?? viewModel ?? PlayerViewModel())
+        self.partyPlayback = partyPlayback
+        self.partyPlaybackIdentity = partyPlaybackIdentity
+        self.watchPartyOwner = watchPartyOwner
+        self.isCurrentPlayerSurface = isCurrentPlayerSurface
+        self.onOpenWatchPartyLobby = onOpenWatchPartyLobby
+        self.url = url
+        self.meta = meta
+        self.subtitle = subtitle
+        self.httpHeaders = httpHeaders
+        self.externalSubtitles = externalSubtitles
+        self.resumeFrom = resumeFrom
+        self.isActionPlaybackSession = isActionPlaybackSession
+        self.playbackOrigin = playbackOrigin
+        self.bingeGroup = bingeGroup
+        self.addonName = addonName
+        self.provider = provider
+        self.filename = filename
+        self.videoSize = videoSize
+        self.videoHash = videoHash
+        self.cacheFileIdentity = cacheFileIdentity
+        self.sourceID = sourceID
+        self.trickplayURL = trickplayURL
+        self.episodes = episodes
+        self.currentEpisode = currentEpisode
+        self.initialStartupBenchmarkToken = initialStartupBenchmarkToken
+        self.autoPlayNextEnabled = autoPlayNextEnabled
+        self.autoPlayNextCountdownSeconds = autoPlayNextCountdownSeconds
+        self.resolveNextStream = resolveNextStream
+        self.reloadCurrentStream = reloadCurrentStream
+        self.fetchPlaybackSources = fetchPlaybackSources
+        self.resolvePlaybackStream = resolvePlaybackStream
+        self.onRequestSources = onRequestSources
+        self.onFinished = onFinished
+        self.onPlaybackStarted = onPlaybackStarted
+        self.onPlayRecommendation = onPlayRecommendation
+        self.onOpenRecommendationDetails = onOpenRecommendationDetails
+        self.onBack = onBack
+    }
 
     @State var didHandleFinished = false
+    @State var partySurface: WatchPartyPlayerRuntime.Surface?
     @State var didReportPlaybackStarted = false
     @State var lastBecameActiveAt: Date = Date()
     @State var requestedControlFocus: PlayerControlFocus? = nil
@@ -82,6 +173,10 @@ struct PlayerView: View {
 
     var body: some View {
         layersWithRemoteCommands
+    }
+
+    var isStandalonePlaybackSession: Bool {
+        isActionPlaybackSession || subtitle == PlaybackMarkers.trailerSubtitle
     }
 
     var subtitleContentId: String {

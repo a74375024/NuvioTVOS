@@ -26,6 +26,12 @@ logs/
 /sideloadlydaemon.log
 analysis/
 Docs
+!Vendor/AetherEngine/docs/
+Vendor/AetherEngine/docs/*
+!Vendor/AetherEngine/docs/api.md
+!Vendor/AetherEngine/docs/architecture.md
+!Vendor/AetherEngine/docs/formats.md
+!Vendor/AetherEngine/docs/cli.md
 keystore/
 scripts/build-distribution.sh
 asset

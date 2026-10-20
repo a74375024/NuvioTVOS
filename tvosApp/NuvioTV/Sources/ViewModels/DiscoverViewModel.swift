@@ -34,7 +34,7 @@ enum DiscoverSort: String, CaseIterable, Identifiable {
 @MainActor
 final class DiscoverViewModel: ObservableObject {
     @Published private(set) var items: [NuvioMeta] = []
-    @Published private(set) var isLoading = false
+    @Published private(set) var isLoading = true
     @Published private(set) var isLoadingMore = false
     @Published private(set) var error: String?
 

@@ -21,6 +21,7 @@ private enum NetflixSearchMetrics {
     static let posterWidth: CGFloat = 210
     static let posterHeight: CGFloat = 315
     static let posterGap: CGFloat = 28
+    static let linearColumnCount = 5
     static let gridColumnCount = 5
     static let gridCardRowWidth = posterWidth * CGFloat(gridColumnCount)
         + posterGap * CGFloat(gridColumnCount - 1)
@@ -747,9 +748,11 @@ struct NetflixSearchView: View {
         return nil
     }
 
-    /// Keep grid-mode posters within the content column beside the keyboard.
+    /// Keep posters within the content column beside either keyboard layout.
     private var gridColumns: [GridItem] {
-        let count = detectedKeyboardMode == .grid ? NetflixSearchMetrics.gridColumnCount : 6
+        let count = detectedKeyboardMode == .grid
+            ? NetflixSearchMetrics.gridColumnCount
+            : NetflixSearchMetrics.linearColumnCount
         return Array(
             repeating: GridItem(
                 .fixed(NetflixSearchMetrics.posterWidth),

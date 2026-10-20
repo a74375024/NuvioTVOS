@@ -4,6 +4,23 @@ import AVFoundation
 
 extension AetherEngine {
 
+    /// One bounded diagnostic at the native DV5 first-frame readiness edge. The format and surface
+    /// state are observations owned by the engine; neither represents decoded pixels or HDMI output.
+    func emitDolbyVisionFirstFrameDiagnosticIfNeeded() {
+        guard sourceVideoFormat == .dolbyVision,
+              sourceDVProfile == 5,
+              nativeVideoSession != nil,
+              nativeHost != nil else { return }
+        let overlayState = displayDebugLines.joined(separator: " | ")
+        EngineLog.emit(
+            "[DVBlack] stage=first-frame loadGeneration=\(loadGeneration) "
+                + "readiness=hasFirstFrameReadyForDisplay \(DolbyVisionColorDiagnostics.sourceFormatFields(sourceVideoStreamFormat)) "
+                + "displayState={\(overlayState)} nativeSurface={\(nativeSurfaceDiagnostic)} "
+                + "pixels=unobserved hdmi=unobserved",
+            category: .engine
+        )
+    }
+
     /// #220 diagnostic opt-in: appends a live large-block census (blocks >= 1 MB, bucketed by
     /// size class) to the 30 s memprobe line. A flat `mallocBlocks` with a rising `mallocMB`
     /// identifies "one large buffer is growing" but not which one; the census names the size
@@ -579,6 +596,9 @@ extension AetherEngine {
     var audioBridgeLiveBytes: Int {
         nativeVideoSession?.audioBridgeLiveBytes ?? 0
     }
+
+    /// What the object renderer is doing, for `LiveTelemetry.objectAudio`; nil off `objectAudioRendering`.
+    var objectAudioActivity: ObjectAudioActivity? { nativeVideoSession?.objectAudioActivity }
 
     /// Cumulative encoded-audio bytes the bridge has emitted this session. Zero when bridge is not active
     /// (stream-copy path or video-only source). The telemetry sampler diffs it into a live bridge output bitrate.

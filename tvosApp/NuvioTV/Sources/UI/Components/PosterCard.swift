@@ -166,6 +166,12 @@ enum AppCardStyle {
     }
 }
 
+/// Home inputs captured by callbacks must invalidate cached cards when they change.
+struct TVCardFocusCallbackContext: Equatable {
+    var restrictFocusToCardKey: String? = nil
+    var suppressFocusAnimations: Bool = false
+}
+
 /// Poster card component with focus animation (tvOS) and tap handling (iOS)
 struct PosterCard: View {
     let meta: NuvioMeta
@@ -216,6 +222,7 @@ struct PosterCard: View {
     /// Lets Home retain off-window artwork without leaving every card in the
     /// tvOS focus graph.
     var allowsFocus: Bool = true
+    var focusCallbackContext: TVCardFocusCallbackContext = TVCardFocusCallbackContext()
     /// Optional upward-focus fallback for Home's lazy vertical rows. The
     /// handler deliberately stays off the default path for other directions.
     var onMove: ((MoveCommandDirection) -> Void)? = nil
@@ -498,6 +505,14 @@ struct PosterCard: View {
 
                 if continueEpisodeText != nil {
                     continueLandscapeSummary
+                } else if continueProgress != nil || continueRemainingText != nil {
+                    Text(meta.name)
+                        .font(.system(size: 28, weight: .semibold))
+                        .foregroundColor(.white)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.82)
+                        .frame(maxWidth: cardWidth * 0.82, alignment: .leading)
+                        .padding(EdgeInsets(top: 22, leading: 22, bottom: 54, trailing: 22))
                 } else if let logoURL = landscapeLogoURL {
                     AsyncImage(url: logoURL) { phase in
                         if case .success(let image) = phase {
@@ -784,7 +799,10 @@ struct PosterCard: View {
     }
 
     private var landscapeArtworkFallbackURL: String? {
-        customLandscapeArtworkURL == nil ? nil : originalLandscapeArtworkURL
+        if isContinueOrUpcomingCard, continueEpisodeText != nil {
+            return meta.backdropUrl
+        }
+        return customLandscapeArtworkURL == nil ? nil : originalLandscapeArtworkURL
     }
 
     private var usesLoadedCustomLandscapeArtwork: Bool {
@@ -998,6 +1016,7 @@ extension PosterCard: Equatable {
             && lhs.focusHighlighterEnabled == rhs.focusHighlighterEnabled
             && lhs.retainFocusAppearance == rhs.retainFocusAppearance
             && lhs.allowsFocus == rhs.allowsFocus
+            && lhs.focusCallbackContext == rhs.focusCallbackContext
             && lhs.isWatched == rhs.isWatched
     }
 }

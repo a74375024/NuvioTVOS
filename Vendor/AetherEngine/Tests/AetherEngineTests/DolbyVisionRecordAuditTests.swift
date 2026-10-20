@@ -265,7 +265,8 @@ struct DolbyVisionRecordAuditTests {
         let r = try Self.route(Self.relabelledProfile5(), dvDisplay: false, rpuProfile: 7)
         #expect(r.codecTagOverride == "hvc1")
         #expect(r.videoRange == .pq)
-        #expect(r.supplementalCodecs == "dvh1.08.06/db1p")
+        // Keep the non-DV supplemental-codecs guard while normalizing the stream to Profile 8.1.
+        #expect(r.supplementalCodecs == nil)
         #expect(r.doviConfig == .rewriteToProfile81)
         #expect(r.convertP7ToProfile81)
     }

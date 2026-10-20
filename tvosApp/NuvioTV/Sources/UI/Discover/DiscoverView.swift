@@ -497,6 +497,18 @@ private struct DiscoverCard: View {
     @AppStorage(SettingsKey.focusHighlighter) private var focusHighlighter = false
     @AppStorage(SettingsKey.cardCornerRadius) private var cardCornerRadiusSetting = AppCardStyle.defaultCornerRadiusRaw
     @AppStorage(SettingsKey.liquidGlassCards) private var liquidGlassCards = true
+    @AppStorage(SettingsKey.customPosterURLPattern) private var customPosterURLPattern = ""
+    @AppStorage(SettingsKey.customPosterEnabledScreens) private var customPosterEnabledScreens = "all"
+
+    private var customPosterArtworkURL: String? {
+        CustomPosterURLResolver.resolve(
+            pattern: customPosterURLPattern,
+            meta: meta,
+            screen: .search,
+            enabledScreens: customPosterEnabledScreens,
+            shape: meta.tileShape == .square ? "square" : "poster"
+        )
+    }
 
     private var cardCornerRadius: CGFloat {
         AppCardStyle.cornerRadius(for: cardCornerRadiusSetting, fallback: 16)
@@ -510,7 +522,8 @@ private struct DiscoverCard: View {
         Button(action: action) {
             VStack(alignment: .leading, spacing: 10) {
                 CachedPosterArtwork(
-                    urlString: meta.posterUrl,
+                    urlString: customPosterArtworkURL ?? meta.posterUrl,
+                    fallbackURLString: customPosterArtworkURL == nil ? nil : meta.posterUrl,
                     width: posterWidth,
                     height: posterHeight,
                     maximumWidth: posterWidth

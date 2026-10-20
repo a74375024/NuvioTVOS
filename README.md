@@ -48,22 +48,22 @@ Download the latest Apple TV `.ipa` from [Releases](https://github.com/bobsupra/
 ## Latest tvOS Beta
 
 <!-- BEGIN LATEST_BETA -->
-**Beta 3.4.4** is the latest tvOS release.
+**Beta 3.4.5** is the latest tvOS release.
 
-[Quick download (.ipa)](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.4.4/NuvioTV-3.4.4-unsigned-release.ipa) · [Read the release notes](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.4.4) · [Report a bug or suggest an idea](https://github.com/bobsupra/NuvioTVOS/issues/new/choose)
+[Quick download (.ipa)](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.4.5/NuvioTV-3.4.5-unsigned-release.ipa) · [Read the release notes](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.4.5) · [Report a bug or suggest an idea](https://github.com/bobsupra/NuvioTVOS/issues/new/choose)
 <!-- END LATEST_BETA -->
 
 > 🎉 **Thank you for 200+ GitHub Stars!** A huge thank you to everyone in the community for supporting NuvioTVOS and helping us reach 200+ stars!
 
 The IPA requires a compatible tvOS development or sideloading signing workflow before installation.
 
-### New in Beta 3.4.4
+### New in Beta 3.4.5
 
-- **Redesigned Playback Info & Real-Time Telemetry:** Completely overhauled the Playback Info tab in the Siri Remote Scene panel (`ScenePanelView.swift`) into a horizontal glass dashboard with dedicated cards for active playback engine, video stream (codec, resolution, bitrate, Dolby Vision profile), and audio stream (channels, codec, spatial audio format).
-- **AetherEngine 7.36.0, DTS:X & Dolby Atmos Spatial Audio:** Upgraded AetherEngine to 7.36.0 with native DTS:X, multi-channel bitstreaming, and opt-in TrueHD Atmos spatial audio decoding through APAC on tvOS 26+.
-- **Simkl Synchronization & Profile Hardening:** Hardened Simkl activity, history, and library item synchronization with atomic snapshots and profile store cache isolation.
-- **Cloud Debrid, TorBox & Provider Isolation:** Scaled Real-Debrid cache availability resolution beyond 50 hashes and hardened cloud playback context.
-- **Tests & Stability:** 877 automated unit and regression tests passing with 0 failures across playback backends, stream caching, subtitle rendering, sync services, and layout settings.
+- **Playback Engine, Subtitles & Telemetry Improvements:** Pre-computed stream candidate sort keys (`StreamPickerSortKey`) to eliminate sort churn, respected forced subtitles during automatic track matching, normalized subtitle preview layout and tracking clamps, preserved stream and row identity across resolved URLs, and hardened MPV display criteria.
+- **Trailers, Artwork & Visual Polish:** Bounded trailer preview delays and activation readiness, preserved artwork caches across playback transitions, and maintained Top Shelf order and AMOLED surface styling.
+- **Cloud, Library & Multi-Profile Hardening:** Serialized remote watchlist toggles from Details, deduplicated Continue Watching and Simkl Up Next seeds, and strictly scoped add-on and collection operations per profile.
+- **Watch Party Feature Gated:** Temporarily disabled the experimental Watch Party feature pending room coordination and lobby finalization.
+- **Tests & Stability:** 1,205 automated unit and regression tests passing with 0 failures across playback backends, stream caching, subtitle rendering, sync services, and layout settings.
 
 ### Built-in Player
 

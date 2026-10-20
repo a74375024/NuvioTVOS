@@ -8,6 +8,7 @@ enum SceneTab: String, CaseIterable, Identifiable, Sendable {
     case info = "Info"
     case scene = "Scene"
     case upNext = "Up Next"
+    case watchParty = "Watch Party"
 
     var id: String { rawValue }
 
@@ -20,6 +21,8 @@ enum SceneTab: String, CaseIterable, Identifiable, Sendable {
             return isNorwegian ? "Innblikk" : "InSight"
         case .upNext:
             return isNorwegian ? "Fortsett å se" : "Up Next"
+        case .watchParty:
+            return isNorwegian ? "Se sammen" : "Watch Party"
         }
     }
 }

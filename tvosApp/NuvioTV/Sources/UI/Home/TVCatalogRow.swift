@@ -21,10 +21,6 @@ enum TVHomeLayout {
     static let stripVerticalPadding: CGFloat = 24
     /// Section title line (~30pt) + VStack spacing under the title (~10pt) + slack.
     static let rowTitleBlock: CGFloat = 56
-    /// The focused section title now lives in the fixed hero instead of the
-    /// scrolling row.
-    /// Keep the hero's added block equal to the space removed from each row.
-    static let heroSectionTitleBlock: CGFloat = 56
 
     /// Horizontal strip motion preserving momentum across continuous remote presses.
     static let scrollAnimation = Animation.interactiveSpring(response: 0.24, dampingFraction: 0.86, blendDuration: 0.18)
@@ -387,8 +383,6 @@ struct TVCatalogRow: View {
     let title: String
     var addonName: String? = nil
     var showAddonName: Bool = true
-    /// Grid View still owns its headings; Modern Home moves catalog headings
-    /// into the fixed hero so poster rows can start at the clipping boundary.
     var showsSectionTitle: Bool = true
     let horizontalEdgeInset: CGFloat
     let items: [NuvioMeta]
@@ -643,7 +637,8 @@ struct TVCatalogRow: View {
                     continueRemainingText: progressItem?.remainingText,
                     continueEpisodeText: progressItem?.episodeLabel,
                     continueEpisodeTitleText: progressItem?.episodeDisplayTitle,
-                    continueEpisodeArtworkURL: progressItem?.episodeArtworkURL,
+                    continueEpisodeArtworkURL: progressItem?.episodeArtworkURL
+                        ?? (id == TVHomeSection.upcomingId ? progressItem?.meta.backdropUrl : nil),
                     continueIsUpNext: progressItem?.isUpNextEntry == true,
                     continueUpNextBadgeText: progressItem?.upNextBadgeText,
                     collectionOrigin: id == TVHomeSection.continueWatchingId && progressItem?.isUpNextEntry == false
@@ -673,14 +668,15 @@ struct TVCatalogRow: View {
                     smoothFocusAnimations: rowCardFocusAnimations,
                     focusHighlighterEnabled: rowFocusHighlighter,
                     retainFocusAppearance: retainFocusAppearanceForCardKey == cardKey,
-                    allowsFocus: true,
+                    allowsFocus: restrictFocusToCardKey == nil || restrictFocusToCardKey == cardKey,
+                    focusCallbackContext: TVCardFocusCallbackContext(
+                        restrictFocusToCardKey: restrictFocusToCardKey,
+                        suppressFocusAnimations: suppressFocusAnimations
+                    ),
                     onMove: onMove
                 ) {
                     onSelect(item)
                 }
-                .disabled(
-                    restrictFocusToCardKey != nil && restrictFocusToCardKey != cardKey
-                )
             }
         }
         .padding(
@@ -1284,8 +1280,6 @@ enum TVCollectionFolderCardLayout {
 struct TVCollectionFolderRow: View {
     let id: String
     let title: String
-    /// Grid View still owns its headings; Modern Home moves collection row
-    /// headings into the folder hero for the same clean clipping boundary.
     var showsSectionTitle: Bool = true
     let horizontalEdgeInset: CGFloat
     let folders: [TVCollectionFolderItem]
@@ -1484,14 +1478,15 @@ struct TVCollectionFolderRow: View {
                     smoothFocusAnimations: rowSmoothFocus && !fastNavigation,
                     focusHighlighterEnabled: rowFocusHighlighter,
                     retainFocusAppearance: retainFocusAppearanceForCardKey == cardKey,
-                    allowsFocus: true,
+                    allowsFocus: restrictFocusToCardKey == nil || restrictFocusToCardKey == cardKey,
+                    focusCallbackContext: TVCardFocusCallbackContext(
+                        restrictFocusToCardKey: restrictFocusToCardKey,
+                        suppressFocusAnimations: suppressFocusAnimations
+                    ),
                     onMove: onMove,
                     onSelect: { onSelect(folder) }
                 )
                 .equatable()
-                .disabled(
-                    restrictFocusToCardKey != nil && restrictFocusToCardKey != cardKey
-                )
             }
         }
         .padding(
@@ -1541,7 +1536,8 @@ extension TVCollectionFolderRow: Equatable {
 
         let lhsRestrictInRow = lhs.restrictFocusToCardKey?.hasPrefix("\(lhs.id)\u{1}") == true
         let rhsRestrictInRow = rhs.restrictFocusToCardKey?.hasPrefix("\(rhs.id)\u{1}") == true
-        guard (lhsRestrictInRow == rhsRestrictInRow),
+        guard (lhs.restrictFocusToCardKey != nil) == (rhs.restrictFocusToCardKey != nil),
+              (lhsRestrictInRow == rhsRestrictInRow),
               !lhsRestrictInRow || lhs.restrictFocusToCardKey == rhs.restrictFocusToCardKey
         else {
             return false
@@ -1574,6 +1570,7 @@ struct TVCollectionFolderCard: View {
     var focusHighlighterEnabled: Bool = false
     var retainFocusAppearance: Bool = false
     var allowsFocus = true
+    var focusCallbackContext: TVCardFocusCallbackContext = TVCardFocusCallbackContext()
     var onMove: ((MoveCommandDirection) -> Void)? = nil
     let onSelect: () -> Void
 
@@ -1829,6 +1826,7 @@ extension TVCollectionFolderCard: Equatable {
         lhs.smoothFocusAnimations == rhs.smoothFocusAnimations &&
         lhs.focusHighlighterEnabled == rhs.focusHighlighterEnabled &&
         lhs.retainFocusAppearance == rhs.retainFocusAppearance &&
-        lhs.allowsFocus == rhs.allowsFocus
+        lhs.allowsFocus == rhs.allowsFocus &&
+        lhs.focusCallbackContext == rhs.focusCallbackContext
     }
 }

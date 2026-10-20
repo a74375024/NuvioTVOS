@@ -226,7 +226,7 @@ extension WatchPartyPreview {
 }
 
 enum WatchPartyFailure: Equatable {
-    case notFound, full, removed, ended, rateLimited, signInRequired, unavailable, network
+    case notFound, full, removed, ended, rateLimited, signInRequired, unavailable, network, invalidCode
 
     init?(serverCode: String?) {
         guard let serverCode else { return nil }

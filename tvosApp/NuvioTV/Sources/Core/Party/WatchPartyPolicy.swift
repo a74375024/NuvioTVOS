@@ -1,5 +1,11 @@
 import Foundation
 
+/// Global feature configuration for Watch Party capabilities.
+enum WatchPartyConfiguration {
+    /// Enables Watch Party capabilities across tvOS tabs, details, and player.
+    static let isEnabled = true
+}
+
 // Sync semantics adapted from NuvioMedia/NuvioTV (GPL-3.0),
 // PartySync.kt at f7e2a78ad3b19a09080ad08315825f1f0a472934.
 // Keep thresholds aligned with Android; extreme arithmetic saturates instead of trapping.

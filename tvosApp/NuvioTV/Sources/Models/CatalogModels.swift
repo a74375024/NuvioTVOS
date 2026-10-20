@@ -2066,7 +2066,12 @@ struct ContinueWatchingItem: Identifiable, Codable, Equatable, Sendable {
     }
 
     var episodeArtworkURL: String? {
-        episodeThumbnailOverride ?? episodeVideo?.thumbnail
+        for candidate in [episodeThumbnailOverride, episodeVideo?.thumbnail] {
+            guard let candidate else { continue }
+            let trimmed = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty { return trimmed }
+        }
+        return nil
     }
 
     /// Player-style episode line ("S1 · E3 · Title"); nil when unknown.

@@ -4,6 +4,8 @@ struct ScenePanelView: View {
     @ObservedObject var viewModel: SceneViewModel
     let onDismiss: () -> Void
     let onPlayNextEpisode: (() -> Void)?
+    let watchPartyContent: ((FocusState<String?>.Binding, FocusState<SceneTab?>.Binding) -> AnyView)?
+    let watchPartyFocusTarget: String
     
     @FocusState private var focusedTab: SceneTab?
     @FocusState private var focusedCardID: String?
@@ -11,11 +13,15 @@ struct ScenePanelView: View {
     init(
         viewModel: SceneViewModel,
         onDismiss: @escaping () -> Void,
-        onPlayNextEpisode: (() -> Void)? = nil
+        onPlayNextEpisode: (() -> Void)? = nil,
+        watchPartyContent: ((FocusState<String?>.Binding, FocusState<SceneTab?>.Binding) -> AnyView)? = nil,
+        watchPartyFocusTarget: String = "party.start"
     ) {
         self.viewModel = viewModel
         self.onDismiss = onDismiss
         self.onPlayNextEpisode = onPlayNextEpisode
+        self.watchPartyContent = watchPartyContent
+        self.watchPartyFocusTarget = watchPartyFocusTarget
     }
     
     var body: some View {
@@ -37,10 +43,13 @@ struct ScenePanelView: View {
                         infoTabContent
                     case .upNext:
                         upNextTabContent
+                    case .watchParty:
+                        watchPartyContent?($focusedCardID, $focusedTab) ?? AnyView(EmptyView())
                     }
                 }
-                .frame(height: viewModel.selectedTab == .info ? 300 : 272, alignment: .top)
-                .padding(.bottom, 24)
+                // Keep the bottom-anchored panel at a constant size across tab navigation.
+                // The previous 272/300pt switch made InSight visibly jump vertically.
+                .frame(height: 300, alignment: .top)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
@@ -59,17 +68,16 @@ struct ScenePanelView: View {
                 }
             }
         }
-        .defaultFocus($focusedTab, .scene)
+        .defaultFocus($focusedTab, viewModel.selectedTab)
     }
     
     // MARK: - Tab Header Bar
     
     private var tabHeaderBar: some View {
         HStack(spacing: 20) {
-            ForEach(viewModel.availableTabs) { tab in
+            ForEach(visibleTabs) { tab in
                 let isSelected = viewModel.selectedTab == tab
                 let isTabFocused = focusedTab == tab
-                let isFilled = isSelected || isTabFocused
                 
                 Button(action: {
                     withAnimation(.easeInOut(duration: 0.18)) {
@@ -77,11 +85,21 @@ struct ScenePanelView: View {
                     }
                 }) {
                     Text(tab.localizedTitle)
-                        .font(.system(size: 26, weight: isFilled ? .bold : .semibold))
-                        .foregroundColor(isFilled ? .black : .white.opacity(0.85))
+                        .font(.system(size: 26, weight: isTabFocused ? .bold : .semibold))
+                        .foregroundColor(isTabFocused ? .black : .white.opacity(0.92))
                         .padding(.horizontal, 36)
                         .frame(height: 64)
-                        .modifier(TvDetailsGlassBackground(filled: isFilled, shape: Capsule()))
+                        .modifier(TvDetailsGlassBackground(filled: isTabFocused, shape: Capsule()))
+                        .overlay {
+                            ZStack {
+                                if isSelected && !isTabFocused {
+                                    Capsule().fill(Color.white.opacity(0.22))
+                                }
+                                Capsule()
+                                    .stroke(Color.white.opacity(isSelected && !isTabFocused ? 0.26 : 0), lineWidth: 1)
+                            }
+                            .allowsHitTesting(false)
+                        }
                 }
                 .buttonStyle(PosterCardButtonStyle())
                 .focused($focusedTab, equals: tab)
@@ -103,6 +121,11 @@ struct ScenePanelView: View {
         }
         .padding(.horizontal, 60)
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var visibleTabs: [SceneTab] {
+        guard watchPartyContent != nil else { return viewModel.availableTabs }
+        return viewModel.availableTabs + [.watchParty]
     }
     
     // MARK: - Scene Tab Content
@@ -206,7 +229,7 @@ struct ScenePanelView: View {
         }
         .padding(.vertical, 16)
         .padding(.horizontal, 12)
-        .frame(width: 184, height: 236)
+        .frame(width: 184, height: 256)
         .modifier(TvCardGlassBackground(isFocused: false, shape: RoundedRectangle(cornerRadius: 32, style: .continuous)))
     }
     
@@ -379,7 +402,7 @@ struct ScenePanelView: View {
                     }
                     .padding(.horizontal, 22)
                     .padding(.vertical, 16)
-                    .frame(height: 236)
+                    .frame(height: 256)
                     .modifier(TvDetailsGlassBackground(filled: isNextFocused, shape: RoundedRectangle(cornerRadius: 32, style: .continuous)))
                     .shadow(color: Color.black.opacity(isNextFocused ? 0.22 : 0.25), radius: isNextFocused ? 10 : 6, y: isNextFocused ? 5 : 3)
                 }
@@ -435,6 +458,9 @@ struct ScenePanelView: View {
             }
         case .info:
             focusedTab = viewModel.selectedTab
+        case .watchParty:
+            focusedTab = nil
+            focusedCardID = watchPartyFocusTarget
         }
     }
 }

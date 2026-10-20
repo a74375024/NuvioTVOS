@@ -672,6 +672,7 @@ struct ProfileAvatarView: View {
     let avatarId: String
     var size: CGFloat
     var isFocused: Bool = false
+    var showsFocusOutline: Bool = true
 
     @ObservedObject private var catalog = AvatarCatalogStore.shared
     @State private var loadedImage: UIImage? = nil
@@ -709,7 +710,10 @@ struct ProfileAvatarView: View {
         .clipShape(Circle())
         .overlay(
             Circle()
-                .stroke(isFocused ? AppFocusOutline.color : Color.white.opacity(0.28), lineWidth: isFocused ? AppFocusOutline.width : 1)
+                .stroke(
+                    (isFocused && showsFocusOutline) ? AppFocusOutline.color : Color.white.opacity(0.28),
+                    lineWidth: (isFocused && showsFocusOutline) ? AppFocusOutline.width : 1
+                )
         )
         .shadow(color: .black.opacity(0.24), radius: isFocused ? 24 : 10, x: 0, y: 8)
         .task(id: imageURL) {

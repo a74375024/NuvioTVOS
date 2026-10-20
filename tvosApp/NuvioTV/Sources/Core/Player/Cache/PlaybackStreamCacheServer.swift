@@ -467,6 +467,22 @@ actor PlaybackStreamCacheServer {
     nonisolated var path: String { "/stream/\(token)" }
     var localURL: URL { URL(string: "http://127.0.0.1:\(port)\(path)")! }
 
+    func matchesActivePlaybackURL(_ url: URL) -> Bool {
+        !stopped && url == localURL
+    }
+
+    func thumbnailSourceDescriptor() -> PlaybackStreamThumbnailSource? {
+        guard !stopped else { return nil }
+        return PlaybackStreamThumbnailSource(
+            cacheDirectory: diskCache.cacheDirectory,
+            fileLength: diskCache.fileLength,
+            chunkSize: diskCache.chunkSize,
+            sessionID: diskCache.sessionID,
+            remoteURL: remoteURL,
+            originalHeaders: customHeaders
+        )
+    }
+
     // MARK: - Playhead & Prefetch Tuning
 
     /// Player playback position reported from UI/media player timeline polling.

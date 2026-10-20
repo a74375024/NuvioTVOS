@@ -133,6 +133,34 @@ final class FrameDecodeContext: @unchecked Sendable {
         return max(0, duration - clampBackoffSeconds)
     }
 
+    struct ElapsedPreviewSeek: Equatable {
+        let elapsedSeconds: Double
+        let rawSeekSeconds: Double
+    }
+
+    static func elapsedPreviewSeek(requested: Double, duration: Double, origin: Double) -> ElapsedPreviewSeek? {
+        guard requested.isFinite, origin.isFinite else { return nil }
+        let elapsed = clampSeekSeconds(requested: requested, duration: duration)
+        let raw = elapsed + origin
+        guard raw.isFinite else { return nil }
+        return ElapsedPreviewSeek(elapsedSeconds: elapsed, rawSeekSeconds: raw)
+    }
+
+    static func previewPresentationOrigin(formatStartTime: Int64, streamStartSeconds: Double?) -> Double {
+        if formatStartTime != Int64.min {
+            let formatOrigin = Double(formatStartTime) / Double(AV_TIME_BASE)
+            if formatOrigin.isFinite { return formatOrigin }
+        }
+        guard let streamStartSeconds, streamStartSeconds.isFinite else { return 0 }
+        return streamStartSeconds
+    }
+
+    static func elapsedPreviewTime(rawSeconds: Double?, origin: Double) -> Double? {
+        guard let rawSeconds, rawSeconds.isFinite, origin.isFinite else { return nil }
+        let elapsed = rawSeconds - origin
+        return elapsed.isFinite ? elapsed : nil
+    }
+
     init(url: URL, httpHeaders: [String: String], selectTitleID: Int? = nil,
          allowsHardwareDecode: Bool = true, requestHeaderStore: RequestHeaderStore? = nil) {
         self.url = url
@@ -432,6 +460,7 @@ final class FrameDecodeContext: @unchecked Sendable {
         maxSize: CGSize?,
 afterFirstFrame offsetSeconds: Double? = nil,
         relativeToFirstFrame: Bool = false,
+        relativeToPresentationStart: Bool = false,
         isCancelled: () -> Bool,
         residentTarget: Double? = nil,
         reportResidentTime: ((Double, Bool) -> Void)? = nil,
@@ -460,8 +489,29 @@ afterFirstFrame offsetSeconds: Double? = nil,
         // past EOF returns a blank garbage frame that still reports success (AE#105). Both the seek and
         // the forward-decode target below must use the clamped value or snapshot would chase an
         // unreachable PTS forever.
-        let seekSeconds = Self.clampSeekSeconds(requested: seconds, duration: demuxer.duration)
-        if seekSeconds != seconds {
+        let presentationOrigin = relativeToPresentationStart
+            ? Self.previewPresentationOrigin(
+                formatStartTime: demuxer.formatStartTime,
+                streamStartSeconds: presentationStartSeconds)
+            : 0
+        let seekSeconds: Double
+        let clampedElapsed: Double?
+        if relativeToPresentationStart {
+            guard let mapping = Self.elapsedPreviewSeek(
+                requested: seconds, duration: demuxer.duration, origin: presentationOrigin) else { return nil }
+            seekSeconds = mapping.rawSeekSeconds
+            clampedElapsed = mapping.elapsedSeconds
+        } else {
+            seekSeconds = Self.clampSeekSeconds(requested: seconds, duration: demuxer.duration)
+            clampedElapsed = nil
+        }
+        if let clampedElapsed, clampedElapsed != seconds {
+            EngineLog.emit(
+                "[FrameExtractor] relative still past duration: elapsed t=\(String(format: "%.2f", seconds))s "
+                + "> duration=\(String(format: "%.2f", demuxer.duration))s; clamped elapsed to "
+                + "\(String(format: "%.2f", clampedElapsed))s (raw seek=\(String(format: "%.2f", seekSeconds))s)",
+                category: .swPlayback)
+        } else if !relativeToPresentationStart && seekSeconds != seconds {
             EngineLog.emit(
                 "[FrameExtractor] still past duration: t=\(String(format: "%.2f", seconds))s "
                 + "> duration=\(String(format: "%.2f", demuxer.duration))s; clamped to "
@@ -633,6 +683,7 @@ afterFirstFrame offsetSeconds: Double? = nil,
                         maxSize: maxSize,
 afterFirstFrame: offsetSeconds,
                         relativeToFirstFrame: relativeToFirstFrame,
+                        relativeToPresentationStart: relativeToPresentationStart,
                         isCancelled: isCancelled,
                         residentTarget: residentTarget,
                         reportResidentTime: reportResidentTime,
@@ -648,7 +699,9 @@ afterFirstFrame: offsetSeconds,
                 }
                 let decodedPTS = f.pointee.pts == Int64.min ? nil
                     : Optional(Double(f.pointee.pts) * Double(timeBase.num) / Double(timeBase.den))
-                reportDecodedTime?(decodedPTS.flatMap { $0.isFinite ? $0 : nil })
+                reportDecodedTime?(relativeToPresentationStart
+                    ? Self.elapsedPreviewTime(rawSeconds: decodedPTS, origin: presentationOrigin)
+                    : decodedPTS.flatMap { $0.isFinite ? $0 : nil })
                 return image
             }
         }

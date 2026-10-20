@@ -176,6 +176,15 @@ final class HLSSegmentProducer: @unchecked Sendable {
     private let videoConfig: StreamConfig
     private let audioConfig: AudioConfig?
 
+    private func logPublishedDolbyVisionInit(_ data: Data, segmentIndex: Int, versioned: Bool) {
+        guard let fields = DolbyVisionColorDiagnostics.initLogFields(from: data) else { return }
+        EngineLog.emit(
+            "[DVBlack] stage=init evidence=cache-published-video-init segment=\(segmentIndex) "
+                + "versioned=\(versioned) \(fields)",
+            category: .session
+        )
+    }
+
     /// Start PTS (source video TB) for each segment at baseIndex+i; used to detect segment crossings.
     private let segmentBoundaries: [Int64]
 
@@ -2203,6 +2212,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
                     guard let self = self else { return }
                     if versionedInit {
                         self.cache.addInitVersion(initBytes, fromSegment: initialSegmentIndex)
+                        self.logPublishedDolbyVisionInit(
+                            initBytes, segmentIndex: initialSegmentIndex, versioned: true)
                         EngineLog.emit(
                             "[HLSSegmentProducer] versioned init captured for seg-\(initialSegmentIndex) "
                             + "(\(initBytes.count) B, \(isAdCreative ? "SSAI program switch" : "same-PID parameter-set change"))",
@@ -2211,6 +2222,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
                     } else if !self.initCaptured {
                         self.initCaptured = true
                         self.cache.setInit(initBytes)
+                        self.logPublishedDolbyVisionInit(
+                            initBytes, segmentIndex: initialSegmentIndex, versioned: false)
                         EngineLog.emit(
                             "[HLSSegmentProducer] init.mp4 captured (\(initBytes.count) B)",
                             category: .session

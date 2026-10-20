@@ -125,6 +125,23 @@ final class ActionStreamTests: XCTestCase {
         ).contains(where: { $0.id == action.id }))
     }
 
+    @MainActor
+    func testActionPlaybackSessionRemainsUntrackedAfterSubtitleChanges() {
+        XCTAssertFalse(PlayerViewModel.shouldTrackPlayback(
+            subtitle: "S01 · E02 · Episode title",
+            isTrailerSession: false,
+            isActionSession: true
+        ))
+        XCTAssertTrue(PlayerViewModel.shouldTrackPlayback(
+            subtitle: "S01 · E02 · Episode title",
+            isTrailerSession: false
+        ))
+        XCTAssertFalse(PlayerViewModel.shouldTrackPlayback(
+            subtitle: PlaybackMarkers.trailerSubtitle,
+            isTrailerSession: false
+        ))
+    }
+
     func testBingeGroupNeverAttachesToActionStream() {
         let action = NuvioStream(
             url: "https://addon.example/action/subtitles",

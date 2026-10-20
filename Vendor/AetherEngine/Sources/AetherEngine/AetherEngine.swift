@@ -620,6 +620,9 @@ public final class AetherEngine: ObservableObject {
             "HDRCRIT  \(displayCriteria.debugSummary())",
             "HDRHLS   route=\(videoRoute.rawValue) \(session)",
         ]
+        if sourceDVProfile == 5 {
+            lines.append("DV5SRC   \(DolbyVisionColorDiagnostics.sourceFormatFields(sourceVideoStreamFormat))")
+        }
         if let nativeHost {
             lines.append(nativeHost.videoFrameCaptureDebugSummary)
         }
@@ -941,7 +944,12 @@ public final class AetherEngine: ObservableObject {
     ///
     /// For "has this seek reached the screen", the per-seek answer is `SeekEvent.landed`, not this
     /// flag: a seek keeps the previous frame up, so the layer never stops being ready for display.
-    @Published public internal(set) var hasFirstFrameReadyForDisplay = false
+    @Published public internal(set) var hasFirstFrameReadyForDisplay = false {
+        didSet {
+            guard !oldValue, hasFirstFrameReadyForDisplay else { return }
+            emitDolbyVisionFirstFrameDiagnosticIfNeeded()
+        }
+    }
 
     /// True while the running session has a host video-display signal to fold (#315). Set with the
     /// host sinks, cleared with the session, and what keeps the external-playback latch from arming
@@ -1734,17 +1742,6 @@ public final class AetherEngine: ObservableObject {
     public nonisolated static func setSourceThrottleKbpsForTesting(_ kbps: Int) {
         sourceThrottleKbpsForTesting = max(0, kbps)
     }
-
-    /// TEST-ONLY: scales the reader's reconnect backoff (1.0 = real timing). Read once by each
-    /// `AVIOReader` at init, so set it before `load`/`start`. Lets a bounded give-up that spans
-    /// ~13 exponential backoffs finish in test time instead of a minute of real sleeping.
-    nonisolated(unsafe) static var reconnectBackoffScaleForTesting = 1.0
-
-    /// TEST-ONLY: how long a pinned redirect target may carry no bytes before its first refusal
-    /// drops it instead of riding out the keep-pin grace (#392). Read once by each `AVIOReader` at
-    /// init, so set it before `load`/`start`. nil keeps the shipped minute, which no test can wait
-    /// out. See `AVIOReader.pinIdleRepinSecondsDefault`.
-    nonisolated(unsafe) static var pinIdleSecondsForTesting: TimeInterval? = nil
 
     /// Reads `AVPlayer.eligibleForHDRPlayback` and `AVPlayer.availableHDRModes` at call time.
     /// Eligibility is display-configuration aware on all platforms (its change notification fires
@@ -4932,7 +4929,7 @@ public final class AetherEngine: ObservableObject {
             // The load seam preserves display criteria (#128 follow-up); an audio-only session never calls
             // apply(), so clear a criteria the previous video session left applied. The engine is a
             // process-wide singleton; without this, music playback keeps the panel in DV/HDR.
-            if Self.loadDisplayCriteriaAction(suppressDisplayCriteria: options.suppressDisplayCriteria, audioOnlyPath: true) == .clearStale {
+            if Self.loadDisplayCriteriaAction(engineWritesCriteria: options.engineWritesDisplayCriteria, audioOnlyPath: true) == .clearStale {
                 resetDisplayCriteriaRespectingOthers()
             }
             // Read codec before closing the probe; custom sources always use FFmpeg (AVPlayer can't consume a custom demuxer).
@@ -5025,7 +5022,7 @@ public final class AetherEngine: ObservableObject {
         // starts a switch, so the post-load play-gate waitForSwitch() below has nothing to settle and would
         // otherwise burn its full ~3s cap on unobservable-DV panels. Skip it in exactly that case.
         var criteriaUnchanged = false
-        switch Self.loadDisplayCriteriaAction(suppressDisplayCriteria: options.suppressDisplayCriteria, audioOnlyPath: false) {
+        switch Self.loadDisplayCriteriaAction(engineWritesCriteria: options.engineWritesDisplayCriteria, audioOnlyPath: false) {
         case .applyFresh:
             let codecTag: FourCharCode? = detectedDVProfile ? 0x64766831 : nil
             switch displayCriteria.apply(
@@ -5062,7 +5059,7 @@ await displayCriteria.waitForSwitch(consumesRecord: false,
             // load rather than when the play gate opens. After reset(), so a switch back to the default
             // mode is not recorded as this session's. Audio-only loads reach clearStale too and have no
             // panel handshake to observe.
-            if options.suppressDisplayCriteria { displayCriteria.armSwitchObservation() }
+            if !options.engineWritesDisplayCriteria { displayCriteria.armSwitchObservation() }
         }
 
         // 2.5. Post-handshake panel-mode snapshot.
@@ -5082,7 +5079,7 @@ await displayCriteria.waitForSwitch(consumesRecord: false,
         //      so a panel parked in HDR never proves itself and one tvOS 27 box stopped answering at all;
         //      a host that knows better says so, and a wrong claim costs the -11848 fallback, not the item.
         var criteriaPanelReadout: Bool? =
-            options.suppressDisplayCriteria ? nil : displayCriteria.currentPanelIsHDR()
+            options.awaitsInboundCriteriaWrite ? nil : displayCriteria.currentPanelIsHDR()
         var panelHDRAfterHandshake = Self.sessionPanelPresentsHDR(
             hostAsserts: options.panelIsInHDRMode, criteriaReadout: criteriaPanelReadout)
         // AE#459: the ROUTE may assume more than the LABEL may claim. `panelHDRAfterHandshake` stays the
@@ -5113,7 +5110,7 @@ await displayCriteria.waitForSwitch(consumesRecord: false,
                 }
                 try checkLoadCurrent(gen)
             }
-            criteriaPanelReadout = options.suppressDisplayCriteria ? nil : displayCriteria.currentPanelIsHDR()
+            criteriaPanelReadout = options.awaitsInboundCriteriaWrite ? nil : displayCriteria.currentPanelIsHDR()
             panelHDRAfterHandshake = Self.sessionPanelPresentsHDR(
                 hostAsserts: options.panelIsInHDRMode, criteriaReadout: criteriaPanelReadout)
             routingPanelHDR = Self.sessionRoutesAsHDRPanel(
@@ -5642,7 +5639,7 @@ await displayCriteria.waitForSwitch(consumesRecord: false,
                 await displayCriteria.waitForSwitch(
                     startGrace: Self.playGateGrace(
                         criteriaUnchanged: criteriaUnchanged,
-                        engineIsCriteriaWriter: !options.suppressDisplayCriteria,
+                        criteriaWrittenBeforeLoad: !options.awaitsInboundCriteriaWrite,
                         formatKnown: probeOpened,
                         effectiveFormat: effectiveFormat,
                         noWriterExpected: options.sharedOutputRole == .secondary

@@ -161,6 +161,30 @@ final class PlaybackBackendPolicyTests: XCTestCase {
         model.shutdown()
     }
 
+    @MainActor
+    func testActionPlaybackDoesNotArmSourceWatchdog() {
+        let coordinator = PlaybackSessionCoordinator(
+            engineSettingProvider: { "MPVKit" },
+            loadDispatcher: { _, _, _ in }
+        )
+        let model = PlayerViewModel(sessionCoordinator: coordinator)
+        defer { model.shutdown() }
+        model.reloadCurrentStream = { _, _ in
+            XCTFail("Action playback must never request another source")
+            return nil
+        }
+        model.load(
+            url: URL(fileURLWithPath: "/tmp/action-confirmation.mp4"),
+            meta: NuvioMeta(id: "tt-action-watchdog", name: "Episode", type: "series"),
+            subtitle: "S1 · E1",
+            resumeFrom: 600,
+            isActionPlaybackSession: true
+        )
+
+        XCTAssertNil(model.loadWatchdogTask)
+        XCTAssertNil(coordinator.playbackCompletionTracker)
+    }
+
     func testVMErrorRecoveryNeedsMultipleAdvancingSamplesAndHalfSecond() {
         var progress = PlayerErrorRecoveryProgress(position: 40, uptime: 100)
         XCTAssertFalse(progress.observe(position: 40, uptime: 100.25))

@@ -769,6 +769,125 @@ final class HomeLayoutSettingsTests: XCTestCase {
         XCTAssertEqual(cardAt0, cardAt0Again)
     }
 
+    func testPosterCardEquatableInvalidatesCapturedFocusCallbackContext() throws {
+        let meta = try title("item1")
+        let cardKey = "catalog-1\u{1}item1"
+        let neighborKey = "catalog-1\u{1}item2"
+
+        func card(
+            key: String = cardKey,
+            restriction: String?,
+            suppressFocusAnimations: Bool = false
+        ) -> PosterCard {
+            PosterCard(
+                meta: meta,
+                externalFocusValue: key,
+                smoothFocusAnimations: false,
+                allowsFocus: restriction == nil || restriction == key,
+                focusCallbackContext: TVCardFocusCallbackContext(
+                    restrictFocusToCardKey: restriction,
+                    suppressFocusAnimations: suppressFocusAnimations
+                )
+            ) {}
+        }
+
+        let lockedTarget = card(restriction: cardKey)
+        let unlockedTarget = card(restriction: nil)
+        XCTAssertTrue(lockedTarget.allowsFocus)
+        XCTAssertTrue(unlockedTarget.allowsFocus)
+        XCTAssertNotEqual(lockedTarget, unlockedTarget)
+
+        let targetAfterLockRetarget = card(restriction: neighborKey)
+        XCTAssertFalse(targetAfterLockRetarget.allowsFocus)
+        XCTAssertNotEqual(lockedTarget, targetAfterLockRetarget)
+
+        let neighborBeforeRetarget = card(key: neighborKey, restriction: cardKey)
+        let neighborAfterRetarget = card(key: neighborKey, restriction: neighborKey)
+        XCTAssertFalse(neighborBeforeRetarget.allowsFocus)
+        XCTAssertTrue(neighborAfterRetarget.allowsFocus)
+        XCTAssertNotEqual(neighborBeforeRetarget, neighborAfterRetarget)
+
+        let suppressed = card(restriction: cardKey, suppressFocusAnimations: true)
+        let unsuppressed = card(restriction: cardKey, suppressFocusAnimations: false)
+        XCTAssertFalse(suppressed.smoothFocusAnimations)
+        XCTAssertFalse(unsuppressed.smoothFocusAnimations)
+        XCTAssertTrue(suppressed.allowsFocus)
+        XCTAssertTrue(unsuppressed.allowsFocus)
+        XCTAssertNotEqual(suppressed, unsuppressed)
+    }
+
+    func testTVCollectionFolderCardEquatableInvalidatesCapturedFocusCallbackContext() throws {
+        let decoded = try JSONDecoder().decode(NuvioCollectionFolder.self, from: Data(#"{"id":"folder","title":"Folder"}"#.utf8))
+        let folder = TVCollectionFolderItem(collectionId: "one", folder: decoded, sources: [])
+        let cardKey = "folder-row\u{1}folder"
+        let neighborKey = "folder-row\u{1}neighbor"
+
+        func card(
+            key: String = cardKey,
+            restriction: String?,
+            suppressFocusAnimations: Bool = false
+        ) -> TVCollectionFolderCard {
+            TVCollectionFolderCard(
+                folder: folder,
+                externalFocusValue: key,
+                smoothFocusAnimations: false,
+                allowsFocus: restriction == nil || restriction == key,
+                focusCallbackContext: TVCardFocusCallbackContext(
+                    restrictFocusToCardKey: restriction,
+                    suppressFocusAnimations: suppressFocusAnimations
+                )
+            ) {}
+        }
+
+        let lockedTarget = card(restriction: cardKey)
+        let unlockedTarget = card(restriction: nil)
+        XCTAssertTrue(lockedTarget.allowsFocus)
+        XCTAssertTrue(unlockedTarget.allowsFocus)
+        XCTAssertNotEqual(lockedTarget, unlockedTarget)
+
+        let targetAfterLockRetarget = card(restriction: neighborKey)
+        XCTAssertFalse(targetAfterLockRetarget.allowsFocus)
+        XCTAssertNotEqual(lockedTarget, targetAfterLockRetarget)
+
+        let neighborBeforeRetarget = card(key: neighborKey, restriction: cardKey)
+        let neighborAfterRetarget = card(key: neighborKey, restriction: neighborKey)
+        XCTAssertFalse(neighborBeforeRetarget.allowsFocus)
+        XCTAssertTrue(neighborAfterRetarget.allowsFocus)
+        XCTAssertNotEqual(neighborBeforeRetarget, neighborAfterRetarget)
+
+        let suppressed = card(restriction: cardKey, suppressFocusAnimations: true)
+        let unsuppressed = card(restriction: cardKey, suppressFocusAnimations: false)
+        XCTAssertFalse(suppressed.smoothFocusAnimations)
+        XCTAssertFalse(unsuppressed.smoothFocusAnimations)
+        XCTAssertTrue(suppressed.allowsFocus)
+        XCTAssertTrue(unsuppressed.allowsFocus)
+        XCTAssertNotEqual(suppressed, unsuppressed)
+    }
+
+    func testTVCollectionFolderRowEquatableChecksExternalRestrictionPresence() throws {
+        let decoded = try JSONDecoder().decode(NuvioCollectionFolder.self, from: Data(#"{"id":"folder","title":"Folder"}"#.utf8))
+        let folder = TVCollectionFolderItem(collectionId: "one", folder: decoded, sources: [])
+
+        func row(restriction: String?) -> TVCollectionFolderRow {
+            TVCollectionFolderRow(
+                id: "folder-row",
+                title: "Folders",
+                horizontalEdgeInset: 40,
+                folders: [folder],
+                initialScrollIndex: 0,
+                onScrollIndexChange: { _ in },
+                initialFocusCardKey: nil,
+                restrictFocusToCardKey: restriction,
+                onInitialFocusRequested: {},
+                onFocus: { _ in },
+                onSelect: { _ in }
+            )
+        }
+
+        XCTAssertNotEqual(row(restriction: "another-row\u{1}one"), row(restriction: nil))
+        XCTAssertEqual(row(restriction: "another-row\u{1}one"), row(restriction: "another-row\u{1}two"))
+    }
+
     func testClearCatalogOrder() {
         let order = ["addon_1", "addon_2"]
         let orderData = try! JSONEncoder().encode(order)

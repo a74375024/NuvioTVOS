@@ -80,6 +80,51 @@ final class PlaybackDiagnosticTimelineTests: XCTestCase {
         XCTAssertLessThanOrEqual(data.count, PlaybackDiagnosticTimeline.maximumBytes)
     }
 
+    func testMenuFocusBreadcrumbsPreservePrivateAllowlist() throws {
+        let names: [PlaybackDiagnosticTimeline.EventName] = [
+            .audioMenuFocusLeft, .audioMenuFocusReturned,
+            .subtitleMenuFocusLeft, .subtitleMenuFocusReturned,
+            .controlsExitReceived, .focusSinkFocused, .focusSinkUnfocused
+        ]
+        var timeline = PlaybackDiagnosticTimeline()
+        let context = session()
+        for name in names {
+            timeline.append(.init(timestamp: Date(), name: name, engine: .aether), session: context)
+        }
+        let data = try XCTUnwrap(timeline.encoded())
+        let decoded = try XCTUnwrap(PlaybackDiagnosticTimeline.decode(data))
+        XCTAssertEqual(decoded.sessions.first?.events.map(\.name), names)
+        let root = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let sessions = try XCTUnwrap(root["sessions"] as? [[String: Any]])
+        let events = try XCTUnwrap(sessions.first?["events"] as? [[String: Any]])
+        XCTAssertEqual(events.count, names.count)
+        for event in events {
+            XCTAssertEqual(Set(event.keys), Set(["timestamp", "name", "engine"]))
+        }
+    }
+
+    func testWatchPartyTraceExportsOnlyAllowlistedFields() throws {
+        var timeline = PlaybackDiagnosticTimeline()
+        let context = session()
+        let names: [PlaybackDiagnosticTimeline.EventName] = [
+            .partyPauseReceived, .partyPauseAccepted, .partyPauseBindingObserved,
+            .partyBindingDeferredSample, .partyRemotePauseStarted, .partyRemoteTransportIssued,
+            .partyPlayReceived, .partyPlayAccepted, .partyPlayBindingObserved,
+            .partyBindingDeferredBehind, .partyRemotePlayStarted, .partyRemoteEffectFailed
+        ]
+        for (index, name) in names.enumerated() {
+            timeline.append(.init(timestamp: Date(timeIntervalSince1970: Double(index)),
+                                  name: name, engine: nil), session: context)
+        }
+        let data = try XCTUnwrap(timeline.encoded())
+        XCTAssertEqual(PlaybackDiagnosticTimeline.decode(data), timeline)
+        let root = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let sessions = try XCTUnwrap(root["sessions"] as? [[String: Any]])
+        let events = try XCTUnwrap(sessions[0]["events"] as? [[String: Any]])
+        XCTAssertEqual(events.count, names.count)
+        XCTAssertTrue(events.allSatisfy { Set($0.keys).isSubset(of: ["timestamp", "name", "engine"]) })
+    }
+
     func testRejectsUnsupportedSchemaOversizedAndCorruptReports() throws {
         var timeline = PlaybackDiagnosticTimeline()
         timeline.schemaVersion = 2

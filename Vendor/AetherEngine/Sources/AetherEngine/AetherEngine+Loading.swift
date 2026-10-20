@@ -579,6 +579,11 @@ extension AetherEngine {
         let inPlaceHandover = pendingInPlaceItemHandover
         pendingInPlaceItemHandover = false
         if loadGeneration == bypassGeneration { recordStartupCheckpoint(.sessionConstructed) }   // #361
+#if os(tvOS)
+        let allowsVideoFrameCapture = false
+#else
+        let allowsVideoFrameCapture = true
+#endif
         host.load(url: playbackURL,
                   startPosition: startPosition,
                   perFrameHDR: true,
@@ -604,7 +609,8 @@ extension AetherEngine {
                       // AVFoundation builds no track, where nothing terminal is ever published.
                       readinessDeadline: RemoteHLSReadinessDeadline.defaultBudgetSeconds,
                       // No probe lists this route's audio, so the item's own tracks are the list.
-                      readsBackAudioTracks: true))
+                      readsBackAudioTracks: true,
+                      allowsVideoFrameCapture: allowsVideoFrameCapture))
 
         attachRemoteHLSCueClock(host: host, expectedGeneration: bypassGeneration)
 
@@ -727,12 +733,12 @@ extension AetherEngine {
     /// bypass. The loopback path applies criteria before item load from its libav probe; this path has no
     /// probe, so it applies late, once AVPlayer's parsed video-track format resolves the range. Without the
     /// panel switch a bare AVPlayerLayer presents no HDR video (audio-only, black; the reporter's symptom).
-    /// SDR needs no switch, and a sole-writer host (`suppressDisplayCriteria`) is left untouched. No-op off
+    /// SDR needs no switch, and criteria owned by AVKit or the host are left untouched (AE#842). No-op off
     /// tvOS (apply() returns .applied there) and where Match Content is off (apply() skips the write).
     @MainActor
     private func applyRemoteHLSDisplayCriteria(format: VideoFormat, options: LoadOptions) {
         guard RemoteHLSFormatDetection.shouldApplyDisplayCriteria(
-            format: format, suppressDisplayCriteria: options.suppressDisplayCriteria) else { return }
+            format: format, engineWritesCriteria: options.engineWritesDisplayCriteria) else { return }
         _ = displayCriteria.apply(
             format: format,
             frameRate: nativeHost?.detectedVideoFrameRate,
@@ -1885,24 +1891,11 @@ extension AetherEngine {
         // and recovery reloads keep their own contracts.
         let inPlaceHandover = pendingInPlaceItemHandover
         pendingInPlaceItemHandover = false
-        // Issue #144: an 8-bit BGRA output washes out native DV on first-generation Apple TV.
-        // Keep the capture output in 10-bit YUV; thumbnail rendering maps it to SDR afterward.
 #if os(tvOS)
-        // HDR10 experiments are opt-in; the verified DV policy stays active in every variant.
-#if NUVIO_HDR10_CAPTURE_DISABLED || NUVIO_HDR10_CAPTURE_X420
-        let isHDR10Source = sourceVideoFormat == .hdr10 || sourceVideoFormat == .hdr10Plus
-#endif
-#if NUVIO_HDR10_CAPTURE_DISABLED
-        let allowsVideoFrameCapture = !isHDR10Source
-#else
-        let allowsVideoFrameCapture = true
-#endif
-#if NUVIO_HDR10_CAPTURE_X420
-        let usesTenBitCapture = sourceVideoFormat == .dolbyVision || isHDR10Source
-#else
-        let usesTenBitCapture = sourceVideoFormat == .dolbyVision
-#endif
-        let videoFrameCapturePixelFormat = usesTenBitCapture
+        // Attaching the thumbnail output can alter native HDR rendering, including DV5 -> HDR10
+        // with x420 on the tested setup. Seek previews use the separate cache/extractor paths.
+        let allowsVideoFrameCapture = false
+        let videoFrameCapturePixelFormat = sourceVideoFormat == .dolbyVision
             ? kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
             : kCVPixelFormatType_32BGRA
 #else
@@ -2659,7 +2652,7 @@ extension AetherEngine {
                 // #339: the only write this reload can still produce is a sole-writer host's re-write on the
                 // swapped item, which happens inside loadNative. Arm before it, or the gate below is again
                 // reading a flag for a switch whose notifications it was not registered for.
-                if loadedOptions.suppressDisplayCriteria { displayCriteria.armSwitchObservation() }
+                if !loadedOptions.engineWritesDisplayCriteria { displayCriteria.armSwitchObservation() }
                 let reloadRoutingPanelHDR = Self.reloadRoutesAsHDRPanel(
                     hostAsserts: loadedOptions.panelIsInHDRMode,
                     criteriaReadoutAtLoad: sessionPanelHDRReadout,
@@ -2735,7 +2728,7 @@ extension AetherEngine {
                 await displayCriteria.waitForSwitch(
                     startGrace: Self.playGateGrace(
                         criteriaUnchanged: false,
-                        engineIsCriteriaWriter: !loadedOptions.suppressDisplayCriteria,
+                        criteriaWrittenBeforeLoad: !loadedOptions.awaitsInboundCriteriaWrite,
                         formatKnown: true,
                         effectiveFormat: videoFormat,
                         noWriterExpected: loadedOptions.sharedOutputRole == .secondary

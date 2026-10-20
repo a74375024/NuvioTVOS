@@ -24,6 +24,17 @@ struct StreamProbeResult: Sendable {
     }
 }
 
+/// Immutable source details for a scrub preview. The proxy URL is deliberately omitted: previews
+/// read complete files from disk, then use the original origin if the cache has a hole.
+struct PlaybackStreamThumbnailSource: Sendable, Equatable {
+    let cacheDirectory: URL
+    let fileLength: Int64
+    let chunkSize: Int64
+    let sessionID: String
+    let remoteURL: URL
+    let originalHeaders: [String: String]
+}
+
 struct PlaybackStreamCacheContentRange: Sendable {
     let start: Int64
     let end: Int64
@@ -769,6 +780,17 @@ actor PlaybackStreamCacheManager {
     func activeConcurrencyMetrics() async -> (active: Int, currentMax: Int, configuredMax: Int)? {
         guard let server = activeServer else { return nil }
         return await server.concurrencyMetrics
+    }
+
+    /// Resolve a playback proxy URL to its immutable disk/origin source only while that exact
+    /// server and manager session still own it. The server performs the port/token URL comparison.
+    func thumbnailSource(for playbackURL: URL) async -> PlaybackStreamThumbnailSource? {
+        guard let server = activeServer, let sessionToken = activeSessionToken,
+              await server.matchesActivePlaybackURL(playbackURL),
+              activeServer === server, activeSessionToken == sessionToken,
+              let descriptor = await server.thumbnailSourceDescriptor(),
+              activeServer === server, activeSessionToken == sessionToken else { return nil }
+        return descriptor
     }
 
     func currentCachedRanges() async -> [Range<Int64>] {

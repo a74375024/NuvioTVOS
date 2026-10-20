@@ -1,5 +1,6 @@
 import XCTest
 import CoreGraphics
+import AetherEngine
 @testable import NuvioTV
 
 private final class PlaybackTaskCancellationProbe: @unchecked Sendable {
@@ -72,6 +73,165 @@ private final class DeferredNextStreamResolver {
     func release(_ prepared: PreparedNextStream?) {
         continuation?.resume(returning: prepared)
         continuation = nil
+    }
+}
+
+final class ActionPlaybackSessionTests: XCTestCase {
+    private let profileID = "action-playback-\(UUID().uuidString)"
+    private var previousSettingsID: String?
+    private var previousSettingsWerePrimary = false
+    private var previousWatchedID: String?
+    private var previousProgressID: String?
+    private var previousContinueWatchingID: String?
+    private var previousDismissID: String?
+    private let meta = NuvioMeta(id: "tt-action-session", name: "Episode", type: "series", runtime: "24 min")
+    private let episode = NuvioVideo(id: "tt-action-session:1:1", title: "One", season: 1, episode: 1)
+    private let savedURL = "https://example.test/real-episode.mkv"
+
+    override func setUp() {
+        super.setUp()
+        previousSettingsID = ProfileSettings.activeProfileID
+        previousSettingsWerePrimary = ProfileSettings.isPrimaryProfileStore(ProfileSettings.current)
+        previousWatchedID = WatchedStore.activeProfileId
+        previousProgressID = WatchProgressLedger.activeProfileId
+        previousContinueWatchingID = ContinueWatchingStore.activeProfileId
+        previousDismissID = ContinueWatchingDismissStore.activeProfileId
+        ProfileSettings.setActiveProfile(profileID, isPrimary: false)
+        WatchedStore.setActiveProfile(profileID)
+        ContinueWatchingStore.setActiveProfile(profileID)
+        LastPlaybackStreamStore.save(metaId: meta.id, url: savedURL, season: 1, episode: 1)
+    }
+
+    override func tearDown() {
+        LastPlaybackStreamStore.remove(metaId: meta.id, season: 1, episode: 1)
+        ContinueWatchingStore.eraseProfile(profileID)
+        WatchedStore.eraseProfile(profileID)
+        WatchedStore.setActiveProfile(previousWatchedID)
+        ContinueWatchingStore.setActiveProfile(previousContinueWatchingID)
+        WatchProgressLedger.setActiveProfile(previousProgressID)
+        ContinueWatchingDismissStore.setActiveProfile(previousDismissID)
+        if let previousSettingsID {
+            ProfileSettings.setActiveProfile(previousSettingsID, isPrimary: previousSettingsWerePrimary)
+        } else {
+            ProfileSettings.clearActiveProfile()
+        }
+        UserDefaults.standard.removePersistentDomain(forName: "nuvio.tv.profile.settings.\(profileID)")
+        super.tearDown()
+    }
+
+    @MainActor
+    private func makeModel(isAction: Bool = true) -> PlayerViewModel {
+        let coordinator = PlaybackSessionCoordinator(
+            engineSettingProvider: { "MPVKit" },
+            loadDispatcher: { _, _, _ in }
+        )
+        let model = PlayerViewModel(sessionCoordinator: coordinator)
+        model.reloadCurrentStream = { _, _ in
+            XCTFail("An action must not resolve an alternative source")
+            return nil
+        }
+        model.load(
+            url: URL(fileURLWithPath: "/tmp/action-confirmation.mp4"),
+            meta: meta,
+            subtitle: "S1 · E1 · One",
+            resumeFrom: 600,
+            playbackOrigin: .details,
+            sourceID: "action-source",
+            currentEpisode: episode,
+            isActionPlaybackSession: isAction
+        )
+        return model
+    }
+
+    @MainActor
+    private func sample(duration: Int64, position: Int64) -> PlayerControlsTestEngine {
+        let engine = PlayerControlsTestEngine()
+        engine.isPlayerPlaying = true
+        engine.isTransportPlaying = true
+        engine.hasCoherentTimeSample = true
+        engine.hasFirstFrameReadyForDisplay = true
+        engine.videoFrameSize = CGSize(width: 1920, height: 1080)
+        engine.durationMs = duration
+        engine.positionMs = position
+        return engine
+    }
+
+    private func assertContentStateUnchanged(file: StaticString = #filePath, line: UInt = #line) {
+        XCTAssertNil(ContinueWatchingStore.item(for: meta.id), file: file, line: line)
+        XCTAssertFalse(WatchedStore.contains(meta: meta), file: file, line: line)
+        XCTAssertFalse(WatchedStore.containsEpisode(meta: meta, season: 1, episode: 1), file: file, line: line)
+        XCTAssertEqual(LastPlaybackStreamStore.load(metaId: meta.id, season: 1, episode: 1)?.url, savedURL, file: file, line: line)
+    }
+
+    @MainActor
+    func testShortActionPlaysAndEndsWithoutReplacementRecovery() async {
+        let model = makeModel()
+        defer { model.shutdown() }
+        let engine = sample(duration: 5_000, position: 1_000)
+        for _ in 0..<6 { model.pollForTesting(using: engine) }
+        XCTAssertEqual(model.status, .playing)
+        XCTAssertEqual(model.time.duration, 5)
+        XCTAssertFalse(model.isReloadingStream)
+
+        engine.positionMs = 4_900
+        engine.isPlayerEnded = true
+        engine.isAtEndOfFile = true
+        engine.isPlayerPlaying = false
+        model.pollForTesting(using: engine)
+        XCTAssertEqual(model.status, .ended)
+        await Task.yield()
+        assertContentStateUnchanged()
+    }
+
+    @MainActor
+    func testLongActionCannotTrackOrAdvanceEvenWithEpisodeCallbacks() async {
+        let model = makeModel()
+        defer { model.shutdown() }
+        let next = NuvioVideo(id: "tt-action-session:1:2", title: "Two", season: 1, episode: 2)
+        model.configureNextEpisode(
+            episodes: [episode, next], current: episode,
+            autoPlayEnabled: true, autoPlayCountdownSeconds: 1
+        ) { _, _ in
+            XCTFail("An action must not resolve the next episode")
+            return nil
+        }
+        let engine = sample(duration: 1_440_000, position: 1_400_000)
+        for _ in 0..<6 { model.pollForTesting(using: engine) }
+        model.saveProgress(force: true, eventAction: .stop)
+        XCTAssertNil(model.nextEpisode)
+        XCTAssertFalse(model.showNextEpisodeCard)
+        XCTAssertFalse(model.postPlayState.isVisible)
+        XCTAssertNil(model.sessionCoordinator.playbackCompletionTracker)
+        model.shutdown()
+        await Task.yield()
+        assertContentStateUnchanged()
+    }
+
+    @MainActor
+    func testActionEngineErrorPreservesSavedEpisodeSource() async {
+        let model = makeModel()
+        defer { model.shutdown() }
+        let engine = sample(duration: 5_000, position: 1_000)
+        model.pollForTesting(using: engine)
+        engine.currentErrorMessage = "Action URL failed"
+        model.pollForTesting(using: engine)
+        XCTAssertEqual(model.status, .error("Action URL failed"))
+        model.retryCurrentPlayback()
+        await Task.yield()
+        XCTAssertFalse(model.isReloadingStream)
+        assertContentStateUnchanged()
+    }
+
+    @MainActor
+    func testOrdinaryEpisodeStillRejectsShortReplacementClip() {
+        let model = makeModel(isAction: false)
+        defer { model.shutdown() }
+        model.reloadCurrentStream = nil
+        let engine = sample(duration: 5_000, position: 1_000)
+        for _ in 0..<6 { model.pollForTesting(using: engine) }
+        guard case .error = model.status else {
+            return XCTFail("A short replacement must still be rejected for ordinary episodes")
+        }
     }
 }
 
@@ -658,6 +818,242 @@ private final class ControlledScrubThumbnailProvider: ScrubThumbnailProviding {
 }
 
 extension PlayerControlsSettingsTests {
+    @MainActor
+    func testScrubThumbnailProviderIsReachedOnMPVBackend() async {
+        let defaults = ProfileSettings.current
+        let previous = defaults.object(forKey: SettingsKey.seekPreviewEnabled)
+        defaults.set(true, forKey: SettingsKey.seekPreviewEnabled)
+        defer { defaults.set(previous, forKey: SettingsKey.seekPreviewEnabled) }
+
+        let provider = ControlledScrubThumbnailProvider()
+        let coordinator = PlaybackSessionCoordinator(
+            aetherControllerFactory: { nil },
+            engineSettingProvider: { "MPVKit" },
+            loadDispatcher: { _, _, _ in }
+        )
+        let model = PlayerViewModel(sessionCoordinator: coordinator, scrubThumbnailProvider: provider)
+        defer { model.pendingSeekDelta = 0; coordinator.stopAll() }
+
+        coordinator.load(PlaybackLoadRequest(videoURL: URL(fileURLWithPath: "/tmp/mpv-preview.mkv")))
+        coordinator.onHandoffToast?("Compatibility player enabled")
+        XCTAssertEqual(coordinator.activeBackend, .mpv)
+        XCTAssertEqual(model.activeEngineKind, .mpv)
+
+        let image = makeTestImage()
+        let published = expectation(description: "MPV scrub provider frame reaches the preview")
+        let subscription = model.$scrubThumbnail.sink { candidate in
+            if candidate === image { published.fulfill() }
+        }
+        defer { subscription.cancel() }
+        provider.decode = { _, precise in
+            guard !precise else { return nil }
+            return image
+        }
+        model.pendingSeekDelta = 1
+        model.requestScrubThumbnail(at: 42)
+        await fulfillment(of: [published], timeout: 3)
+        XCTAssertTrue(model.scrubThumbnail === image)
+    }
+
+    @MainActor
+    func testLateScrubThumbnailIsDiscardedAcrossMPVHandoff() async {
+        let defaults = ProfileSettings.current
+        let previous = defaults.object(forKey: SettingsKey.seekPreviewEnabled)
+        defaults.set(true, forKey: SettingsKey.seekPreviewEnabled)
+        defer { defaults.set(previous, forKey: SettingsKey.seekPreviewEnabled) }
+
+        let provider = ControlledScrubThumbnailProvider()
+        let coordinator = PlaybackSessionCoordinator(
+            aetherControllerFactory: { nil },
+            engineSettingProvider: { "MPVKit" },
+            loadDispatcher: { _, _, _ in }
+        )
+        let model = PlayerViewModel(sessionCoordinator: coordinator, scrubThumbnailProvider: provider)
+        defer { model.pendingSeekDelta = 0; coordinator.stopAll() }
+
+        let started = expectation(description: "Old backend preview is in flight")
+        var continuation: CheckedContinuation<CGImage?, Never>?
+        provider.decode = { _, precise in
+            guard !precise else { return nil }
+            started.fulfill()
+            return await withCheckedContinuation { continuation = $0 }
+        }
+        model.pendingSeekDelta = 1
+        model.requestScrubThumbnail(at: 42)
+        await fulfillment(of: [started], timeout: 3)
+
+        coordinator.load(PlaybackLoadRequest(videoURL: URL(fileURLWithPath: "/tmp/mpv-preview-next.mkv")))
+        coordinator.onHandoffToast?("Compatibility player enabled")
+        XCTAssertEqual(model.activeEngineKind, .mpv)
+        continuation?.resume(returning: makeTestImage())
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        XCTAssertNil(model.scrubThumbnail, "A late preview from the prior backend must not repopulate the overlay")
+    }
+
+    @MainActor
+    func testAetherBoundedScrubPreviewAdmitsKnownProgressiveVODOnly() {
+        let suffixless = URL(string: "https://cdn.example.test/download/abc123")!
+        XCTAssertTrue(AetherPlaybackController.shouldUseBoundedProgressiveScrubPreview(
+            requestIsLive: false, engineIsLive: false, route: .loopback,
+            isKnownHLS: false, sourceURL: suffixless, sourceContainerFormat: "matroska,webm"))
+        XCTAssertFalse(AetherPlaybackController.shouldUseBoundedProgressiveScrubPreview(
+            requestIsLive: false, engineIsLive: false, route: .loopback,
+            isKnownHLS: false, sourceURL: suffixless, sourceContainerFormat: nil))
+        XCTAssertFalse(AetherPlaybackController.shouldUseBoundedProgressiveScrubPreview(
+            requestIsLive: false, engineIsLive: false, route: .remoteBypass,
+            isKnownHLS: false, sourceURL: suffixless, sourceContainerFormat: "matroska"))
+        XCTAssertFalse(AetherPlaybackController.shouldUseBoundedProgressiveScrubPreview(
+            requestIsLive: true, engineIsLive: false, route: .loopback,
+            isKnownHLS: false, sourceURL: suffixless, sourceContainerFormat: "matroska"))
+        XCTAssertFalse(AetherPlaybackController.shouldUseBoundedProgressiveScrubPreview(
+            requestIsLive: false, engineIsLive: true, route: .loopback,
+            isKnownHLS: false, sourceURL: suffixless, sourceContainerFormat: "matroska"))
+        XCTAssertFalse(AetherPlaybackController.shouldUseBoundedProgressiveScrubPreview(
+            requestIsLive: false, engineIsLive: false, route: .loopback,
+            isKnownHLS: true, sourceURL: suffixless, sourceContainerFormat: "matroska"))
+        XCTAssertFalse(AetherPlaybackController.shouldUseBoundedProgressiveScrubPreview(
+            requestIsLive: false, engineIsLive: false, route: .loopback,
+            isKnownHLS: false, sourceURL: URL(fileURLWithPath: "/tmp/disc.iso"),
+            sourceContainerFormat: "matroska"))
+    }
+
+    @MainActor
+    func testAetherBoundedScrubFrameRequiresAccurateActualTimeAndValidRange() {
+        let image = makeTestImage()
+        let frame = ScrubFrame(image: image, actualSeconds: 42.25, refined: true, validRange: 40..<45)
+        XCTAssertTrue(AetherPlaybackController.acceptsBoundedScrubFrame(frame, at: 42))
+        XCTAssertFalse(AetherPlaybackController.acceptsBoundedScrubFrame(frame, at: 42.8))
+        XCTAssertFalse(AetherPlaybackController.acceptsBoundedScrubFrame(frame, at: 46))
+
+        let invalidTime = ScrubFrame(image: image, actualSeconds: .infinity, refined: true, validRange: nil)
+        XCTAssertFalse(AetherPlaybackController.acceptsBoundedScrubFrame(invalidTime, at: 42))
+        XCTAssertFalse(AetherPlaybackController.acceptsBoundedScrubFrame(nil, at: 42))
+    }
+
+    @MainActor
+    func testAetherResidentFrameAvoidsFallbackAndKeepsActualTimestamp() async {
+        let image = makeTestImage()
+        var cleanupCount = 0
+        var fallbackCount = 0
+        let result = await AetherPlaybackController.boundedProgressiveScrubFrame(
+            at: 42,
+            resident: {
+                ScrubFrame(image: image, actualSeconds: 42.25, refined: true, validRange: 40..<45)
+            },
+            ownsSource: { true },
+            cleanup: { cleanupCount += 1 },
+            isCurrent: { true },
+            fallback: {
+                fallbackCount += 1
+                return nil
+            })
+
+        XCTAssertEqual(cleanupCount, 1)
+        XCTAssertEqual(fallbackCount, 0)
+        XCTAssertTrue(result?.image === image)
+        XCTAssertEqual(result?.actualSeconds, 42.25)
+    }
+
+    @MainActor
+    func testAetherMissingAndInaccurateResidentFramesFallbackAfterCleanup() async {
+        let image = makeTestImage()
+        let residentFrames: [ScrubFrame?] = [
+            nil,
+            ScrubFrame(image: image, actualSeconds: 42.8, refined: false, validRange: 40..<45),
+        ]
+        for residentFrame in residentFrames {
+            var events: [String] = []
+            let fallbackImage = makeTestImage()
+            let result = await AetherPlaybackController.boundedProgressiveScrubFrame(
+                at: 42,
+                resident: {
+                    events.append("resident")
+                    return residentFrame
+                },
+                ownsSource: {
+                    events.append("ownsSource")
+                    return true
+                },
+                cleanup: { events.append("cleanup") },
+                isCurrent: {
+                    events.append("current")
+                    return true
+                },
+                fallback: {
+                    events.append("fallback")
+                    return BoundedStillFrame(image: fallbackImage, actualSeconds: 42.1)
+                })
+
+            XCTAssertEqual(events, ["resident", "ownsSource", "cleanup", "current", "fallback"])
+            XCTAssertTrue(result?.image === fallbackImage)
+            XCTAssertEqual(result?.actualSeconds, 42.1)
+        }
+    }
+
+    @MainActor
+    func testAetherWaitsForCleanupBeforeStartingFallback() async {
+        let image = makeTestImage()
+        let cleanupStarted = expectation(description: "Resident decoder cleanup started")
+        var cleanupContinuation: CheckedContinuation<Void, Never>?
+        var fallbackStarted = false
+        let operation = Task {
+            await AetherPlaybackController.boundedProgressiveScrubFrame(
+                at: 42,
+                resident: { nil },
+                ownsSource: { true },
+                cleanup: {
+                    cleanupStarted.fulfill()
+                    await withCheckedContinuation { cleanupContinuation = $0 }
+                },
+                isCurrent: { true },
+                fallback: {
+                    fallbackStarted = true
+                    return BoundedStillFrame(image: image, actualSeconds: 42)
+                })
+        }
+        await fulfillment(of: [cleanupStarted], timeout: 2)
+        XCTAssertFalse(fallbackStarted)
+        cleanupContinuation?.resume()
+
+        let result = await operation.value
+        XCTAssertTrue(fallbackStarted)
+        XCTAssertTrue(result?.image === image)
+    }
+
+    @MainActor
+    func testAetherSameSourceCancellationCleansButSourceReplacementSkipsCleanup() async {
+        let image = makeTestImage()
+        var cleanupCount = 0
+        var fallbackCount = 0
+        let cancelled = await AetherPlaybackController.boundedProgressiveScrubFrame(
+            at: 42,
+            resident: { nil },
+            ownsSource: { true },
+            cleanup: { cleanupCount += 1 },
+            isCurrent: { false },
+            fallback: {
+                fallbackCount += 1
+                return BoundedStillFrame(image: image, actualSeconds: 42)
+            })
+        XCTAssertNil(cancelled)
+        XCTAssertEqual(cleanupCount, 1)
+        XCTAssertEqual(fallbackCount, 0)
+
+        let replaced = await AetherPlaybackController.boundedProgressiveScrubFrame(
+            at: 42,
+            resident: { nil },
+            ownsSource: { false },
+            cleanup: { cleanupCount += 1 },
+            isCurrent: { true },
+            fallback: {
+                fallbackCount += 1
+                return BoundedStillFrame(image: image, actualSeconds: 42)
+            })
+        XCTAssertNil(replaced)
+        XCTAssertEqual(cleanupCount, 1)
+        XCTAssertEqual(fallbackCount, 0)
+    }
+
     @MainActor
     func testSlowPreviewPublishesWhileNewerSeekIsPendingThenRefines() async {
         let defaults = ProfileSettings.current

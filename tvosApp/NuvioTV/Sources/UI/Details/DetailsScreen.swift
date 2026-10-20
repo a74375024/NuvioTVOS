@@ -17,7 +17,7 @@ struct DetailsScreen: View {
     let type: String
     let initialPlaybackRequestID: UInt?
     let onInitialPlaybackRequestConsumed: ((UInt) -> Void)?
-    /// (streamURL, httpHeaders, meta, episodeSubtitleLine, streamSubtitles, currentEpisode, orderedEpisodes).
+    /// (streamURL, httpHeaders, meta, episodeSubtitleLine, streamSubtitles, currentEpisode, orderedEpisodes, actionSession).
     /// The last two carry series context for the player's next-episode auto-play;
     /// (streamURL, httpHeaders, meta, episodeSubtitleLine, streamSubtitles, currentEpisode, orderedEpisodes, player, cacheFileIdentity, filename, videoSize, videoHash, resumeFrom).
     /// The episode fields carry series context for the player's next-episode auto-play;
@@ -37,9 +37,12 @@ struct DetailsScreen: View {
         _ videoHash: String?,
         _ resumeFrom: Double?,
         _ startupBenchmarkToken: UUID?,
-        _ sourceID: String?
+        _ sourceID: String?,
+        _ isActionPlaybackSession: Bool
     ) -> Void
     let onBack: () -> Void
+    /// Host a room for the current title or a specific series episode.
+    var onCreateWatchParty: ((NuvioMeta, NuvioVideo?) -> Void)? = nil
     /// Open another title (More Like This / production catalog).
     var onOpenTitle: ((String, String) -> Void)? = nil
     /// Open a production company / network catalog.
@@ -49,9 +52,14 @@ struct DetailsScreen: View {
     let initiallyPresentStreamPicker: Bool
     let initialStreamPickerEpisode: NuvioVideo?
     let onInitialStreamPickerPresented: (() -> Void)?
+    var onWatchPartyMovieReady: ((NuvioMeta) -> Void)? = nil
+    var creatingWatchPartyRoom = false
+    var onWatchPartyMediaSelected: ((NuvioMeta, NuvioVideo?) -> Void)? = nil
 
     @StateObject private var viewModel: DetailsViewModel
     @State private var isStreamPickerPresented = false
+    @State private var isWatchPartyEpisodePickerPresented = false
+    @State private var pendingWatchPartySelection: (NuvioMeta, NuvioVideo)?
     @State private var isSmartPlaybackPending = false
     @State private var isPreparingPlayback = false
     @State private var isPreparingInitialPlayback = false
@@ -122,6 +130,9 @@ struct DetailsScreen: View {
         initiallyPresentStreamPicker: Bool = false,
         initialStreamPickerEpisode: NuvioVideo? = nil,
         onInitialStreamPickerPresented: (() -> Void)? = nil,
+        onWatchPartyMovieReady: ((NuvioMeta) -> Void)? = nil,
+        creatingWatchPartyRoom: Bool = false,
+        onWatchPartyMediaSelected: ((NuvioMeta, NuvioVideo?) -> Void)? = nil,
         onPlayClick: @escaping (
             _ streamUrl: String,
             _ httpHeaders: [String: String],
@@ -137,9 +148,11 @@ struct DetailsScreen: View {
             _ videoHash: String?,
             _ resumeFrom: Double?,
             _ startupBenchmarkToken: UUID?,
-            _ sourceID: String?
+            _ sourceID: String?,
+            _ isActionPlaybackSession: Bool
         ) -> Void,
         onBack: @escaping () -> Void,
+        onCreateWatchParty: ((NuvioMeta, NuvioVideo?) -> Void)? = nil,
         onOpenTitle: ((String, String) -> Void)? = nil,
         onOpenProduction: ((MetaCompany) -> Void)? = nil,
         onOpenPerson: ((TmdbPersonMetadata) -> Void)? = nil
@@ -150,12 +163,16 @@ struct DetailsScreen: View {
         self.onInitialPlaybackRequestConsumed = onInitialPlaybackRequestConsumed
         self.onPlayClick = onPlayClick
         self.onBack = onBack
+        self.onCreateWatchParty = onCreateWatchParty
         self.onOpenTitle = onOpenTitle
         self.onOpenProduction = onOpenProduction
         self.onOpenPerson = onOpenPerson
         self.initiallyPresentStreamPicker = initiallyPresentStreamPicker
         self.initialStreamPickerEpisode = initialStreamPickerEpisode
         self.onInitialStreamPickerPresented = onInitialStreamPickerPresented
+        self.onWatchPartyMovieReady = onWatchPartyMovieReady
+        self.creatingWatchPartyRoom = creatingWatchPartyRoom
+        self.onWatchPartyMediaSelected = onWatchPartyMediaSelected
         _isPreparingInitialPlayback = State(initialValue: initialPlaybackRequestID != nil)
         _viewModel = StateObject(wrappedValue: DetailsViewModel(repository: repository))
         TVHomeDebugTrace.log("details.init id=\(id) type=\(type)")
@@ -198,12 +215,20 @@ struct DetailsScreen: View {
                         // Movie (or a series with no episode list): make sure streams
                         // are loaded for the canonical title id, then either auto-select
                         // or open the picker.
+                        if creatingWatchPartyRoom, let meta = viewModel.uiState.meta, !meta.isSeries {
+                            onWatchPartyMediaSelected?(meta, nil)
+                            return
+                        }
                         pendingEpisodeSubtitle = ""
                         pendingEpisode = nil
                         startStreamFlow(streamId: viewModel.uiState.meta?.streamId ?? id, type: viewModel.uiState.meta?.type ?? type, reload: viewModel.uiState.streams.isEmpty)
                     },
                     onPlayManually: {
                         // Hold-to-play-manually: always open the picker even when Auto Select is on.
+                        if creatingWatchPartyRoom, let meta = viewModel.uiState.meta, !meta.isSeries {
+                            onWatchPartyMediaSelected?(meta, nil)
+                            return
+                        }
                         pendingEpisodeSubtitle = ""
                         pendingEpisode = nil
                         startStreamFlow(
@@ -213,7 +238,19 @@ struct DetailsScreen: View {
                             forceManualPicker: true
                         )
                     },
+                    onHostWatchParty: onCreateWatchParty == nil ? nil : {
+                        guard let meta = viewModel.uiState.meta else { return }
+                        if meta.isSeries {
+                            isWatchPartyEpisodePickerPresented = true
+                        } else {
+                            onCreateWatchParty?(meta, nil)
+                        }
+                    },
                     onEpisodeSelected: { video in
+                        if creatingWatchPartyRoom, let meta = viewModel.uiState.meta {
+                            onWatchPartyMediaSelected?(meta, video)
+                            return
+                        }
                         pendingEpisodeSubtitle = "S\(video.season) · E\(video.episode) · \(video.title)"
                         pendingEpisode = video
                         let streamId = canonicalEpisodeStreamId(for: video, meta: viewModel.uiState.meta)
@@ -221,6 +258,10 @@ struct DetailsScreen: View {
                         startStreamFlow(streamId: streamId, type: "series", reload: !isPreFetched)
                     },
                     onEpisodePlayManually: { video in
+                        if creatingWatchPartyRoom, let meta = viewModel.uiState.meta {
+                            onWatchPartyMediaSelected?(meta, video)
+                            return
+                        }
                         pendingEpisodeSubtitle = "S\(video.season) · E\(video.episode) · \(video.title)"
                         pendingEpisode = video
                         let streamId = canonicalEpisodeStreamId(for: video, meta: viewModel.uiState.meta)
@@ -256,14 +297,14 @@ struct DetailsScreen: View {
                 // While the stream picker is open it sits on top as a full-screen
                 // overlay; disable the details content so the focus engine can't
                 // route focus to the (hidden) buttons behind it.
-                .disabled(isStreamPickerPresented || expandedComment != nil || isSmartPlaybackPending || isResolvingDebrid || isPreparingPlayback || isPreparingInitialPlayback)
+                .disabled(isStreamPickerPresented || isWatchPartyEpisodePickerPresented || expandedComment != nil || isSmartPlaybackPending || isResolvingDebrid || isPreparingPlayback || isPreparingInitialPlayback)
                 #else
                 MobileDetailsContent(
                     uiState: viewModel.uiState,
                     onPlayClick: {
                         if let url = viewModel.uiState.streams.first?.url,
                            let meta = viewModel.uiState.meta {
-                            onPlayClick(url, [:], meta, "", [], nil, [], nil, nil, nil, nil, nil, nil, nil, nil)
+                            onPlayClick(url, [:], meta, "", [], nil, [], nil, nil, nil, nil, nil, nil, nil, nil, false)
                         }
                     },
                     onWatchlistClick: { viewModel.toggleWatchlist() },
@@ -304,6 +345,26 @@ struct DetailsScreen: View {
             }
         }
         #if os(tvOS)
+        .fullScreenCover(isPresented: $isWatchPartyEpisodePickerPresented, onDismiss: {
+            // Wait for the native focus hierarchy to dismiss before navigating.
+            guard let selection = pendingWatchPartySelection else { return }
+            pendingWatchPartySelection = nil
+            onCreateWatchParty?(selection.0, selection.1)
+        }) {
+            if let meta = viewModel.uiState.meta {
+                WatchPartyDetailsEpisodePicker(
+                    episodes: (meta.videos ?? []).filter { $0.episode > 0 && $0.season >= 0 },
+                    onSelect: { episode in
+                        pendingWatchPartySelection = (meta, episode)
+                        isWatchPartyEpisodePickerPresented = false
+                    },
+                    onCancel: {
+                        pendingWatchPartySelection = nil
+                        isWatchPartyEpisodePickerPresented = false
+                    }
+                )
+            }
+        }
         // Present sources in an isolated full-screen focus hierarchy. Keeping
         // this overlay inside the details screen's vertical ScrollView ancestry
         // lets tvOS apply focus-visibility corrections to the shared host,
@@ -382,8 +443,15 @@ struct DetailsScreen: View {
         }
         .onChange(of: viewModel.uiState.isLoading) { _, isLoading in
             if !isLoading {
+                if let meta = viewModel.uiState.meta, meta.id == id, !meta.isSeries {
+                    onWatchPartyMovieReady?(meta)
+                }
                 presentInitialStreamPickerIfNeeded()
             }
+        }
+        .onChange(of: viewModel.uiState.meta?.id) { _, newID in
+            guard let newID, newID == id, let meta = viewModel.uiState.meta, meta.id == newID, !meta.isSeries else { return }
+            onWatchPartyMovieReady?(meta)
         }
         .onChange(of: initialPlaybackRequestID) { oldRequestID, newRequestID in
             if let newRequestID {
@@ -411,6 +479,9 @@ struct DetailsScreen: View {
             } else if viewModel.uiState.meta == nil || viewModel.uiState.meta?.id != id {
                 viewModel.loadDetails(id: id, type: type)
             } else {
+                if let meta = viewModel.uiState.meta, !meta.isSeries {
+                    onWatchPartyMovieReady?(meta)
+                }
                 viewModel.refreshWatchlistAndWatchedStatus()
             }
             presentInitialStreamPickerIfNeeded()
@@ -606,7 +677,8 @@ struct DetailsScreen: View {
                     nil,
                     nil,
                     startupToken,
-                    nil
+                    nil,
+                    false
                 )
                 return
             }
@@ -678,7 +750,8 @@ struct DetailsScreen: View {
                 preStream.videoHash,
                 nil,
                 startupToken,
-                preStream.id
+                preStream.id,
+                preStream.isNotPlayable
             )
             return
         }
@@ -1081,7 +1154,7 @@ struct DetailsScreen: View {
             isStreamPickerPresented = false
             isPreparingPlayback = true
             isSmartPlaybackPending = false
-            armExternalPlayerTimeoutIfNeeded(player: player)
+            if !stream.isNotPlayable { armExternalPlayerTimeoutIfNeeded(player: player) }
             if self.startupBenchmarkToken == startupToken {
                 self.startupBenchmarkToken = nil
             }
@@ -1100,7 +1173,8 @@ struct DetailsScreen: View {
                 stream.videoHash,
                 nil,
                 startupToken,
-                stream.id
+                stream.id,
+                stream.isNotPlayable
             )
             return
         }
@@ -1113,7 +1187,7 @@ struct DetailsScreen: View {
             isStreamPickerPresented = false
             isPreparingPlayback = true
             isSmartPlaybackPending = false
-            armExternalPlayerTimeoutIfNeeded(player: player)
+            if !stream.isNotPlayable { armExternalPlayerTimeoutIfNeeded(player: player) }
             if self.startupBenchmarkToken == startupToken {
                 self.startupBenchmarkToken = nil
             }
@@ -1132,7 +1206,8 @@ struct DetailsScreen: View {
                 stream.videoHash,
                 nil,
                 startupToken,
-                stream.id
+                stream.id,
+                stream.isNotPlayable
             )
             return
         }
@@ -1185,7 +1260,7 @@ struct DetailsScreen: View {
                     isStreamPickerPresented = false
                     isPreparingPlayback = true
                     isSmartPlaybackPending = false
-                    armExternalPlayerTimeoutIfNeeded(player: player)
+                    if !stream.isNotPlayable { armExternalPlayerTimeoutIfNeeded(player: player) }
                     if self.startupBenchmarkToken == startupToken {
                         self.startupBenchmarkToken = nil
                     }
@@ -1204,7 +1279,8 @@ struct DetailsScreen: View {
                         stream.videoHash,
                         nil,
                         startupToken,
-                        stream.id
+                        stream.id,
+                        stream.isNotPlayable
                     )
                 } else {
                     cancelStartupRequest(token: startupToken)
@@ -1282,12 +1358,12 @@ struct DetailsScreen: View {
         Task {
             if let source = await YouTubeTrailerResolver.shared.resolve(for: meta) {
                 await MainActor.run {
-                    onPlayClick(source.videoUrl, source.requestHeaders, meta, PlaybackMarkers.trailerSubtitle, [], nil, [], nil, nil, nil, nil, nil, resumeFrom, nil, nil)
+                    onPlayClick(source.videoUrl, source.requestHeaders, meta, PlaybackMarkers.trailerSubtitle, [], nil, [], nil, nil, nil, nil, nil, resumeFrom, nil, nil, false)
                 }
             } else if let ytId = await preferredTrailerYouTubeId(for: meta) {
                 let youtubeUrl = "https://www.youtube.com/watch?v=\(ytId)"
                 await MainActor.run {
-                    onPlayClick(youtubeUrl, [:], meta, PlaybackMarkers.trailerSubtitle, [], nil, [], nil, nil, nil, nil, nil, resumeFrom, nil, nil)
+                    onPlayClick(youtubeUrl, [:], meta, PlaybackMarkers.trailerSubtitle, [], nil, [], nil, nil, nil, nil, nil, resumeFrom, nil, nil, false)
                 }
             }
         }
@@ -3123,12 +3199,84 @@ private enum TvDetailsFocusSection: Hashable {
     case comments
 }
 
+/// A separate focus hierarchy for choosing the exact episode to host.
+private struct WatchPartyDetailsEpisodePicker: View {
+    let episodes: [NuvioVideo]
+    let onSelect: (NuvioVideo) -> Void
+    let onCancel: () -> Void
+
+    @FocusState private var focusedEpisodeID: String?
+
+    private var sortedEpisodes: [NuvioVideo] {
+        episodes.sorted {
+            ($0.season, $0.episode, $0.id) < ($1.season, $1.episode, $1.id)
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 26) {
+            HStack {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Choose an episode")
+                        .font(.system(size: 40, weight: .bold))
+                    Text("Your Watch Party room will be created for this exact episode.")
+                        .font(.system(size: 21))
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("Cancel", action: onCancel)
+            }
+            .padding(.horizontal, 64)
+
+            if sortedEpisodes.isEmpty {
+                ContentUnavailableView(
+                    "Episodes unavailable",
+                    systemImage: "tv",
+                    description: Text("Wait for the episode list to load before creating a room.")
+                )
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 14) {
+                        ForEach(sortedEpisodes, id: \.id) { episode in
+                            Button {
+                                onSelect(episode)
+                            } label: {
+                                HStack(spacing: 20) {
+                                    Text("S\(episode.season) · E\(episode.episode)")
+                                        .font(.system(size: 23, weight: .semibold, design: .monospaced))
+                                    Text(episode.title)
+                                        .font(.system(size: 22))
+                                        .lineLimit(2)
+                                    Spacer()
+                                    Image(systemName: "chevron.right")
+                                }
+                                .padding(22)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .background(.white.opacity(0.1), in: RoundedRectangle(cornerRadius: 18))
+                            }
+                            .buttonStyle(.plain)
+                            .focused($focusedEpisodeID, equals: episode.id)
+                        }
+                    }
+                    .padding(.horizontal, 64)
+                }
+            }
+        }
+        .padding(.vertical, 46)
+        .background(Color.black.ignoresSafeArea())
+        .onAppear { focusedEpisodeID = sortedEpisodes.first?.id }
+        .onExitCommand(perform: onCancel)
+    }
+}
+
 struct TvDetailsContent: View {
     let uiState: DetailsUiState
     var initialPlayRequestID: UInt? = nil
     var onInitialPlayRequestConsumed: ((UInt) -> Void)? = nil
     let onPlayClick: () -> Void
     var onPlayManually: (() -> Void)? = nil
+    var onHostWatchParty: (() -> Void)? = nil
     let onEpisodeSelected: (NuvioVideo) -> Void
     var onEpisodePlayManually: ((NuvioVideo) -> Void)? = nil
     var onEpisodeMenuPresented: ((Bool) -> Void)? = nil
@@ -3419,6 +3567,7 @@ struct TvDetailsContent: View {
             onPlayLongPress: canBypassPicker ? {
                 handlePlayLongPress(playTarget: playTarget)
             } : nil,
+            onHostWatchParty: onHostWatchParty,
             onWatchlistClick: onWatchlistClick,
             onWatchedClick: onWatchedClick,
             onRateClick: onRateClick != nil ? {
@@ -4244,7 +4393,7 @@ private struct TvDetailsLogo: View {
 /// (tvOS doesn't auto-focus the primary button when the details content swaps in
 /// after the async load — see `TvDetailsContent`).
 private enum DetailsActionFocus: Hashable {
-    case play, watchlist, watched, rate, trailer
+    case play, party, watchlist, watched, rate, trailer
 }
 
 private enum DetailsCastHeaderFocus: Hashable {
@@ -4258,6 +4407,7 @@ private struct TvDetailsActionRow: View {
     var playHint: String = L10n.string("details_play_hint", fallback: "Starts playback or opens stream sources")
     let onPlayClick: () -> Void
     var onPlayLongPress: (() -> Void)? = nil
+    var onHostWatchParty: (() -> Void)? = nil
     let onWatchlistClick: () -> Void
     let onWatchedClick: () -> Void
     var mdbListUserRating: Int? = nil
@@ -4284,6 +4434,22 @@ private struct TvDetailsActionRow: View {
                 longPressAction: onPlayLongPress,
                 onBack: onBack
             )
+
+            if let onHostWatchParty {
+                TvDetailsActionButton(
+                    title: nil,
+                    systemName: "person.2.fill",
+                    accessibilityLabel: "Create Watch Party",
+                    accessibilityHint: "Host a private room for this title",
+                    isPrimary: false,
+                    focus: focus,
+                    tag: .party,
+                    action: onHostWatchParty,
+                    onFocus: onFocus,
+                    onBack: onBack
+                )
+                .disabled(entryLocked)
+            }
 
             TvDetailsActionButton(
                 title: nil,
@@ -6903,6 +7069,7 @@ private struct TvDetailsEpisodes: View {
                     let epRating = episodeRatings[meta.canonicalEpisodeStreamId(for: video)] ?? []
                     TvEpisodeCard(
                         video: video,
+                        fallbackArtworkURL: meta.backdropUrl,
                         fallbackRating: seriesRating,
                         continueProgress: continueProgress(for: video),
                         isWatched: watchedEpisodeKeys.contains(watchKey),
@@ -7107,6 +7274,7 @@ private struct TvEpisodeRatingItem: Identifiable {
 
 private struct TvEpisodeCard: View {
     let video: NuvioVideo
+    let fallbackArtworkURL: String?
     let fallbackRating: Double?
     let continueProgress: Double?
     let isWatched: Bool
@@ -7370,6 +7538,7 @@ private struct TvEpisodeCard: View {
     private var episodeArtwork: some View {
         CachedPosterArtwork(
             urlString: video.thumbnail,
+            fallbackURLString: fallbackArtworkURL,
             width: cardWidth,
             height: cardHeight,
             placeholder: { placeholderThumb }

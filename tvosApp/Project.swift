@@ -49,9 +49,9 @@ let signingXCConfig: Path = .relativeToManifest("Configurations/Signing.xcconfig
 // MARK: - Shared values
 
 let bundleID = "com.pyksel.nuviotvos"
-let marketingVersion = "3.4.4"
-let projectVersion = "75"
-// LibTrueHD 2.2.0 requires tvOS 18; APAC rendering itself is gated to tvOS 26+.
+let marketingVersion = "3.4.5"
+let projectVersion = "76"
+// LibTrueHD 3.0.0 requires tvOS 18; APAC rendering itself is gated to tvOS 26+.
 let tvOSDeployment = "18.0"
 
 // MARK: - Project-level settings
@@ -168,6 +168,7 @@ let appTarget: Target = .target(
         .package(product: "LibTorrent"),
         .package(product: "MPVKit"),
         .package(product: "SwiftAssRenderer"),
+        .package(product: "Realtime"),
     ],
     settings: .settings(
         base: [
@@ -292,6 +293,7 @@ let project = Project(
         .local(path: "../Vendor/LibTorrent"),
         .local(path: "../MPVKit"),
         .package(url: "https://github.com/mihai8804858/swift-ass-renderer.git", from: "1.3.1"),
+        .package(url: "https://github.com/supabase/supabase-swift.git", .exact("2.55.4")),
     ],
     settings: .settings(
         base: projectBaseSettings,

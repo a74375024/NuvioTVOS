@@ -6,6 +6,7 @@
 //
 
 import SwiftUI
+import Combine
 import Foundation
 import UIKit
 import ImageIO
@@ -270,10 +271,16 @@ private enum DetailsReturnDestination {
 }
 
 enum TVTab: Hashable, Identifiable, CaseIterable {
-    case profile, home, search, library, calendar, settings
+    case profile, home, party, search, library, calendar, settings
     case collection(CollectionHomeID)
 
-    static var allCases: [Self] { [.profile, .home, .search, .library, .calendar, .settings] }
+    static var allCases: [Self] {
+        if WatchPartyConfiguration.isEnabled {
+            return [.profile, .home, .party, .search, .library, .calendar, .settings]
+        } else {
+            return [.profile, .home, .search, .library, .calendar, .settings]
+        }
+    }
     var id: String { rawValue }
     var rawValue: String {
         switch self {
@@ -283,6 +290,7 @@ enum TVTab: Hashable, Identifiable, CaseIterable {
         case .library: return "Library"
         case .calendar: return "Calendar"
         case .settings: return "Settings"
+        case .party: return "Watch Party"
         case .collection(let id): return "Collection:\(id.key)"
         }
     }
@@ -294,6 +302,7 @@ enum TVTab: Hashable, Identifiable, CaseIterable {
         case .library: return L10n.string("nav_library", fallback: "Library")
         case .calendar: return L10n.string("nav_calendar", fallback: "Calendar")
         case .settings: return L10n.string("nav_settings", fallback: "Settings")
+        case .party: return "Watch Party"
         case .collection: return L10n.string("tmdb_collections_title", fallback: "Collections")
         }
     }
@@ -305,6 +314,7 @@ enum TVTab: Hashable, Identifiable, CaseIterable {
         case .library: return "rectangle.stack"
         case .calendar: return "calendar"
         case .settings: return "gearshape"
+        case .party: return "person.2.fill"
         case .collection: return "rectangle.stack.fill"
         }
     }
@@ -314,6 +324,12 @@ enum TVTab: Hashable, Identifiable, CaseIterable {
 struct ContentView: View {
     @Environment(\.scenePhase) private var scenePhase
     @State private var activeScreen: TVScreen = .login
+    @State private var playbackPartyID: UUID?
+    @State private var playerSurfaceID = UUID()
+    @State private var creatingParty = false
+    @State private var choosingPartySource = false
+    @State private var partyLaunchTask: Task<Void, Never>?
+    @State private var partyLaunchID = UUID()
     @State private var resolvedInitialScreen = false
     /// `nil` until tvOS has actually backgrounded the app, so the initial
     /// `.active` callback is never treated as a resume.
@@ -350,6 +366,7 @@ struct ContentView: View {
     /// player can offer/auto-play the next episode. Empty for movies/trailers.
     @State private var playbackEpisodes: [NuvioVideo] = []
     @State private var playbackCurrentEpisode: NuvioVideo?
+    @State private var playbackIsActionPlaybackSession = false
     @State private var playbackOrigin: PlaybackOrigin = .main
     @State private var playbackFilename: String?
     @State private var playbackSourceID: String?
@@ -398,6 +415,7 @@ struct ContentView: View {
     /// tvOS can accept it, instead of guessing with delayed timers.
     @State private var detailsDidDisappearGeneration: UInt = 0
     @StateObject private var authManager = AuthManager()
+    @StateObject private var watchPartyOwner = WatchPartyAppOwner()
     @StateObject private var profileViewModel = ProfileViewModel()
     @StateObject private var syncManager = NuvioSyncManager()
     // Both search screens are backed by their own view model. Only the one
@@ -541,6 +559,23 @@ struct ContentView: View {
         }
         .onChange(of: activeScreen) { oldScreen, newScreen in
             TVHomeDebugTrace.log("app.activeScreen changed from \(oldScreen) to \(newScreen)")
+            if oldScreen != newScreen, !newScreen.isPlayer, partyLaunchTask != nil {
+                partyLaunchID = UUID(); partyLaunchTask?.cancel(); partyLaunchTask = nil
+            }
+        }
+        .overlay {
+            if partyLaunchTask != nil {
+                VStack(spacing: 24) {
+                    ProgressView("Preparing Watch Party…")
+                    Button("Cancel") {
+                        partyLaunchID = UUID(); partyLaunchTask?.cancel(); partyLaunchTask = nil
+                        creatingParty = false; choosingPartySource = false
+                        selectedTab = .party; activeScreen = .main
+                    }
+                }
+                .padding(50)
+                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 24))
+            }
         }
         .background(Color.black.ignoresSafeArea())
         // Safety net for the Menu button while an overlay is up. During the
@@ -551,8 +586,35 @@ struct ContentView: View {
         // focus is settled inside Details/Player their own handler fires first,
         // so this only kicks in for the in-between frames.
         .onExitCommand(perform: isOverlayPresented ? dismissOverlay : nil)
+        .onChange(of: watchPartyOwner.presentation?.id) { old, new in
+            if old == nil, let new, activeScreen.isPlayer, playbackPartyID == nil {
+                // InSight adopted the already-playing PlayerViewModel. Keep its view identity stable.
+                playbackPartyID = new
+            }
+            if let old, old == playbackPartyID, new == nil {
+                playbackPartyID = nil
+                let keepPlayer = watchPartyOwner.consumePreservePlayerAfterRoomExit()
+                if activeScreen.isPlayer, !keepPlayer {
+                    activeScreen = .main; selectedTab = WatchPartyConfiguration.isEnabled ? .party : .home
+                }
+            }
+        }
+        .onReceive(authManager.contextWillChange.merge(with: profileViewModel.contextWillChange)) { _ in
+            partyLaunchID = UUID()
+            partyLaunchTask?.cancel(); partyLaunchTask = nil
+            creatingParty = false; choosingPartySource = false
+        }
         .onOpenURL(perform: handleDeepLink)
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.willResignActiveNotification)) { _ in
+            watchPartyOwner.suspendForInactivity()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
+            watchPartyOwner.resumeAfterForeground()
+        }
         .onAppear {
+            if WatchPartyConfiguration.isEnabled {
+                watchPartyOwner.attach(authManager: authManager, profiles: profileViewModel)
+            }
             syncManager.attach(authManager: authManager, profileViewModel: profileViewModel)
             ICloudSettingsSyncManager.shared.start()
             setupPictureInPicture()
@@ -637,11 +699,13 @@ struct ContentView: View {
         .onChange(of: scenePhase) { _, phase in
             switch phase {
             case .background:
+                watchPartyOwner.suspendForInactivity()
                 backgroundedAt = Date()
                 syncManager.flushPendingPushes()
             case .active:
                 syncManager.refreshAccountIfIdle()
                 presentProfileSelectionAfterBackgroundIfNeeded()
+                watchPartyOwner.resumeAfterForeground()
             default:
                 break
             }
@@ -681,6 +745,9 @@ struct ContentView: View {
             }
         }
         guard shouldRequireSelection else { return }
+
+        // Revoke transient Party work before a privacy gate, even if the selected ID stays equal.
+        watchPartyOwner.invalidateContext()
 
         continueWatchingPlaybackTask?.cancel()
         continueWatchingPlaybackTask = nil
@@ -1508,9 +1575,23 @@ struct ContentView: View {
         videoHash: String? = nil,
         startupBenchmarkToken: UUID? = nil,
         sourceID: String? = nil,
-        collectionContext: CollectionPlaybackContext? = nil
+        collectionContext: CollectionPlaybackContext? = nil,
+        isActionPlaybackSession: Bool = false
     ) {
+        playbackIsActionPlaybackSession = isActionPlaybackSession
         let isTrailer = subtitle == PlaybackMarkers.trailerSubtitle
+        let isStandalonePlaybackSession = isTrailer || isActionPlaybackSession
+        if !isStandalonePlaybackSession && (creatingParty || choosingPartySource) {
+            launchPartyPlayback(url: url, meta: meta, subtitle: subtitle, httpHeaders: httpHeaders,
+                externalSubtitles: externalSubtitles, cacheFileIdentity: cacheFileIdentity,
+                filename: filename, videoSize: videoSize, videoHash: videoHash,
+                startupBenchmarkToken: startupBenchmarkToken, sourceID: sourceID)
+            return
+        }
+        if watchPartyOwner.presentation != nil {
+            watchPartyOwner.finishPlayback()
+            playbackPartyID = nil
+        }
         let provenance = collectionContext ?? self.collectionContext(id: meta.id, type: meta.type)
         let store = ProfileSettings.store(for: profileViewModel.activeProfile?.id)
         let defaultPlayer = ExternalPlayer.from(store.string(forKey: SettingsKey.externalPlayer))
@@ -1526,7 +1607,9 @@ struct ContentView: View {
             : []
 
         let numbers: (season: Int, episode: Int)?
-        if let current = playbackCurrentEpisode, current.season > 0, current.episode > 0 {
+        if isActionPlaybackSession {
+            numbers = nil
+        } else if let current = playbackCurrentEpisode, current.season > 0, current.episode > 0 {
             numbers = (current.season, current.episode)
         } else if let parsed = Self.episodeNumbers(fromSubtitle: subtitle) {
             numbers = parsed
@@ -1542,7 +1625,7 @@ struct ContentView: View {
         let errorCallback: URL?
         // Infuse, SenPlayer, and Native Player all take x-callback-url success/error
         // URLs and return here so we can report watch progress to continue-watching/Trakt.
-        if player == .infuse || player == .senplayer || player == .nativePlayer {
+        if !isActionPlaybackSession && (player == .infuse || player == .senplayer || player == .nativePlayer) {
             let id = UUID().uuidString
             let profileID = profileViewModel.activeProfile?.id ?? WatchedStore.activeProfileId
             externalSession = ExternalPlaybackSession(
@@ -1570,10 +1653,10 @@ struct ContentView: View {
             meta: meta,
             season: meta.isSeries ? numbers?.season : nil,
             episode: meta.isSeries ? numbers?.episode : nil,
-            episodeTitle: playbackCurrentEpisode?.title ?? (meta.isSeries ? subtitle : nil)
+            episodeTitle: isActionPlaybackSession ? nil : (playbackCurrentEpisode?.title ?? (meta.isSeries ? subtitle : nil))
         )
 
-        if !isTrailer,
+        if !isStandalonePlaybackSession,
            url.scheme?.lowercased() != "smb",
            let launchURL = player.launchURL(
                for: url,
@@ -1599,7 +1682,7 @@ struct ContentView: View {
             subtitle: subtitle,
             httpHeaders: httpHeaders,
             externalSubtitles: externalSubtitles,
-            resumeFrom: resumeFrom,
+            resumeFrom: isActionPlaybackSession ? nil : resumeFrom,
             origin: origin,
             cacheFileIdentity: cacheFileIdentity,
             filename: filename,
@@ -1609,6 +1692,183 @@ struct ContentView: View {
             sourceID: sourceID,
             collectionContext: provenance
         )
+    }
+
+    /// Host from Details without starting a stream. The server owns room-code
+    /// generation; membership and uncertain outcomes stay in WatchPartyService.
+    private func createWatchPartyFromDetails(meta: NuvioMeta, episode: NuvioVideo?) {
+        guard WatchPartyConfiguration.isEnabled else { return }
+        guard let service = watchPartyOwner.service, partyLaunchTask == nil else { return }
+        guard authManager.isAuthenticated, !authManager.sessionNeedsReauthentication,
+              profileViewModel.activeProfile != nil else {
+            selectedTab = .party
+            activeScreen = .main
+            return
+        }
+        if service.session?.party != nil {
+            selectedTab = .party
+            activeScreen = .main
+            return
+        }
+        guard !service.busy, !service.membershipOutcomeUncertain else {
+            watchPartyOwner.message = "Check your previous room request before creating another."
+            selectedTab = .party
+            activeScreen = .main
+            return
+        }
+        let media: WatchPartyMedia
+        do {
+            media = try WatchPartyLaunchPolicy.mediaForDetails(meta, episode: episode)
+        } catch {
+            watchPartyOwner.message = "Choose a valid movie or a specific episode to host a room."
+            return
+        }
+        watchPartyOwner.message = nil
+        let mark = UUID()
+        partyLaunchID = mark
+        partyLaunchTask = Task { @MainActor in
+            defer { if partyLaunchID == mark { partyLaunchTask = nil } }
+            do {
+                try await service.create(media: media, playback: nil)
+                guard !Task.isCancelled, partyLaunchID == mark,
+                      watchPartyOwner.service === service else { return }
+                creatingParty = false
+                choosingPartySource = false
+                partyLaunchTask = nil
+                selectedTab = .party
+                activeScreen = .main
+            } catch {
+                guard !Task.isCancelled, partyLaunchID == mark,
+                      watchPartyOwner.service === service else { return }
+                watchPartyOwner.message = "Watch Party could not create the room. Check the room status before retrying."
+                partyLaunchTask = nil
+                selectedTab = .party
+                activeScreen = .main
+            }
+        }
+    }
+
+    private func launchPartyPlayback(
+        url: URL, meta: NuvioMeta, subtitle: String, httpHeaders: [String: String],
+        externalSubtitles: [NuvioSubtitle], cacheFileIdentity: PlaybackCacheFileIdentity?,
+        filename: String?, videoSize: Int64?, videoHash: String?,
+        startupBenchmarkToken: UUID?, sourceID: String?
+    ) {
+        guard let service = watchPartyOwner.service else { return }
+        let createsRoom = creatingParty
+        let roomMedia = service.session?.party?.media
+        let episode = meta.isSeries ? playbackCurrentEpisode : nil
+        // Keep validation inside the launch task so its existing catch path
+        // releases startup timing and any resolved torrent on failure.
+        let mediaResult = Result {
+            try WatchPartyLaunchPolicy.mediaForPlayback(
+                meta, episode: episode, room: roomMedia
+            )
+        }
+        partyLaunchTask?.cancel()
+        let mark = UUID()
+        partyLaunchID = mark
+        partyLaunchTask = Task { @MainActor in
+            defer { if partyLaunchID == mark { partyLaunchTask = nil } }
+            do {
+                let media = try mediaResult.get()
+                try WatchPartyLaunchPolicy.validate(media)
+                if createsRoom { try await service.create(media: media) }
+                try Task.checkCancellation()
+                guard partyLaunchID == mark, watchPartyOwner.service === service,
+                      let current = service.session?.party?.media else { throw WatchPartyPlaybackRuntimeError.staleContext }
+                try WatchPartyLaunchPolicy.validateSelection(media, room: current)
+                let presentation = try watchPartyOwner.preparePlayback(media: current)
+                creatingParty = false; choosingPartySource = false
+                presentBuiltInPlayer(url: url, meta: meta, subtitle: subtitle, httpHeaders: httpHeaders,
+                    externalSubtitles: externalSubtitles, resumeFrom: nil, origin: .main,
+                    cacheFileIdentity: cacheFileIdentity, filename: filename, videoSize: videoSize,
+                    videoHash: videoHash, startupBenchmarkToken: startupBenchmarkToken,
+                    sourceID: sourceID, party: presentation)
+            } catch {
+                PlaybackStartupTiming.cancel(token: startupBenchmarkToken)
+                if PictureInPictureManager.shared.activeCoordinator?.torrentStreamSourceURL != url {
+                    await TorrentEngineManager.shared.stopActiveStream(for: url)
+                }
+                guard partyLaunchID == mark, !Task.isCancelled else { return }
+                watchPartyOwner.message = error is WatchPartyLaunchError
+                    ? "That title or episode doesn't match the room. Choose the matching entry; you can use any source."
+                    : "Watch Party could not start. Check the room status and choose your source again."
+                selectedTab = .party; activeScreen = .main
+            }
+        }
+    }
+
+    private func watchPartyMedia(
+        for meta: NuvioMeta,
+        episode: NuvioVideo? = nil,
+        matchingRoom: WatchPartyMedia? = nil
+    ) -> WatchPartyMedia {
+        let identifiers = [meta.id, meta.imdbId].compactMap { $0 }
+        let metaID = matchingRoom.flatMap { identifiers.contains($0.metaID) ? $0.metaID : nil }
+            ?? meta.imdbId ?? meta.id
+        let mediaType = meta.isSeries ? "series" : "movie"
+        return WatchPartyMedia(
+            type: mediaType,
+            metaID: metaID,
+            metaType: mediaType,
+            videoID: episode?.id,
+            season: episode?.season,
+            episode: episode?.episode,
+            title: meta.name,
+            episodeTitle: episode?.title,
+            description: meta.description,
+            poster: meta.posterUrl,
+            background: meta.backgroundUrl,
+            logo: meta.logoUrl
+        )
+    }
+
+    private func createWatchPartyRoom(media: WatchPartyMedia) {
+        guard WatchPartyConfiguration.isEnabled else {
+            creatingParty = false
+            return
+        }
+        guard creatingParty, partyLaunchTask == nil else { return }
+        guard let service = watchPartyOwner.service else {
+            creatingParty = false
+            watchPartyOwner.message = "Watch Party is unavailable on this server."
+            selectedTab = .party; activeScreen = .main
+            return
+        }
+
+        let mark = UUID()
+        partyLaunchID = mark
+        partyLaunchTask = Task { @MainActor in
+            defer { if partyLaunchID == mark { partyLaunchTask = nil } }
+            do {
+                try WatchPartyLaunchPolicy.validate(media)
+                try await service.create(media: media)
+                try Task.checkCancellation()
+                guard partyLaunchID == mark, watchPartyOwner.service === service,
+                      let roomMedia = service.session?.party?.media else {
+                    throw WatchPartyPlaybackRuntimeError.staleContext
+                }
+                try WatchPartyLaunchPolicy.validateSelection(media, room: roomMedia)
+
+                creatingParty = false
+                choosingPartySource = false
+                watchPartyOwner.message = nil
+                partyLaunchTask = nil
+                selectedTab = .party
+                activeScreen = .main
+            } catch {
+                guard partyLaunchID == mark, !Task.isCancelled else { return }
+                creatingParty = false
+                choosingPartySource = false
+                watchPartyOwner.message = error is WatchPartyLaunchError
+                    ? "That title or episode isn't supported for a Watch Party."
+                    : "Watch Party could not be created. Check the room status and try again."
+                partyLaunchTask = nil
+                selectedTab = .party
+                activeScreen = .main
+            }
+        }
     }
 
     private func presentBuiltInPlayer(
@@ -1625,8 +1885,18 @@ struct ContentView: View {
         videoHash: String? = nil,
         startupBenchmarkToken: UUID? = nil,
         sourceID: String? = nil,
-        collectionContext: CollectionPlaybackContext? = nil
+        collectionContext: CollectionPlaybackContext? = nil,
+        party: WatchPartyAppOwner.Presentation? = nil
     ) {
+        if party == nil {
+            partyLaunchID = UUID()
+            partyLaunchTask?.cancel(); partyLaunchTask = nil
+            watchPartyOwner.finishPlayback()
+        }
+        playbackPartyID = party?.id
+        if let party, PictureInPictureManager.shared.activeCoordinator !== party.mount.viewModel.sessionCoordinator {
+            PictureInPictureManager.shared.invalidateSession()
+        }
         if PictureInPictureManager.shared.isPictureInPictureActive,
            PictureInPictureManager.shared.activeContext?.url != url {
             PictureInPictureManager.shared.invalidateSession()
@@ -1645,6 +1915,7 @@ struct ContentView: View {
         playbackCacheFileIdentity = cacheFileIdentity
         playbackStartupBenchmarkToken = startupBenchmarkToken
         playbackDidStart = false
+        playerSurfaceID = UUID()
         withAnimation(.easeInOut(duration: 0.28)) {
             activeScreen = .player(
                 url: url,
@@ -1658,8 +1929,29 @@ struct ContentView: View {
     }
 
     private func setupPictureInPicture() {
+        PictureInPictureManager.shared.onDidLoseWatchPartyPiP = { coordinator in
+            guard watchPartyOwner.owns(coordinator),
+                  !activeScreen.isPlayer || UIApplication.shared.applicationState != .active else { return }
+            watchPartyOwner.finishPlayback()
+        }
         PictureInPictureManager.shared.onRestoreUI = { [self] context, completion in
+            if watchPartyOwner.owns(PictureInPictureManager.shared.activeCoordinator) {
+                guard let restored = watchPartyOwner.restorePlayback(for: PictureInPictureManager.shared.activeCoordinator) else {
+                    completion(false)
+                    watchPartyOwner.finishPlayback()
+                    return
+                }
+                playbackPartyID = restored.id
+            } else {
+                guard PictureInPictureManager.shared.activeCoordinator?.aetherController?.isWatchPartyControlled != true else {
+                    completion(false)
+                    return
+                }
+                playbackPartyID = nil
+            }
             withAnimation(.easeInOut(duration: 0.24)) {
+                self.playbackIsActionPlaybackSession = false
+                self.playerSurfaceID = UUID()
                 self.playbackOrigin = context.playbackOrigin
                 self.playbackCollectionContext = self.collectionContext(
                     id: context.meta.id, type: context.meta.type, resuming: true
@@ -1684,6 +1976,10 @@ struct ContentView: View {
         }
 
         PictureInPictureManager.shared.onDidStopPiPWithoutRestoring = {
+            if watchPartyOwner.owns(PictureInPictureManager.shared.activeCoordinator) {
+                watchPartyOwner.finishPlayback()
+                return
+            }
             if let coordinator = PictureInPictureManager.shared.activeCoordinator {
                 PlaybackWakeLock.release(ownerID: coordinator.wakeLockOwnerID)
             }
@@ -1926,6 +2222,44 @@ struct ContentView: View {
             onProfileGateReadinessChange: profileGateReadinessChanged,
             authManager: authManager,
             syncManager: syncManager,
+            watchPartyOwner: watchPartyOwner,
+            onCreateParty: {
+                creatingParty = true; choosingPartySource = false
+                reopenStreamPickerOnDetails = false
+                reopenStreamPickerEpisode = nil
+                selectedTab = .search
+            },
+            onChoosePartySource: { media in
+                // Honor upstream beta gating. Never detach the current player
+                // for a stale or unauthorized Watch Party selection.
+                guard WatchPartyConfiguration.isEnabled,
+                      let room = watchPartyOwner.service?.session,
+                      room.connection == .ready, room.membershipExit == nil,
+                      let currentMedia = room.party?.media,
+                      (try? WatchPartyLaunchPolicy.validateSelection(media, room: currentMedia)) != nil else {
+                    watchPartyOwner.message = "The room or episode changed. Review the current room before choosing a source."
+                    return
+                }
+                creatingParty = false; choosingPartySource = true
+                watchPartyOwner.finishPlayback()
+                reopenStreamPickerOnDetails = true
+                if let season = media.season, let episode = media.episode {
+                    reopenStreamPickerEpisode = NuvioVideo(
+                        id: media.videoID ?? "\(media.metaID):\(season):\(episode)",
+                        title: media.episodeTitle.flatMap { $0.isEmpty ? nil : $0 } ?? "Episode \(episode)",
+                        season: season,
+                        episode: episode
+                    )
+                } else {
+                    reopenStreamPickerEpisode = nil
+                }
+                openDetailsRoot(id: media.metaID, type: media.metaType)
+            },
+            partyIsChoosing: creatingParty || choosingPartySource,
+            onCancelPartySelection: {
+                creatingParty = false; choosingPartySource = false
+                partyLaunchID = UUID(); partyLaunchTask?.cancel(); partyLaunchTask = nil
+            },
             onSwitchProfile: {
                 // A fresh profile should get a fresh Home (different Continue
                 // Watching, etc.), so drop the cached catalog.
@@ -2096,7 +2430,16 @@ struct ContentView: View {
                 reopenStreamPickerOnDetails = false
                 reopenStreamPickerEpisode = nil
             },
-            onPlayClick: { streamUrlString, httpHeaders, meta, subtitle, externalSubtitles, currentEpisode, episodes, player, cacheFileIdentity, filename, videoSize, videoHash, resumeFrom, startupToken, sourceID in
+            onWatchPartyMovieReady: { meta in
+                guard creatingParty, !meta.isSeries else { return }
+                createWatchPartyRoom(media: watchPartyMedia(for: meta))
+            },
+            creatingWatchPartyRoom: creatingParty,
+            onWatchPartyMediaSelected: { meta, episode in
+                guard creatingParty else { return }
+                createWatchPartyRoom(media: watchPartyMedia(for: meta, episode: episode))
+            },
+            onPlayClick: { streamUrlString, httpHeaders, meta, subtitle, externalSubtitles, currentEpisode, episodes, player, cacheFileIdentity, filename, videoSize, videoHash, resumeFrom, startupToken, sourceID, isActionPlaybackSession in
                 if let url = URL(string: streamUrlString) {
                     let isTrailer = subtitle == PlaybackMarkers.trailerSubtitle
                     reopenStreamPickerOnDetails = false
@@ -2108,7 +2451,7 @@ struct ContentView: View {
                         meta: meta,
                         subtitle: subtitle,
                         externalSubtitles: externalSubtitles,
-                        resumeFrom: isTrailer ? resumeFrom : (resumeFrom ?? Self.resumePosition(for: meta, episode: currentEpisode)),
+                        resumeFrom: isActionPlaybackSession ? nil : (isTrailer ? resumeFrom : (resumeFrom ?? Self.resumePosition(for: meta, episode: currentEpisode))),
                         httpHeaders: httpHeaders,
                         origin: .details,
                         customPlayer: player,
@@ -2118,13 +2461,17 @@ struct ContentView: View {
                         videoHash: videoHash,
                         startupBenchmarkToken: startupToken,
                         sourceID: sourceID,
-                        collectionContext: provenance
+                        collectionContext: provenance,
+                        isActionPlaybackSession: isActionPlaybackSession
                     )
                 } else {
                     PlaybackStartupTiming.cancel(token: startupToken)
                 }
             },
             onBack: { leaveDetails() },
+            onCreateWatchParty: WatchPartyConfiguration.isEnabled ? { meta, episode in
+                createWatchPartyFromDetails(meta: meta, episode: episode)
+            } : nil,
             onOpenTitle: { nextId, nextType in
                 detailsBackStack.append((id: contentId, type: contentType))
                 withAnimation(.easeInOut(duration: 0.28)) {
@@ -2628,10 +2975,17 @@ struct ContentView: View {
         startupBenchmarkToken: UUID?
     ) -> some View {
         let isTrailer = subtitle == PlaybackMarkers.trailerSubtitle
+        let isActionPlaybackSession = playbackIsActionPlaybackSession
+        let isStandalonePlaybackSession = isTrailer || isActionPlaybackSession
         let store = ProfileSettings.store(for: profileViewModel.activeProfile?.id)
         let autoPlayNext = store.object(forKey: SettingsKey.autoPlayNext) as? Bool ?? true
         let autoPlayNextCountdown = store.object(forKey: SettingsKey.autoPlayNextCountdown) as? Int ?? 10
         let provenance = playbackCollectionContext
+        let surfaceIdentity = playerSurfaceID
+        let party = playbackPartyID.flatMap { id in
+            watchPartyOwner.presentation.flatMap { $0.id == id && $0.mount.isCurrent ? $0.mount : nil }
+        }
+        if playbackPartyID == nil || party != nil {
         PlayerView(
             url: url,
             meta: meta,
@@ -2639,18 +2993,19 @@ struct ContentView: View {
             httpHeaders: httpHeaders,
             externalSubtitles: externalSubtitles,
             resumeFrom: resumeFrom,
+            isActionPlaybackSession: isActionPlaybackSession,
             playbackOrigin: playbackOrigin,
-            filename: isTrailer ? nil : playbackFilename,
-            videoSize: isTrailer ? nil : playbackVideoSize,
-            videoHash: isTrailer ? nil : playbackVideoHash,
-            cacheFileIdentity: isTrailer ? nil : playbackCacheFileIdentity,
-            sourceID: isTrailer ? nil : playbackSourceID,
-            episodes: isTrailer ? [] : playbackEpisodes,
-            currentEpisode: isTrailer ? nil : playbackCurrentEpisode,
+            filename: isStandalonePlaybackSession ? nil : playbackFilename,
+            videoSize: isStandalonePlaybackSession ? nil : playbackVideoSize,
+            videoHash: isStandalonePlaybackSession ? nil : playbackVideoHash,
+            cacheFileIdentity: isStandalonePlaybackSession ? nil : playbackCacheFileIdentity,
+            sourceID: isStandalonePlaybackSession ? nil : playbackSourceID,
+            episodes: (isStandalonePlaybackSession || party != nil) ? [] : playbackEpisodes,
+            currentEpisode: isStandalonePlaybackSession ? nil : playbackCurrentEpisode,
             initialStartupBenchmarkToken: startupBenchmarkToken,
-            autoPlayNextEnabled: autoPlayNext,
+            autoPlayNextEnabled: party == nil && autoPlayNext,
             autoPlayNextCountdownSeconds: autoPlayNextCountdown,
-            resolveNextStream: (isTrailer || !meta.isSeries) ? nil : { episode, startupToken in
+            resolveNextStream: (isStandalonePlaybackSession || party != nil || !meta.isSeries) ? nil : { episode, startupToken in
                 await Self.resolveNextEpisodeStream(
                     episode: episode,
                     seriesMeta: meta,
@@ -2658,7 +3013,7 @@ struct ContentView: View {
                     startupToken: startupToken
                 )
             },
-            reloadCurrentStream: isTrailer ? nil : { currentEpisode, excludedURLs in
+            reloadCurrentStream: (isStandalonePlaybackSession || party != nil) ? nil : { currentEpisode, excludedURLs in
                 let profileId = profileViewModel.activeProfile?.id
                 let excluded = Set(excludedURLs)
                 if let episode = currentEpisode {
@@ -2685,14 +3040,14 @@ struct ContentView: View {
                     startupToken: nil
                 )
             },
-            fetchPlaybackSources: isTrailer ? nil : { contentId, type in
+            fetchPlaybackSources: (isStandalonePlaybackSession || party != nil) ? nil : { contentId, type in
                 Self.playbackSourcesProgressively(
                     contentId: contentId,
                     type: type,
                     profileId: profileViewModel.activeProfile?.id
                 )
             },
-            resolvePlaybackStream: isTrailer ? nil : { stream, contentId, subtitleLine, startupToken in
+            resolvePlaybackStream: (isStandalonePlaybackSession || party != nil) ? nil : { stream, contentId, subtitleLine, startupToken in
                 await Self.resolveChosenStream(
                     stream,
                     contentId: contentId,
@@ -2702,21 +3057,23 @@ struct ContentView: View {
                     startupToken: startupToken
                 )
             },
-            onRequestSources: isTrailer ? nil : {
+            onRequestSources: (isStandalonePlaybackSession || party != nil) ? nil : {
                 withAnimation(.easeInOut(duration: 0.28)) {
                     reopenStreamPickerOnDetails = true
                     reopenStreamPickerEpisode = playbackCurrentEpisode
                     openDetailsRoot(id: meta.id, type: meta.type, collectionContext: provenance)
                 }
             },
-            onFinished: isTrailer ? {
+            onFinished: isActionPlaybackSession ? {
+                dismissPlayer(meta: meta, subtitle: subtitle)
+            } : (isTrailer ? {
                 withAnimation(.easeInOut(duration: 0.24)) {
                     activeScreen = .details(id: meta.id, type: meta.type)
                 }
-            } : nil,
+            } : nil),
             onPlaybackStarted: {
                 playbackDidStart = true
-                if !isTrailer, let provenance,
+                if !isStandalonePlaybackSession, let provenance,
                    ProfileSettings.activeProfileID == provenance.profileID {
                     CollectionPlaybackOriginStore.recordStarted(
                         meta: meta, context: provenance,
@@ -2724,18 +3081,32 @@ struct ContentView: View {
                     )
                 }
             },
-            onPlayRecommendation: { recMeta, playManually in
+            onPlayRecommendation: (isStandalonePlaybackSession || party != nil) ? nil : { recMeta, playManually in
                 dismissPlayer(meta: meta, subtitle: subtitle)
                 playRecommendedTitle(meta: recMeta, playManually: playManually)
             },
-            onOpenRecommendationDetails: { recMeta in
+            onOpenRecommendationDetails: (isStandalonePlaybackSession || party != nil) ? nil : { recMeta in
                 dismissPlayer(meta: meta, subtitle: subtitle)
                 withAnimation(.easeInOut(duration: 0.28)) {
                     openDetailsRoot(id: recMeta.id, type: recMeta.type)
                 }
-            }
-        ) {
-            dismissPlayer(meta: meta, subtitle: subtitle)
+            },
+            partyPlayback: party,
+            partyPlaybackIdentity: playbackPartyID,
+            watchPartyOwner: watchPartyOwner,
+            isCurrentPlayerSurface: {
+                self.activeScreen.isPlayer
+                    && self.playerSurfaceID == surfaceIdentity
+                    && UIApplication.shared.applicationState == .active
+            },
+            onOpenWatchPartyLobby: {
+                guard WatchPartyConfiguration.isEnabled, party == nil else { return }
+                selectedTab = .party
+                activeScreen = .main
+            },
+            onBack: { dismissPlayer(meta: meta, subtitle: subtitle) }
+        )
+        .id(playerSurfaceID.uuidString)
         }
     }
 
@@ -2778,19 +3149,29 @@ struct ContentView: View {
     }
 
     private func dismissPlayer(meta: NuvioMeta, subtitle: String) {
+        if playbackPartyID != nil {
+            let pip = PictureInPictureManager.shared
+            let keepsPiP = watchPartyOwner.owns(pip.activeCoordinator)
+                && (pip.isPictureInPictureActive || pip.isRestoringUIInProgress)
+            if !keepsPiP { watchPartyOwner.finishPlayback(); playbackPartyID = nil }
+            selectedTab = WatchPartyConfiguration.isEnabled ? .party : .home
+            activeScreen = .main
+            return
+        }
         let isTrailer = subtitle == PlaybackMarkers.trailerSubtitle
+        let isActionPlaybackSession = playbackIsActionPlaybackSession
         withAnimation(.easeInOut(duration: 0.24)) {
             switch playbackOrigin {
             case .details:
                 // A stream that never reached playback should return to the
                 // exact decision point so another source is one click away.
-                reopenStreamPickerOnDetails = !playbackDidStart && !isTrailer
+                reopenStreamPickerOnDetails = isActionPlaybackSession || (!playbackDidStart && !isTrailer)
                 reopenStreamPickerEpisode = reopenStreamPickerOnDetails ? playbackCurrentEpisode : nil
                 activeScreen = .details(id: meta.id, type: meta.type)
             case .cloudLibrary:
                 activeScreen = .cloudLibrary
             case .main:
-                activeScreen = (isTrailer || meta.isSeries)
+                activeScreen = (isTrailer || isActionPlaybackSession || meta.isSeries)
                     ? .details(id: meta.id, type: meta.type)
                     : .main
             }
@@ -3163,6 +3544,11 @@ private struct TVMainTabView: View {
     let onProfileGateReadinessChange: (TVHomeContentIdentity, UInt, TVProfileGateReadiness) -> Void
     let authManager: AuthManager
     let syncManager: NuvioSyncManager
+    @ObservedObject var watchPartyOwner: WatchPartyAppOwner
+    let onCreateParty: () -> Void
+    let onChoosePartySource: (WatchPartyMedia) -> Void
+    let partyIsChoosing: Bool
+    let onCancelPartySelection: () -> Void
     let onSwitchProfile: () -> Void
     let onChangeProfileAvatar: (String, String) -> Void
     let onChangeProfileName: (String, String) -> Void
@@ -3410,6 +3796,11 @@ private struct TVMainTabView: View {
             homeTabContent
                 .tabItem { Label(TVTab.home.title, systemImage: TVTab.home.symbol) }
                 .tag(TVTab.home)
+            if WatchPartyConfiguration.isEnabled {
+                partyTabContent
+                    .tabItem { Label(TVTab.party.title, systemImage: TVTab.party.symbol) }
+                    .tag(TVTab.party)
+            }
             searchTab
                 .tabItem { Label(TVTab.search.title, systemImage: TVTab.search.symbol) }
                 .tag(TVTab.search)
@@ -3423,6 +3814,19 @@ private struct TVMainTabView: View {
         }
     }
 
+    @ViewBuilder
+    private var partyTabContent: some View {
+        if let service = watchPartyOwner.service {
+            WatchPartyLobbyView(owner: watchPartyOwner, service: service,
+                canUseAccount: isAuthenticated && !sessionNeedsReauthentication && activeProfile != nil,
+                isChoosing: partyIsChoosing, onCreate: onCreateParty,
+                onChooseSource: onChoosePartySource, onCancelSelection: onCancelPartySelection,
+                onOpenProfile: onSwitchProfile)
+        } else {
+            Text("Sign in and choose a profile to use Watch Party.")
+        }
+    }
+
     @available(tvOS 18.0, *)
     private var groupedCollectionTabs: some View {
         TabView(selection: $selectedTab) {
@@ -3431,6 +3835,11 @@ private struct TVMainTabView: View {
             }
             Tab(TVTab.home.title, systemImage: TVTab.home.symbol, value: TVTab.home) {
                 homeTabContent
+            }
+            if WatchPartyConfiguration.isEnabled {
+                Tab(TVTab.party.title, systemImage: TVTab.party.symbol, value: TVTab.party) {
+                    partyTabContent
+                }
             }
             Tab(TVTab.search.title, systemImage: TVTab.search.symbol, value: TVTab.search) {
                 searchTab
@@ -3574,41 +3983,44 @@ private struct TVSidebarProfileHeader: View {
             headerContent
         }
         .buttonStyle(PosterCardButtonStyle())
+        .scaleEffect(isFocused ? 1.05 : 1.0, anchor: .leading)
+        .animation(.spring(response: 0.28, dampingFraction: 0.78), value: isFocused)
         .focused($isFocused)
         .focusEffectDisabled()
-        .animation(.easeInOut(duration: 0.2), value: isFocused)
     }
 
     private var headerContent: some View {
         HStack(spacing: 12) {
             TVSidebarAvatar(profile: profile, isFocused: isFocused)
 
-            VStack(alignment: .leading, spacing: 3) {
+            VStack(alignment: .leading, spacing: 2) {
                 Text(displayName)
-                    .font(.system(size: 26, weight: .semibold))
+                    .font(.system(size: 21, weight: .semibold))
                     .foregroundColor(.white)
                     .lineLimit(1)
-                    .layoutPriority(1)
+                    .minimumScaleFactor(0.85)
 
                 if isFocused {
                     Text(L10n.string("profile_change", fallback: "Change Profile"))
-                        .font(.system(size: 18, weight: .semibold))
+                        .font(.system(size: 16, weight: .medium))
                         .foregroundColor(.white.opacity(0.72))
                         .lineLimit(1)
                         .transition(.opacity.combined(with: .move(edge: .top)))
                 }
             }
-            .layoutPriority(1)
 
             Spacer(minLength: 8)
 
             TVSidebarClock()
-                .font(.system(size: 23, weight: .medium))
+                .font(.system(size: 20, weight: .medium))
                 .foregroundColor(.white.opacity(0.68))
-                .frame(width: 140, alignment: .trailing)
+                .fixedSize(horizontal: true, vertical: false)
+                .opacity(isFocused ? 0 : 1)
+                .animation(isFocused ? .easeOut(duration: 0.12) : .easeInOut(duration: 0.25), value: isFocused)
+                .accessibilityHidden(isFocused)
         }
         .padding(.horizontal, 10)
-        .padding(.vertical, 14)
+        .padding(.vertical, 12)
         .contentShape(Rectangle())
     }
 
@@ -3624,13 +4036,14 @@ private struct TVSidebarAvatar: View {
     var body: some View {
         ProfileAvatarView(
             avatarId: profile?.avatarId ?? ProfileAvatarCatalog.defaultId,
-            size: 44,
-            isFocused: isFocused
+            size: 54,
+            isFocused: isFocused,
+            showsFocusOutline: false
         )
-        .scaleEffect(isFocused ? 1.12 : 1)
-        .offset(y: isFocused ? -3 : 0)
-        .shadow(color: .black.opacity(isFocused ? 0.32 : 0), radius: 12, x: 0, y: 8)
-        .animation(.spring(response: 0.28, dampingFraction: 0.82), value: isFocused)
+        .scaleEffect(isFocused ? 1.15 : 1)
+        .offset(y: isFocused ? -2 : 0)
+        .shadow(color: .black.opacity(isFocused ? 0.42 : 0), radius: isFocused ? 16 : 0, x: 0, y: isFocused ? 8 : 0)
+        .animation(.spring(response: 0.28, dampingFraction: 0.78), value: isFocused)
     }
 }
 
@@ -3959,6 +4372,7 @@ struct TVHomeView: View {
     /// context (episode line, time left) for cards focused in that row.
     @State private var focusedSectionId: String?
     @State private var landscapeFocusedId: String?
+    @State private var lastAccountRefreshRequestedAt: Date?
     @State private var focusWork = TVHomeFocusWork()
     @State private var rowScrollStore = TVHomeRowScrollStore()
     @State private var homeReloadTask: Task<Void, Never>?
@@ -4171,19 +4585,12 @@ struct TVHomeView: View {
                     // focus swaps poster meta for emoji + folder title (browse-style).
                     if heroEnabled && homeLayout != "Grid View" {
                         if let folder = focusedCollectionFolder {
-                            TVCollectionFolderHeroView(
-                                folder: folder,
-                                sectionTitle: heroCollectionSection?.title
-                            )
-                            .equatable()
+                            TVCollectionFolderHeroView(folder: folder)
+                                .equatable()
                         } else if let heroMeta = visibleFocusedMeta ?? visibleHero {
-                            let catalogSection = heroCatalogSection
                             TVHeroView(
                                 meta: heroMeta,
-                                continueItem: heroContinueItem(for: heroMeta),
-                                catalogTitle: catalogSection?.title,
-                                catalogAddonName: catalogSection?.addonName,
-                                showsCatalogAddonName: catalogAddonNames
+                                continueItem: heroContinueItem(for: heroMeta)
                             ) {
                                 navigateToDetailsFromHome(id: heroMeta.id, type: heroMeta.type)
                             }
@@ -4212,10 +4619,8 @@ struct TVHomeView: View {
                                 heroBleed: horizontalEdgeInset
                             )
                         } else {
-                            // Native lazy vertical scrolling for the rows. The
-                            // focused row ±2 window controls real card/artwork
-                            // materialization; lazy mounting limits row work
-                            // outside the viewport without changing row geometry.
+                            // Keep row shells mounted for native tvOS Up/Down focus.
+                            // The focused row ±2 window limits real card/artwork work.
                             ScrollViewReader { verticalScrollProxy in
                                 ScrollView(.vertical, showsIndicators: false) {
                                     VStack(alignment: .leading, spacing: TVHomeLayout.sectionSpacing) {
@@ -4296,28 +4701,28 @@ struct TVHomeView: View {
                                             }
                                         }
                                     }
-                                    .onChange(of: overlayRestoreCardID) { oldTarget, newTarget in
-                                        guard let target = oldTarget,
-                                              newTarget == nil,
+                                    .onChange(of: overlayRestoreGeneration) { _, generation in
+                                        guard let target = overlayRestoreCardID,
                                               isActive,
                                               !isFullScreenOverlayPresented,
-                                              focusedCardID == target,
                                               let sectionID = visibleSections
                                                 .filter({ target.hasPrefix("\($0.id)\u{1}") })
                                                 .max(by: { $0.id.count < $1.id.count })?.id
                                         else { return }
-                                        let generation = overlayRestoreGeneration
+                                        var transaction = Transaction(animation: nil)
+                                        transaction.disablesAnimations = true
+                                        withTransaction(transaction) {
+                                            verticalScrollProxy.scrollTo(sectionID, anchor: .top)
+                                        }
                                         DispatchQueue.main.async {
                                             guard overlayRestoreGeneration == generation,
                                                   isActive,
                                                   !isFullScreenOverlayPresented,
-                                                  overlayRestoreCardID == nil,
-                                                  focusedCardID == target,
                                                   visibleSections.contains(where: { $0.id == sectionID })
                                             else { return }
-                                            var transaction = Transaction(animation: nil)
-                                            transaction.disablesAnimations = true
-                                            withTransaction(transaction) {
+                                            var asyncTransaction = Transaction(animation: nil)
+                                            asyncTransaction.disablesAnimations = true
+                                            withTransaction(asyncTransaction) {
                                                 verticalScrollProxy.scrollTo(sectionID, anchor: .top)
                                             }
                                         }
@@ -4397,10 +4802,12 @@ struct TVHomeView: View {
             if isActive {
                 if let lastFocused = store.lastFocusedCardID {
                     armReturnFocusAnimationSuppression()
-                    if focusedCardID == nil {
-                        pendingInitialFocusCardKey = lastFocused
-                        didRequestInitialCardFocus = false
-                        didPrepareInitialFocusViewport = false
+                    pendingInitialFocusCardKey = lastFocused
+                    didRequestInitialCardFocus = false
+                    didPrepareInitialFocusViewport = false
+                    restoreFocusState(for: lastFocused)
+                    if focusedCardID != lastFocused {
+                        focusedCardID = lastFocused
                     }
                 } else if focusedCardID == nil, let defaultFocus = initialDefaultFocusCardID {
                     focusedCardID = defaultFocus
@@ -4483,10 +4890,14 @@ struct TVHomeView: View {
                 if !suppressReturnFocusAnimations {
                     armReturnFocusAnimationSuppression()
                 }
-                if let lastFocused = store.lastFocusedCardID, focusedCardID == nil {
+                if let lastFocused = store.lastFocusedCardID {
                     pendingInitialFocusCardKey = lastFocused
                     didRequestInitialCardFocus = false
                     didPrepareInitialFocusViewport = false
+                    restoreFocusState(for: lastFocused)
+                    if focusedCardID != lastFocused {
+                        focusedCardID = lastFocused
+                    }
                 }
                 if focusedCardID != nil {
                     releaseReturnFocusAnimationSuppression()
@@ -4786,8 +5197,9 @@ struct TVHomeView: View {
                     if isActive {
                         releaseReturnFocusAnimationSuppression()
                     }
-                    if isEnabled, overlayRestoreCardID != nil {
-                        completeOverlayFocusRestore(for: newValue)
+                    if isEnabled, let target = overlayRestoreCardID, newValue == target {
+                        focusWork.acknowledgedNativeOverlayFocusCardID = target
+                        completeOverlayFocusRestore(for: target)
                     }
                 }
             }
@@ -4831,10 +5243,7 @@ struct TVHomeView: View {
             TVHomeDebugTrace.log(
                 "home.details.disappeared generation=\(generation) restoring target=\(target)"
             )
-            if let rowIndex = visibleSections.firstIndex(where: { target.hasPrefix("\($0.id)\u{1}") }) {
-                focusedRowIndex = rowIndex
-                focusedSectionId = visibleSections[rowIndex].id
-            }
+            restoreFocusState(for: target)
             // Re-acquire the one-card lock instead of assigning focus directly.
             // On the first frames after Details fades out, the row has not
             // re-rendered with its restriction yet, so a bare assignment lets
@@ -5293,6 +5702,7 @@ struct TVHomeView: View {
             // Build the restriction only on return. Details may still be
             // finishing its opacity transition, so use the short retry window
             // instead of relying on a single onDisappear callback ordering.
+            restoreFocusState(for: target)
             armReturnFocusAnimationSuppression()
             overlayRestoreGeneration &+= 1
             TVHomeDebugTrace.log("home.overlay.dismissal restoring to target=\(target) gen=\(overlayRestoreGeneration)")
@@ -5308,9 +5718,52 @@ struct TVHomeView: View {
                 focusWork.acknowledgedNativeOverlayFocusCardID = nil
                 return
             }
+            restoreFocusState(for: target)
             overlayRestoreCardID = target
             TVHomeDebugTrace.log("home.overlay.dismissal fallback restoring to target=\(target) gen=\(overlayRestoreGeneration)")
             restoreOverlayFocus(to: target, generation: overlayRestoreGeneration)
+        }
+    }
+
+    private func restoreFocusState(for rawTarget: String) {
+        guard let target = validRestoreTarget(rawTarget) ?? (rawTarget.isEmpty ? nil : rawTarget) else { return }
+        for (sectionIndex, section) in visibleSections.enumerated() {
+            let prefix = "\(section.id)\u{1}"
+            guard target.hasPrefix(prefix) else { continue }
+
+            focusedRowIndex = sectionIndex
+            focusedSectionId = section.id
+
+            if !section.collectionFolders.isEmpty {
+                if let folderIndex = section.collectionFolders.firstIndex(where: {
+                    TVHomeCardIdentity.folderKey(rowID: section.id, folder: $0) == target
+                }) {
+                    let folder = section.collectionFolders[folderIndex]
+                    focusedCollectionFolder = folder
+                    focusedMeta = nil
+                    focusWork.pendingFocusedFolder = folder
+                    focusWork.pendingFocusedMeta = nil
+                    rowScrollStore.setIndex(folderIndex, for: section.id)
+                    return
+                }
+            } else if !section.items.isEmpty {
+                if let itemIndex = section.items.firstIndex(where: {
+                    TVHomeCardIdentity.key(rowID: section.id, item: $0) == target
+                }) {
+                    let item = section.items[itemIndex]
+                    let settledMeta = collectionHome?.preparedHero(for: item) ?? item
+                    focusedMeta = settledMeta
+                    focusedCollectionFolder = nil
+                    focusWork.pendingFocusedMeta = settledMeta
+                    focusWork.pendingFocusedFolder = nil
+                    rowScrollStore.setIndex(itemIndex, for: section.id)
+                    if settledMeta.needsHeroMetadataEnrichment {
+                        enrichSettledCatalogMeta(settledMeta, in: section.id)
+                    }
+                    scheduleLandscapeFocus(cardKey: target)
+                    return
+                }
+            }
         }
     }
 
@@ -5319,10 +5772,7 @@ struct TVHomeView: View {
         generation: Int
     ) {
         TVHomeDebugTrace.log("home.restoreOverlayFocus begin target=\(target) gen=\(generation)")
-        if let rowIndex = visibleSections.firstIndex(where: { target.hasPrefix("\($0.id)\u{1}") }) {
-            focusedRowIndex = rowIndex
-            focusedSectionId = visibleSections[rowIndex].id
-        }
+        restoreFocusState(for: target)
         focusWork.restoringOverlayCardID = target
         focusWork.acknowledgedNativeOverlayFocusCardID = nil
 
@@ -5951,7 +6401,7 @@ struct TVHomeView: View {
             TVCollectionFolderRow(
                 id: section.id,
                 title: section.title,
-                showsSectionTitle: false,
+                showsSectionTitle: true,
                 horizontalEdgeInset: horizontalEdgeInset,
                 folders: section.collectionFolders,
                 initialScrollIndex: rowScrollStore.index(for: section.id),
@@ -6036,7 +6486,7 @@ struct TVHomeView: View {
                 title: section.title,
                 addonName: section.addonName,
                 showAddonName: catalogAddonNames,
-                showsSectionTitle: false,
+                showsSectionTitle: true,
                 horizontalEdgeInset: horizontalEdgeInset,
                 items: section.items,
                 progressByItemId: (section.id == TVHomeSection.continueWatchingId || section.id == TVHomeSection.upcomingId)
@@ -6293,9 +6743,13 @@ struct TVHomeView: View {
         }
 
         didPrepareInitialFocusViewport = true
-        focusedRowIndex = location.sectionIndex
-        focusedSectionId = location.sectionID
-        rowScrollStore.setIndex(location.cardIndex, for: location.sectionID)
+        if let key = initialFocusCardKey {
+            restoreFocusState(for: key)
+        } else {
+            focusedRowIndex = location.sectionIndex
+            focusedSectionId = location.sectionID
+            rowScrollStore.setIndex(location.cardIndex, for: location.sectionID)
+        }
         let targetSection = sections[location.sectionIndex]
         let isGridCatalogSection = homeLayout == "Grid View"
             && targetSection.collectionFolders.isEmpty
@@ -6328,7 +6782,7 @@ struct TVHomeView: View {
             proxy.scrollTo(location.sectionID, anchor: scrollAnchor)
         }
         DispatchQueue.main.async {
-            guard !self.didRequestInitialCardFocus else { return }
+            guard self.isActive, !self.isFullScreenOverlayPresented else { return }
             var transaction = Transaction()
             transaction.animation = nil
             withTransaction(transaction) {
@@ -6337,19 +6791,12 @@ struct TVHomeView: View {
         }
     }
 
-    /// Normal Modern Home catalog rows contain only the poster strip. Their
-    /// title block is part of the fixed hero now, so the row can be clipped at
-    /// the poster boundary during vertical focus transitions.
+    /// Catalog poster row estimate (title + strip + labels padding).
     private var estimatedCatalogRowHeight: CGFloat {
         let imageHeight: CGFloat = homeLayout == "Compact" ? 255 : 315
         let stripHeight = imageHeight + (posterLabels ? 48 : 0) + TVHomeLayout.stripVerticalPadding * 2
-        return stripHeight
-    }
-
-    /// Loading rows still show their known catalog title while cards are being
-    /// fetched, so preserve their original title-bearing geometry.
-    private var estimatedLoadingCatalogRowHeight: CGFloat {
-        estimatedCatalogRowHeight + TVHomeLayout.rowTitleBlock
+        // One 30pt Inter title line plus the row's 10pt internal spacing.
+        return stripHeight + TVHomeLayout.rowTitleBlock
     }
 
     /// Collection folder row estimate. Curated templates may hide every folder
@@ -6358,13 +6805,10 @@ struct TVHomeView: View {
         let imageHeight: CGFloat = homeLayout == "Compact" ? 255 : 315
         let showsLabels = posterLabels && section.collectionFolders.contains { !$0.hideTitle }
         let stripHeight = imageHeight + (showsLabels ? 48 : 0) + TVHomeLayout.stripVerticalPadding * 2
-        return stripHeight
+        return stripHeight + TVHomeLayout.rowTitleBlock
     }
 
     private func estimatedHeight(for section: TVHomeSection) -> CGFloat {
-        if section.isLoadingPlaceholder {
-            return estimatedLoadingCatalogRowHeight
-        }
         return section.collectionFolders.isEmpty
             ? estimatedCatalogRowHeight
             : estimatedCollectionRowHeight(for: section)
@@ -6524,47 +6968,6 @@ struct TVHomeView: View {
         return hero
     }
 
-    /// The section label paired with the settled hero title. Keep this tied to
-    /// the same settled section state as the hero metadata so the label does
-    /// not race ahead of the poster transition while focus is moving rapidly.
-    private var heroCatalogSection: TVHomeSection? {
-        if let focusedSectionId,
-           let section = visibleSections.first(where: { $0.id == focusedSectionId }),
-           section.collectionFolders.isEmpty,
-           !section.items.isEmpty {
-            return section
-        }
-
-        let heroMeta = visibleFocusedMeta ?? visibleHero
-        if let heroMeta {
-            let heroId = heroMeta.id
-            let identity = heroMeta.homeTitleIdentity
-            if let section = visibleSections.first(where: { section in
-                guard section.collectionFolders.isEmpty else { return false }
-                return section.items.contains(where: { $0.id == heroId || $0.homeTitleIdentity == identity })
-            }) {
-                return section
-            }
-        }
-
-        return visibleSections.first(where: {
-            !$0.isLoadingPlaceholder
-                && $0.collectionFolders.isEmpty
-                && !$0.items.isEmpty
-        })
-    }
-
-    private var heroCollectionSection: TVHomeSection? {
-        if let folder = focusedCollectionFolder {
-            return visibleSections.first(where: { section in
-                section.collectionFolders.contains(where: { $0.id == folder.id })
-            })
-        }
-        guard let focusedSectionId else { return nil }
-        return visibleSections.first(where: {
-            $0.id == focusedSectionId && !$0.collectionFolders.isEmpty
-        })
-    }
 
     private var visibleFocusedMeta: NuvioMeta? {
         guard let focusedMeta, isVisible(focusedMeta) else { return nil }
@@ -7937,6 +8340,11 @@ struct TVHomeView: View {
             // The ledger this just read is only as fresh as the last account
             // pull. Ask for a new one; it lands via the store's change
             // notification, which already refreshes the row.
+            let now = Date()
+            if let last = lastAccountRefreshRequestedAt, now.timeIntervalSince(last) < 30 {
+                return
+            }
+            lastAccountRefreshRequestedAt = now
             print("[ContinueWatching][Home] refreshContinueWatchingFromSelectedSource: triggering account refresh for local ledger")
             onRequestAccountRefresh(false)
             return
@@ -9475,27 +9883,22 @@ let TVHomeRowPrefetchThreshold = 18
 
 /// Hero header while a collection folder card is focused.
 /// Full-screen backdrop is driven by `homeBackdropURL` (folder hero backdrop).
-/// This view draws the title area: optional title logo, else emoji + name,
-/// followed by the current Home collection-row label when one is available.
+/// This view only draws the title area: optional title logo, else emoji + name.
 ///
 /// Unlike `TVHeroView` (title + meta + multi-line description that fills the
-/// block), folder heroes use a compact logo/title block followed by the row
-/// label. Both sit at the bottom of the hero frame, matching Android Modern
-/// Home. A large top padding (copied from poster heroes) was making this area
-/// sit too high.
+/// block), folder heroes are a single short line. They must sit at the bottom
+/// of the hero frame — where a poster description's last line ends — matching
+/// Android Modern Home. A large top padding (copied from poster heroes) was
+/// making this line sit too high.
 private struct TVCollectionFolderHeroView: View, Equatable {
     let folder: TVCollectionFolderItem
-    /// The Home collection-row label. Collections do not provide a movie
-    /// description, so this is placed directly below the folder logo/title.
-    let sectionTitle: String?
     @AppStorage(SettingsKey.homeLayout) private var homeLayout = "Modern"
 
     static func == (lhs: TVCollectionFolderHeroView, rhs: TVCollectionFolderHeroView) -> Bool {
         lhs.folder.id == rhs.folder.id &&
         lhs.folder.title == rhs.folder.title &&
         lhs.folder.coverEmoji == rhs.folder.coverEmoji &&
-        lhs.folder.preferredTitleLogoURLString == rhs.folder.preferredTitleLogoURLString &&
-        lhs.sectionTitle == rhs.sectionTitle
+        lhs.folder.preferredTitleLogoURLString == rhs.folder.preferredTitleLogoURLString
     }
 
     private var emoji: String? {
@@ -9507,14 +9910,8 @@ private struct TVCollectionFolderHeroView: View, Equatable {
         folder.title.isEmpty ? "Folder" : folder.title
     }
 
-    private var hasSectionTitle: Bool {
-        guard let sectionTitle else { return false }
-        return !sectionTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-    }
-
     private var heroHeight: CGFloat {
-        let baseHeight: CGFloat = homeLayout == "Compact" ? 390 : 500
-        return baseHeight + TVHomeLayout.heroSectionTitleBlock
+        homeLayout == "Compact" ? 390 : 500
     }
 
     var body: some View {
@@ -9522,81 +9919,36 @@ private struct TVCollectionFolderHeroView: View, Equatable {
             // Push the title line to the bottom of the fixed hero frame.
             Spacer(minLength: 0)
 
-            VStack(alignment: .leading, spacing: 18) {
-                Group {
-                    if let logoURL = folder.preferredTitleLogoURLString {
-                        CachedHeroLogo(url: logoURL, title: displayTitle)
-                    } else {
-                        HStack(alignment: .center, spacing: 18) {
-                            if let emoji {
-                                Text(emoji)
-                                    .font(.system(size: 52))
-                            } else {
-                                Image(systemName: "movieclapper")
-                                    .font(.system(size: 44, weight: .semibold))
-                                    .foregroundColor(.white.opacity(0.92))
-                            }
-
-                            Text(displayTitle)
-                                .font(.custom("Inter-Bold", size: 48))
-                                .foregroundColor(.white)
-                                .lineLimit(2)
-                                .minimumScaleFactor(0.7)
+            Group {
+                if let logoURL = folder.preferredTitleLogoURLString {
+                    CachedHeroLogo(url: logoURL, title: displayTitle)
+                } else {
+                    HStack(alignment: .center, spacing: 18) {
+                        if let emoji {
+                            Text(emoji)
+                                .font(.system(size: 52))
+                        } else {
+                            Image(systemName: "movieclapper")
+                                .font(.system(size: 44, weight: .semibold))
+                                .foregroundColor(.white.opacity(0.92))
                         }
+
+                        Text(displayTitle)
+                            .font(.custom("Inter-Bold", size: 48))
+                            .foregroundColor(.white)
+                            .lineLimit(2)
+                            .minimumScaleFactor(0.7)
                     }
                 }
-                if hasSectionTitle, let sectionTitle {
-                    TVHeroCatalogTitleView(
-                        title: sectionTitle,
-                        addonName: nil,
-                        showAddonName: false
-                    )
-                    .equatable()
-                }
             }
+            .padding(.leading, TVLayout.rowLeading)
             // Match the gap under poster-hero descriptions so the first catalog
             // title sits the same distance below (Android-style).
-            .padding(.leading, TVLayout.rowLeading)
             .padding(.bottom, TVHomeLayout.heroBottomPadding)
         }
         .foregroundColor(.white)
         .frame(maxWidth: .infinity, alignment: .leading)
         .frame(height: heroHeight, alignment: .bottomLeading)
-    }
-}
-
-private struct TVHeroCatalogTitleView: View, Equatable {
-    let title: String
-    let addonName: String?
-    let showAddonName: Bool
-    @AppStorage(SettingsKey.theme) private var theme = SettingsAccent.white.rawValue
-
-    static func == (lhs: TVHeroCatalogTitleView, rhs: TVHeroCatalogTitleView) -> Bool {
-        lhs.title == rhs.title &&
-        lhs.addonName == rhs.addonName &&
-        lhs.showAddonName == rhs.showAddonName
-    }
-
-    var body: some View {
-        HStack(alignment: .center, spacing: 14) {
-            Text(title)
-                .font(.custom("Inter-Bold", size: 30))
-                .foregroundColor(.white)
-
-            if showAddonName, let addonName, !addonName.isEmpty {
-                Text(addonName)
-                    .font(.custom("Inter-SemiBold", size: 16))
-                    .foregroundColor(SettingsAccent.color(for: theme))
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 4)
-                    .background(SettingsAccent.color(for: theme).opacity(0.18), in: Capsule())
-                    .overlay(
-                        Capsule()
-                            .strokeBorder(SettingsAccent.color(for: theme).opacity(0.35), lineWidth: 1)
-                    )
-            }
-        }
-        .frame(maxWidth: 900, alignment: .leading)
     }
 }
 
@@ -9606,22 +9958,11 @@ private struct TVHeroView: View {
     /// say which episode is in progress, how much is left, and show the
     /// episode's own overview instead of the series blurb.
     var continueItem: ContinueWatchingItem? = nil
-    /// The currently focused Home catalog label. It is rendered inside the
-    /// fixed hero so the poster strip below can start at the clipping boundary.
-    var catalogTitle: String? = nil
-    var catalogAddonName: String? = nil
-    var showsCatalogAddonName: Bool = true
     let onSelect: () -> Void
     @AppStorage(SettingsKey.homeLayout) private var homeLayout = "Modern"
 
     private var heroHeight: CGFloat {
-        let baseHeight: CGFloat = homeLayout == "Compact" ? 390 : 500
-        return baseHeight + TVHomeLayout.heroSectionTitleBlock
-    }
-
-    private var hasCatalogTitle: Bool {
-        guard let catalogTitle else { return false }
-        return !catalogTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        homeLayout == "Compact" ? 390 : 500
     }
 
     var body: some View {
@@ -9651,14 +9992,6 @@ private struct TVHeroView: View {
                     .lineLimit(4)
                     .frame(maxWidth: 900, alignment: .leading)
                     .padding(.top, 4)
-            }
-
-            if hasCatalogTitle, let catalogTitle {
-                TVHeroCatalogTitleView(
-                    title: catalogTitle,
-                    addonName: catalogAddonName,
-                    showAddonName: showsCatalogAddonName
-                )
             }
         }
         .foregroundColor(.white)
@@ -9697,9 +10030,6 @@ extension TVHeroView: Equatable {
             && lhs.continueItem?.meta.id == rhs.continueItem?.meta.id
             && lhs.continueItem?.episodeLabel == rhs.continueItem?.episodeLabel
             && lhs.continueItem?.remainingText == rhs.continueItem?.remainingText
-            && lhs.catalogTitle == rhs.catalogTitle
-            && lhs.catalogAddonName == rhs.catalogAddonName
-            && lhs.showsCatalogAddonName == rhs.showsCatalogAddonName
     }
 }
 

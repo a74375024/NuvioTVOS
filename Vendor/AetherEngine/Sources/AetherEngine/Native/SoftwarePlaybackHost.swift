@@ -1958,6 +1958,19 @@ final class SoftwarePlaybackHost {
         }
     }
 
+    /// Invalidate queued still requests, then release the auxiliary still decoder on its own queue.
+    /// The continuation is a queue barrier even when no extractor has been created.
+    func closeAuxiliaryStillExtractor() async {
+        _ = stillRequests.next()
+        let extractor = stillExtractorSlot.reset()
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            stillQueue.async {
+                extractor?.close()
+                continuation.resume()
+            }
+        }
+    }
+
     /// #544: a scrub still for the live DVR window, decoded out of the packet ring.
     ///
     /// Takes the session axis, exactly as `seek` does, and converts it with the same `sessionStartPts`

@@ -1,10 +1,10 @@
 # Vendored playback dependencies
 
-## AetherEngine (pin 7.36.0)
+## AetherEngine (pin 7.42.0)
 
-Local pin of [AetherEngine 7.36.0](https://github.com/superuser404notfound/AetherEngine/releases/tag/7.36.0) with imports rewritten to the namespaced FFmpeg modules below and Nuvio's host integration patches retained.
+Local pin of [AetherEngine 7.42.0](https://github.com/superuser404notfound/AetherEngine/releases/tag/7.42.0) with imports rewritten to the namespaced FFmpeg modules below and Nuvio's host integration patches retained. This release also avoids Atmos-confirmation reads on sources limited to one request, and adds host-owned display-criteria handling.
 
-Retain the local spatial-bridge patch that reports persistent APAC encoding failures independently of successful TrueHD decoding, along with its regression tests.
+Retain the local spatial-bridge patch that reports persistent APAC encoding failures independently of successful TrueHD decoding, along with its regression tests. The patch is merged with the 7.40 bed-split renderer and its telemetry reporting.
 
 Nuvio also retains its supplemental-codecs guard for non-Dolby-Vision displays, including the upstream Profile 7 to Profile 8.1 conversion. Explicit host DV assertions still enable the guarded route. The tagged API, architecture, and format docs are included for upstream documentation-consistency tests.
 
@@ -33,4 +33,4 @@ Local pin of [FFmpegBuild 3.7.1](https://github.com/superuser404notfound/FFmpegB
 
 Keep the AetherEngine patch surface minimal so rebases stay manageable.
 
-The Nuvio host offers an off-by-default setting for TrueHD Atmos and DTS:X object rendering to 9.1.6 APAC. LibTrueHD is pinned to 2.3.0 and LibDTSX to 1.0.1; APAC rendering requires tvOS 26 or later and a supported 48 kHz VOD source. Their notices are bundled under `AudioLicenses`. The engine retains its ordinary audio bridge for other content, including ordinary DTS-HD MA.
+The Nuvio host offers an off-by-default setting for TrueHD Atmos and DTS:X spatial rendering to 9.1.6 APAC. LibTrueHD and LibDTSX are pinned to 3.0.0; APAC rendering requires tvOS 26 or later and a supported 48 kHz VOD source. The app bundles their notices and license texts under `tvosApp/NuvioTV/Resources/AudioLicenses`. TrueHD uses the source's channel presentation split into a speaker bed; DTS:X 3.0 renders its standard presentation and falls back for object presentations. The engine retains its ordinary audio bridge for other content, including ordinary DTS-HD MA.

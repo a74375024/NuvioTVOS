@@ -8,6 +8,7 @@ import Libmpv
 import Metal
 import QuartzCore
 import Combine
+import AetherEngine
 
 struct MPVHTTPHeaderOptions: Equatable {
     let userAgent: String
@@ -367,6 +368,152 @@ struct MPVLoadConfiguration: Equatable {
     }
 }
 
+struct PlaybackThumbnailSourceContext: Sendable, Equatable {
+    let contextID = UUID()
+    let generation: UInt64
+    let playbackURL: URL?
+    let headerSourceURL: URL?
+    let requestHeaders: [String: String]
+    let isLive: Bool
+    let isKnownHLS: Bool
+    let streamKey: String
+}
+
+/// Request-wide cancellation plus one replaceable bounded-probe cancellation. A timed-out cache
+/// stage can finish and a fresh source stage can still run; superseded work cancels both.
+final class PlaybackThumbnailRequestCancellation: @unchecked Sendable {
+    private let lock = NSLock()
+    private let request = ProbeCancellation()
+    private var stage: ProbeCancellation?
+
+    var isCancelled: Bool { request.isCancelled }
+
+    func beginStage() -> ProbeCancellation? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !request.isCancelled else { return nil }
+        let cancellation = ProbeCancellation()
+        stage = cancellation
+        return cancellation
+    }
+
+    func finishStage(_ cancellation: ProbeCancellation) {
+        lock.lock()
+        if stage === cancellation { stage = nil }
+        lock.unlock()
+    }
+
+    func cancel() {
+        lock.lock()
+        request.cancel()
+        stage?.cancel()
+        stage = nil
+        lock.unlock()
+    }
+}
+
+/// Shared bounded disk-cache and original-source fallback used by both playback backends.
+/// Callers retain their own request/generation checks and image index.
+enum PlaybackThumbnailSourceFallback {
+    private static let cacheLimits = ProbeLimits(
+        maxInputBytes: 32 * 1024 * 1024, maxPackets: 1_024,
+        maxPacketBytes: 8 * 1024 * 1024, timeBudget: 1)
+    private static let sourceLimits = ProbeLimits(
+        maxInputBytes: 64 * 1024 * 1024, maxPackets: 2_048,
+        maxPacketBytes: 8 * 1024 * 1024, timeBudget: 2)
+
+    @MainActor
+    static func boundedSnapshot(
+        sourceContext: PlaybackThumbnailSourceContext,
+        atSeconds seconds: Double,
+        maxWidth: Int,
+        cancellation: PlaybackThumbnailRequestCancellation,
+        isCurrent: @MainActor () -> Bool
+    ) async -> BoundedStillFrame? {
+        guard seconds.isFinite, maxWidth > 0, !sourceContext.isLive, !sourceContext.isKnownHLS,
+              isCurrent(), let playbackURL = sourceContext.playbackURL else { return nil }
+
+        let descriptor = await PlaybackStreamCacheManager.shared.thumbnailSource(for: playbackURL)
+        guard isCurrent(), !cancellation.isCancelled else { return nil }
+        let originURL = descriptor?.remoteURL ?? sourceContext.headerSourceURL ?? playbackURL
+        guard !isKnownHLSURL(originURL), supportsIndependentPreview(originURL) else { return nil }
+
+        if let descriptor {
+            let reader = PlaybackStreamCacheIOReader(source: descriptor)
+            guard let stage = cancellation.beginStage() else {
+                reader.close()
+                return nil
+            }
+            let extractor = FrameExtractor(reader: reader)
+            let still = await boundedSnapshot(
+                extractor, seconds: seconds, maxWidth: maxWidth, limits: cacheLimits, cancellation: stage)
+            cancellation.finishStage(stage)
+            reader.close()
+            guard isCurrent(), !cancellation.isCancelled else { return nil }
+            if isAccurate(still, requestedSeconds: seconds) { return still }
+        } else if isCacheProxyURL(playbackURL) {
+            // A loopback cache URL is usable only while its exact active server descriptor exists.
+            return nil
+        }
+
+        guard isCurrent(), !cancellation.isCancelled,
+              let stage = cancellation.beginStage() else { return nil }
+        let extractor = FrameExtractor(url: originURL, httpHeaders: descriptor?.originalHeaders ?? sourceContext.requestHeaders)
+        let still = await boundedSnapshot(
+            extractor, seconds: seconds, maxWidth: maxWidth, limits: sourceLimits, cancellation: stage)
+        cancellation.finishStage(stage)
+        guard isCurrent(), !cancellation.isCancelled,
+              isAccurate(still, requestedSeconds: seconds) else { return nil }
+        return still
+    }
+
+    @MainActor
+    private static func boundedSnapshot(
+        _ extractor: FrameExtractor,
+        seconds: Double,
+        maxWidth: Int,
+        limits: ProbeLimits,
+        cancellation: ProbeCancellation
+    ) async -> BoundedStillFrame? {
+        let width = CGFloat(maxWidth)
+        let result = await extractor.boundedSnapshot(
+            at: seconds,
+            maxSize: CGSize(width: width, height: width),
+            limits: limits,
+            cancellation: cancellation,
+            relativeToPresentationStart: true
+        )
+        await extractor.shutdown()
+        return result
+    }
+
+    static func isAccurate(_ still: BoundedStillFrame?, requestedSeconds: Double) -> Bool {
+        guard let actualSeconds = still?.actualSeconds, actualSeconds.isFinite,
+              requestedSeconds.isFinite else { return false }
+        return abs(actualSeconds - requestedSeconds) <= HybridSeekThumbnailPolicy.maximumPreviewTimeError
+    }
+
+    static func isKnownHLSURL(_ url: URL?) -> Bool {
+        guard let url else { return false }
+        return ["m3u8", "m3u"].contains(url.pathExtension.lowercased())
+            || url.absoluteString.localizedCaseInsensitiveContains(".m3u8")
+            || url.host?.localizedCaseInsensitiveContains("googlevideo.com") == true
+    }
+
+    static func isCacheProxyURL(_ url: URL) -> Bool {
+        guard let host = url.host?.lowercased(),
+              ["127.0.0.1", "localhost", "::1"].contains(host) else { return false }
+        return url.path.hasPrefix("/stream/")
+    }
+
+    private static func supportsIndependentPreview(_ url: URL) -> Bool {
+        guard let scheme = url.scheme?.lowercased(),
+              ["file", "http", "https"].contains(scheme),
+              !isCacheProxyURL(url), !isKnownHLSURL(url) else { return false }
+        return !["iso", "img", "udf"].contains(url.pathExtension.lowercased())
+    }
+}
+
 // MARK: - MPV Player View Controller (tvOS)
 //
 // Self-contained libmpv host. Ported from the iOS bridge, with the Kotlin/
@@ -374,6 +521,11 @@ struct MPVLoadConfiguration: Equatable {
 // status-bar, screen-edge gestures — none exist on tvOS) removed.
 
 final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling, ScrubThumbnailProviding {
+    /// Synchronously revoke Party control admission before parking the engine.
+    var onWillSuspendPlayback: (() -> Void)?
+    /// Lifecycle reattachment has been requested; visual readiness still
+    /// requires a fresh MPV playback restart and a coherent state sample.
+    var onDidRestorePlayback: (() -> Void)?
     /// Called after a coherent position is captured but before tvOS suspends
     /// the player. PlayerViewModel uses it for a durable lifecycle save.
     var onPlaybackSuspended: ((Int64, Int64) -> Void)?
@@ -382,27 +534,57 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
     private let hybridThumbnailIndex = HybridSeekThumbnailIndex()
     private var externalTrickplayProvider: (any TrickplayProviding)?
     private var loadGeneration: UInt64 = 0
+    private let firstFrameReadiness = MPVFirstFrameReadiness()
+    // Accessed only on eventQueue; copy the ID before hopping to the UI queue.
+    private var eventPlaylistEntryID: Int64?
     private var contentCanonicalKey: String?
     private var currentStreamKey: String = ""
+    private var thumbnailSourceContext: PlaybackThumbnailSourceContext?
+    private var thumbnailIndexResetTask: Task<Void, Never>?
+    private var thumbnailRequestSequence: UInt64 = 0
+    private var activeThumbnailCancellation: PlaybackThumbnailRequestCancellation?
+    private var activeThumbnailTask: Task<CGImage?, Never>?
+    private var activeThumbnailTaskRequestID: UInt64?
+    private var externalProviderGeneration: UInt64 = 0
 
     var supportsScrubThumbnails: Bool { true }
 
     func setExternalTrickplayProvider(_ provider: (any TrickplayProviding)?) {
+        cancelScrubThumbnailWork()
+        externalProviderGeneration &+= 1
+        let providerGeneration = externalProviderGeneration
+        let generation = loadGeneration
         self.externalTrickplayProvider = provider
-        Task { await hybridThumbnailIndex.setExternalTrickplayProvider(provider) }
+        let resetTask = thumbnailIndexResetTask
+        Task { [weak self] in
+            await resetTask?.value
+            guard let self,
+                  self.loadGeneration == generation,
+                  self.externalProviderGeneration == providerGeneration else { return }
+            await self.hybridThumbnailIndex.setExternalTrickplayProvider(provider)
+        }
     }
 
     func cachedScrubThumbnail(atSeconds seconds: Double, duration: Double) async -> CGImage? {
+        let generation = loadGeneration
+        let requestID = beginScrubThumbnailRequest()
+        let providerGeneration = externalProviderGeneration
         if let external = externalTrickplayProvider {
-            if let image = await external.thumbnail(at: seconds) {
+            let image = await external.thumbnail(at: seconds)
+            guard isCurrentScrubThumbnailRequest(
+                requestID, generation: generation, providerGeneration: providerGeneration) else { return nil }
+            if let image {
                 return image
             }
         }
-        return await hybridThumbnailIndex.lookup(
+        let image = await hybridThumbnailIndex.lookup(
             seconds: seconds,
             duration: duration,
-            generation: loadGeneration
+            generation: generation
         )
+        guard isCurrentScrubThumbnailRequest(
+            requestID, generation: generation, providerGeneration: providerGeneration) else { return nil }
+        return image
     }
 
     func scrubThumbnail(
@@ -410,17 +592,193 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
         maxWidth: Int = 360,
         precise: Bool = true
     ) async -> CGImage? {
+        let generation = loadGeneration
+        let sourceContext = thumbnailSourceContext
+        let previousTask = activeThumbnailTask
+        let requestID = beginScrubThumbnailRequest()
+        let providerGeneration = externalProviderGeneration
+        let cancellation = PlaybackThumbnailRequestCancellation()
+        activeThumbnailCancellation = cancellation
+        let duration = durationMs > 0 ? Double(durationMs) / 1000.0 : 3600.0
+        let work: Task<CGImage?, Never> = Task { @MainActor [weak self, previousTask] in
+            _ = await previousTask?.value
+            guard let self,
+                  self.isCurrentScrubThumbnailRequest(
+                    requestID, generation: generation, providerGeneration: providerGeneration,
+                    cancellation: cancellation) else { return nil }
+            return await withTaskCancellationHandler {
+                await self.generateScrubThumbnail(
+                    atSeconds: seconds,
+                    maxWidth: maxWidth,
+                    duration: duration,
+                    generation: generation,
+                    requestID: requestID,
+                    providerGeneration: providerGeneration,
+                    sourceContext: sourceContext,
+                    cancellation: cancellation
+                )
+            } onCancel: {
+                cancellation.cancel()
+            }
+        }
+        activeThumbnailTask = work
+        activeThumbnailTaskRequestID = requestID
+        let result = await withTaskCancellationHandler {
+            await work.value
+        } onCancel: {
+            cancellation.cancel()
+            work.cancel()
+        }
+        if activeThumbnailTaskRequestID == requestID {
+            activeThumbnailTask = nil
+            activeThumbnailTaskRequestID = nil
+        }
+        if thumbnailRequestSequence == requestID,
+           activeThumbnailCancellation === cancellation {
+            activeThumbnailCancellation = nil
+        }
+        return result
+    }
+
+    private func generateScrubThumbnail(
+        atSeconds seconds: Double,
+        maxWidth: Int,
+        duration: Double,
+        generation: UInt64,
+        requestID: UInt64,
+        providerGeneration: UInt64,
+        sourceContext: PlaybackThumbnailSourceContext?,
+        cancellation: PlaybackThumbnailRequestCancellation
+    ) async -> CGImage? {
+        guard seconds.isFinite, maxWidth > 0,
+              isCurrentScrubThumbnailRequest(requestID, generation: generation,
+                                             providerGeneration: providerGeneration,
+                                             cancellation: cancellation) else { return nil }
         if let external = externalTrickplayProvider {
-            if let image = await external.thumbnail(at: seconds) {
+            let image = await external.thumbnail(at: seconds)
+            guard isCurrentScrubThumbnailRequest(requestID, generation: generation,
+                                                 providerGeneration: providerGeneration,
+                                                 cancellation: cancellation) else { return nil }
+            if let image {
                 return image
             }
         }
-        let dur = Double(durationMs) / 1000.0
-        return await hybridThumbnailIndex.lookup(
+        let cached = await hybridThumbnailIndex.lookup(
             seconds: seconds,
-            duration: dur > 0 ? dur : 3600.0,
-            generation: loadGeneration
+            duration: duration,
+            generation: generation
         )
+        guard isCurrentScrubThumbnailRequest(requestID, generation: generation,
+                                             providerGeneration: providerGeneration,
+                                             cancellation: cancellation) else { return nil }
+        if let cached { return cached }
+        guard let sourceContext,
+              sourceContext.generation == generation else { return nil }
+        let still = await PlaybackThumbnailSourceFallback.boundedSnapshot(
+            sourceContext: sourceContext,
+            atSeconds: seconds,
+            maxWidth: maxWidth,
+            cancellation: cancellation,
+            isCurrent: {
+                self.isCurrentScrubThumbnailRequest(
+                    requestID, generation: generation, providerGeneration: providerGeneration,
+                    cancellation: cancellation)
+            })
+        guard isCurrentScrubThumbnailRequest(requestID, generation: generation,
+                                             providerGeneration: providerGeneration,
+                                             cancellation: cancellation) else { return nil }
+        return await storePreviewIfCurrent(
+            still, requestedSeconds: seconds, generation: generation,
+            requestID: requestID, providerGeneration: providerGeneration, cancellation: cancellation)
+    }
+
+    private func storePreviewIfCurrent(
+        _ still: BoundedStillFrame?,
+        requestedSeconds: Double,
+        generation: UInt64,
+        requestID: UInt64,
+        providerGeneration: UInt64,
+        cancellation: PlaybackThumbnailRequestCancellation
+    ) async -> CGImage? {
+        guard let still,
+              let actualSeconds = still.actualSeconds,
+              actualSeconds.isFinite,
+              abs(actualSeconds - requestedSeconds) <= HybridSeekThumbnailPolicy.maximumPreviewTimeError,
+              isCurrentScrubThumbnailRequest(requestID, generation: generation,
+                                             providerGeneration: providerGeneration,
+                                             cancellation: cancellation) else { return nil }
+        await hybridThumbnailIndex.store(
+            still.image, seconds: actualSeconds, kind: .fine, generation: generation)
+        guard isCurrentScrubThumbnailRequest(requestID, generation: generation,
+                                             providerGeneration: providerGeneration,
+                                             cancellation: cancellation) else { return nil }
+        return still.image
+    }
+
+    private func beginScrubThumbnailRequest() -> UInt64 {
+        thumbnailRequestSequence &+= 1
+        activeThumbnailTask?.cancel()
+        activeThumbnailCancellation?.cancel()
+        activeThumbnailCancellation = nil
+        return thumbnailRequestSequence
+    }
+
+    private func isCurrentScrubThumbnailRequest(
+        _ requestID: UInt64,
+        generation: UInt64,
+        providerGeneration: UInt64,
+        cancellation: PlaybackThumbnailRequestCancellation? = nil
+    ) -> Bool {
+        guard !Task.isCancelled,
+              thumbnailRequestSequence == requestID,
+              loadGeneration == generation,
+              externalProviderGeneration == providerGeneration else { return false }
+        if let cancellation {
+            guard !cancellation.isCancelled, activeThumbnailCancellation === cancellation else { return false }
+        }
+        if let thumbnailSourceContext {
+            guard thumbnailSourceContext.generation == generation else { return false }
+        }
+        return true
+    }
+
+    private func cancelScrubThumbnailWork() {
+        thumbnailRequestSequence &+= 1
+        activeThumbnailTask?.cancel()
+        activeThumbnailCancellation?.cancel()
+        activeThumbnailCancellation = nil
+    }
+
+    private func resetScrubThumbnailSource(
+        playbackURL: URL?,
+        headerSourceURL: URL? = nil,
+        headers: [String: String],
+        isLive: Bool,
+        streamKey: String,
+        canonicalMediaKey: String?,
+        isKnownHLS: Bool = false
+    ) {
+        cancelScrubThumbnailWork()
+        loadGeneration &+= 1
+        externalProviderGeneration &+= 1
+        externalTrickplayProvider = nil
+        contentCanonicalKey = canonicalMediaKey
+        currentStreamKey = streamKey
+        let generation = loadGeneration
+        thumbnailSourceContext = PlaybackThumbnailSourceContext(
+            generation: generation,
+            playbackURL: playbackURL,
+            headerSourceURL: headerSourceURL,
+            requestHeaders: headers,
+            isLive: isLive,
+            isKnownHLS: isLive || isKnownHLS
+                || PlaybackThumbnailSourceFallback.isKnownHLSURL(playbackURL)
+                || PlaybackThumbnailSourceFallback.isKnownHLSURL(headerSourceURL),
+            streamKey: streamKey
+        )
+        let index = hybridThumbnailIndex
+        let resetTask = Task { await index.reset(generation: generation, streamKey: streamKey) }
+        thumbnailIndexResetTask = resetTask
     }
 
     func prepareScrubThumbnailExtractor() {
@@ -453,6 +811,20 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
     private var artworkLoadTask: Task<Void, Never>?
     #endif
     private var didConfigureMPVRemoteCommands = false
+    private let remoteCommandTargets = PlayerRemoteCommandTargets()
+    private var watchPartyRemoteIntent: (@MainActor (PlayerRemoteIntent) -> Bool)?
+
+    func setWatchPartyRemoteIntent(_ handler: (@MainActor (PlayerRemoteIntent) -> Bool)?) {
+        let rebind = didConfigureMPVRemoteCommands
+        if rebind { teardownMPVRemoteCommands() }
+        watchPartyRemoteIntent = handler
+        if rebind { setupMPVRemoteCommandsIfNeeded() }
+    }
+
+    func stopWatchPartyRemoteCommands() {
+        watchPartyRemoteIntent = { _ in false }
+        teardownMPVRemoteCommands()
+    }
     /// Physical Apple TV can blank HDMI while matching frame rate / dynamic
     /// range. Keep the file paused until that switch finishes so playback time
     /// cannot advance behind the black screen.
@@ -461,6 +833,24 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
     private var mpv: OpaquePointer?
     private lazy var eventQueue = DispatchQueue(label: "mpv-events", qos: .userInitiated)
     private var recentPlaybackLogs: [String] = []
+    private enum DesiredTrackSelection {
+        case trackID(Int)
+        case externalURL(String)
+    }
+    private struct PendingTrackCommand {
+        let loadGeneration: UInt64
+        let command: String
+        let url: String
+        let selectionGeneration: UInt64
+        let selectsWhenReady: Bool
+    }
+    private let pendingTrackCommandsLock = NSLock()
+    private var pendingTrackCommands: [UInt64: PendingTrackCommand] = [:]
+    private var nextTrackCommandReplyID: UInt64 = 1
+    private var subtitleSelectionGeneration: UInt64 = 0
+    private var desiredSubtitleSelection: DesiredTrackSelection?
+    private var audioSelectionGeneration: UInt64 = 0
+    private var desiredAudioSelection: DesiredTrackSelection?
     let subtitleTranslationState = MPVSubtitleTranslationState()
     private var isMPVSubtitleRendererHiddenForTranslation = false
 
@@ -515,7 +905,7 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
     private(set) var isAtEndOfFile: Bool = false
     private(set) var hasCoherentTimeSample: Bool = false
     var hasFirstFrameReadyForDisplay: Bool {
-        (videoFrameSize != .zero || durationMs > 0) && isPlayerPlaying && !isPlayerLoading
+        firstFrameReadiness.isReady && !isPlayerLoading
     }
     var durationMs: Int64 = 0
     var positionMs: Int64 = 0
@@ -783,6 +1173,11 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
         guard mpv != nil else { return }
         guard !isApplicationBackgrounded else { return }
 
+        onWillSuspendPlayback?()
+        // A callback may synchronously retire this player.
+        guard mpv != nil, !isApplicationBackgrounded else { return }
+        firstFrameReadiness.reset(keepingPlaylistEntry: true)
+
         let sampledDurationMs = milliseconds(from: readDoubleProperty("duration")) ?? durationMs
         let sampledPositionMs = milliseconds(from: readDoubleProperty("time-pos")) ?? positionMs
         let verifiedPositionMs = lastVerifiedPositionMs ?? positionMs
@@ -833,14 +1228,15 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
             foregroundRestoreDeadline = Date().addingTimeInterval(4)
             let rawPositionMs = milliseconds(from: readDoubleProperty("time-pos"))
             screensaverDebugLog("[ScreensaverDebug][MPVController] restorePlayback restoring pos: target=\(target)ms, rawPos=\(String(describing: rawPositionMs))ms")
-            if rawPositionMs == nil
+            if watchPartyRemoteIntent != nil
+                || rawPositionMs == nil
                 || abs((rawPositionMs ?? target) - target) > 1_500
                 || getFlag("eof-reached") {
                 seekToMs(target)
             }
         }
 
-        if shouldResume {
+        if shouldResume && watchPartyRemoteIntent == nil {
             screensaverDebugLog("[ScreensaverDebug][MPVController] restorePlayback resuming playback")
             playPlayback()
         } else {
@@ -848,6 +1244,7 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
             screensaverDebugLog("[ScreensaverDebug][MPVController] restorePlayback preserving pause")
             pausePlayback()
         }
+        onDidRestorePlayback?()
     }
 
     @objc private func appWillResignActive() {
@@ -894,11 +1291,16 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
     // MARK: - Playback API
 
     func loadFile(_ urlString: String) {
+        firstFrameReadiness.reset()
+        if didConfigureMPVRemoteCommands { teardownMPVRemoteCommands(); setupMPVRemoteCommandsIfNeeded() }
         pendingLoadConfiguration = nil
         pendingHTTPHeaders = [:]
         pendingIsLiveStream = false
         pendingCacheProfile = .fromSettings(ProfileSettings.current.string(forKey: SettingsKey.networkCache))
         pendingURL = urlString
+        resetScrubThumbnailSource(
+            playbackURL: URL(string: urlString), headers: [:], isLive: false,
+            streamKey: TrickplayDiskCache.streamKey(for: urlString), canonicalMediaKey: nil)
         if Thread.isMainThread {
             attemptStartPendingLoad()
         } else {
@@ -907,6 +1309,8 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
     }
 
     func load(_ request: PlaybackLoadRequest) {
+        firstFrameReadiness.reset()
+        teardownMPVRemoteCommands()
         pendingLoadConfiguration = MPVLoadConfiguration(request: request)
         pendingAudioURL = request.audioURL?.absoluteString
         pendingHTTPHeaders = request.httpHeaders
@@ -918,15 +1322,14 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
         currentAspectMode = request.aspectMode
         PlaybackAudioSession.activateMoviePlayback()
 
-        loadGeneration &+= 1
-        let gen = loadGeneration
-        self.externalTrickplayProvider = nil
         let key = request.canonicalMediaKey ?? request.cacheFileIdentity?.cacheKey ?? TrickplayDiskCache.streamKey(for: request.videoURL.absoluteString)
-        self.contentCanonicalKey = request.canonicalMediaKey
-        self.currentStreamKey = key
-        Task {
-            await hybridThumbnailIndex.reset(generation: gen, streamKey: key)
-        }
+        resetScrubThumbnailSource(
+            playbackURL: request.videoURL,
+            headers: request.httpHeaders,
+            isLive: request.isLiveStream,
+            streamKey: key,
+            canonicalMediaKey: request.canonicalMediaKey,
+            isKnownHLS: request.streamDescription == PlaybackMarkers.trailerSubtitle)
 
         #if os(tvOS) || os(iOS)
         currentMediaArtwork = nil
@@ -1050,10 +1453,14 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
         }
         setFlag("pause", true)
         command("loadfile", args: [url, "replace"])
+        // loadfile replace creates its playlist entry synchronously. Unlike
+        // path/duration, the entry ID distinguishes reloading the same URL.
+        firstFrameReadiness.arm(playlistEntryID: readOptionalInt64Property("playlist/0/id"))
         setAspectMode(currentAspectMode)
     }
 
     func playPlayback() {
+        cancelScrubThumbnailWork()
         guard mpv != nil else { return }
         screensaverDebugLog("[ScreensaverDebug][MPVController] playPlayback() called: pos=\(positionMs)ms")
         lastVerifiedWasPlaying = true
@@ -1068,6 +1475,18 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
     }
 
     func seekToMs(_ ms: Int64) {
+        seekToMs(ms, exact: false)
+    }
+
+    /// Party completion is confirmed by a later coherent VM sample, not this command's return.
+    func beginWatchPartySeek(_ ms: Int64) throws {
+        guard mpv != nil else { throw WatchPartyPlayerBridgeError.notReady }
+        seekToMs(ms, exact: true)
+    }
+
+    private(set) var isSeekingForWatchParty = false
+
+    private func seekToMs(_ ms: Int64, exact: Bool) {
         guard mpv != nil else { return }
 #if NUVIO_MPV_MEMORY_WATCHDOG && os(tvOS)
         memoryWatchdog.record(event: "seek")
@@ -1085,7 +1504,7 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
         print("[SeekWatchdog][#\(seekId)] ⏩ Seek started -> target: \(ms)ms (current: \(positionMs)ms, duration: \(durationMs)ms, isLocalCache: \(isLocalOrDiskCacheStream))")
         subtitleTranslationState.cancelPendingTranslations()
         rememberExplicitSeek(to: ms)
-        command("seek", args: [String(format: "%.3f", Double(ms) / 1000.0), "absolute+keyframes"])
+        command("seek", args: [String(format: "%.3f", Double(ms) / 1000.0), exact ? "absolute+exact" : "absolute+keyframes"])
     }
 
     func seekByMs(_ ms: Int64) {
@@ -1129,64 +1548,43 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
         guard !didConfigureMPVRemoteCommands else { return }
         didConfigureMPVRemoteCommands = true
         let center = MPRemoteCommandCenter.shared()
+        installRemoteCommands(center)
+    }
 
-        center.playCommand.isEnabled = true
-        center.playCommand.addTarget { [weak self] _ in
-            self?.playPlayback()
-            return .success
-        }
-
-        center.pauseCommand.isEnabled = true
-        center.pauseCommand.addTarget { [weak self] _ in
-            self?.pausePlayback()
-            return .success
-        }
-
-        center.togglePlayPauseCommand.isEnabled = true
-        center.togglePlayPauseCommand.addTarget { [weak self] _ in
-            guard let self else { return .commandFailed }
-            if self.isPlayerPlaying {
-                self.pausePlayback()
-            } else {
-                self.playPlayback()
+    private func installRemoteCommands(_ center: MPRemoteCommandCenter) {
+        let action: @MainActor @Sendable (PlayerRemoteIntent) -> Void = { [weak self] intent in
+            guard let self else { return }
+            if let handler = self.watchPartyRemoteIntent { _ = handler(intent); return }
+            guard let intent = intent.localIntent(positionMs: self.positionMs, isPlaying: self.isTransportPlaying) else { return }
+            switch intent {
+            case .play: self.playPlayback()
+            case .pause: self.pausePlayback()
+            case .seek(let position): self.seekToMs(position)
+            default: break
             }
-            return .success
         }
-
+        center.playCommand.isEnabled = true
+        center.pauseCommand.isEnabled = true
+        center.togglePlayPauseCommand.isEnabled = true
         center.changePlaybackPositionCommand.isEnabled = true
-        center.changePlaybackPositionCommand.addTarget { [weak self] event in
-            guard let event = event as? MPChangePlaybackPositionCommandEvent else { return .commandFailed }
-            self?.seekToMs(Int64((event.positionTime * 1000).rounded()))
-            return .success
-        }
-
         center.skipForwardCommand.isEnabled = true
         center.skipForwardCommand.preferredIntervals = [10]
-        center.skipForwardCommand.addTarget { [weak self] _ in
-            guard let self else { return .commandFailed }
-            self.seekToMs(self.positionMs + 10_000)
-            return .success
-        }
-
         center.skipBackwardCommand.isEnabled = true
         center.skipBackwardCommand.preferredIntervals = [10]
-        center.skipBackwardCommand.addTarget { [weak self] _ in
-            guard let self else { return .commandFailed }
-            self.seekToMs(max(0, self.positionMs - 10_000))
-            return .success
-        }
+        remoteCommandTargets.add(center.playCommand, intent: .play, action: action)
+        remoteCommandTargets.add(center.pauseCommand, intent: .pause, action: action)
+        remoteCommandTargets.add(center.togglePlayPauseCommand, intent: .toggle, action: action)
+        remoteCommandTargets.add(center.changePlaybackPositionCommand, resolve: { event in
+            guard let event = event as? MPChangePlaybackPositionCommandEvent, event.positionTime.isFinite else { return nil }
+            return .position(event.positionTime)
+        }, action: action)
+        remoteCommandTargets.add(center.skipForwardCommand, intent: .skip(10), action: action)
+        remoteCommandTargets.add(center.skipBackwardCommand, intent: .skip(-10), action: action)
     }
 
     private func teardownMPVRemoteCommands() {
-        guard didConfigureMPVRemoteCommands else { return }
+        remoteCommandTargets.stop()
         didConfigureMPVRemoteCommands = false
-        let center = MPRemoteCommandCenter.shared()
-        center.playCommand.removeTarget(nil)
-        center.pauseCommand.removeTarget(nil)
-        center.togglePlayPauseCommand.removeTarget(nil)
-        center.changePlaybackPositionCommand.removeTarget(nil)
-        center.skipForwardCommand.removeTarget(nil)
-        center.skipBackwardCommand.removeTarget(nil)
     }
     #endif
 
@@ -1487,11 +1885,25 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
 
     func selectAudio(_ trackId: Int) {
         guard mpv != nil else { return }
+        audioSelectionGeneration &+= 1
+        desiredAudioSelection = .trackID(trackId)
+        applyAudioSelection(trackId)
+    }
+
+    private func applyAudioSelection(_ trackId: Int) {
+        guard mpv != nil else { return }
         var id = Int64(trackId)
         mpv_set_property(mpv, "aid", MPV_FORMAT_INT64, &id)
     }
 
     func selectSubtitle(_ trackId: Int) {
+        guard mpv != nil else { return }
+        subtitleSelectionGeneration &+= 1
+        desiredSubtitleSelection = .trackID(trackId)
+        applySubtitleSelection(trackId)
+    }
+
+    private func applySubtitleSelection(_ trackId: Int) {
         guard mpv != nil else { return }
         if trackId < 0 {
             setStringProperty("sid", "no")
@@ -1503,12 +1915,16 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
 
     func addSubtitle(_ subtitle: NuvioSubtitle, select: Bool) {
         guard mpv != nil else { return }
-        command("sub-add", args: [
+        if select {
+            subtitleSelectionGeneration &+= 1
+            desiredSubtitleSelection = .externalURL(subtitle.url)
+        }
+        commandAsyncTrack("sub-add", args: [
             subtitle.url,
-            select ? "select" : "auto",
+            "auto",
             subtitle.label ?? "",
             subtitle.language
-        ])
+        ], url: subtitle.url, selectionGeneration: subtitleSelectionGeneration, selectsWhenReady: select)
     }
 
     func addAudioUrl(_ url: String) {
@@ -1520,7 +1936,12 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
     private func attachPendingAudioIfNeeded() {
         guard let url = pendingAudioURL else { return }
         pendingAudioURL = nil
-        command("audio-add", args: [url, "select"])
+        audioSelectionGeneration &+= 1
+        desiredAudioSelection = .externalURL(url)
+        commandAsyncTrack(
+            "audio-add", args: [url, "auto"], url: url,
+            selectionGeneration: audioSelectionGeneration, selectsWhenReady: true
+        )
     }
 
     private func applyPendingLoadConfiguration() {
@@ -1571,9 +1992,20 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
     }
 
     func destroyPlayer() {
+        firstFrameReadiness.reset()
 #if NUVIO_MPV_MEMORY_WATCHDOG && os(tvOS)
         memoryWatchdog.stop(event: "destroy")
 #endif
+        cancelScrubThumbnailWork()
+        loadGeneration &+= 1
+        externalProviderGeneration &+= 1
+        externalTrickplayProvider = nil
+        thumbnailSourceContext = nil
+        contentCanonicalKey = nil
+        currentStreamKey = ""
+        let generation = loadGeneration
+        let index = hybridThumbnailIndex
+        thumbnailIndexResetTask = Task { await index.reset(generation: generation) }
         NotificationCenter.default.removeObserver(self)
         pendingURL = nil
         subtitleTranslationState.reset()
@@ -1592,6 +2024,7 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
         #endif
         guard let ctx = mpv else { return }
         mpv = nil  // nil first so the event loop stops reading
+        clearPendingTrackCommands()
         mpv_set_wakeup_callback(ctx, nil, nil)
 
         // libmpv's avfoundation audio output tears down AVAudioSession from
@@ -1609,6 +2042,8 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
 #if NUVIO_MPV_MEMORY_WATCHDOG && os(tvOS)
         memoryWatchdog.stop(event: "deinit")
 #endif
+        activeThumbnailTask?.cancel()
+        activeThumbnailCancellation?.cancel()
         NotificationCenter.default.removeObserver(self)
         if let ctx = mpv {
             mpv = nil
@@ -1640,6 +2075,7 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
         let eofReached = getFlag("eof-reached")
         let idle = getFlag("core-idle")
         let seeking = getFlag("seeking")
+        isSeekingForWatchParty = seeking
         let bufferingCache = getFlag("paused-for-cache")
 
         isAtEndOfFile = eofReached
@@ -2289,12 +2725,20 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
                 case MPV_EVENT_PROPERTY_CHANGE:
                     DispatchQueue.main.async { self.updateState() }
                 case MPV_EVENT_START_FILE:
+                    self.eventPlaylistEntryID = eventPtr.pointee.data.map {
+                        UnsafePointer<mpv_event_start_file>(OpaquePointer($0)).pointee.playlist_entry_id
+                    }
                     self.clearPlaybackError()
 #if NUVIO_MPV_MEMORY_WATCHDOG && os(tvOS)
                     self.memoryWatchdog.record(event: "start_file")
 #endif
                 case MPV_EVENT_FILE_LOADED:
+                    let frameToken = self.firstFrameReadiness.token
+                    let entryID = self.eventPlaylistEntryID
                     DispatchQueue.main.async {
+                        guard self.mpv == mpv,
+                              self.watchPartyRemoteIntent == nil
+                                || self.firstFrameReadiness.matches(token: frameToken, playlistEntryID: entryID) else { return }
 #if NUVIO_MPV_MEMORY_WATCHDOG && os(tvOS)
                         self.memoryWatchdog.record(event: "file_loaded")
 #endif
@@ -2308,6 +2752,25 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
                         self.updateState()
                         self.resetDisplayCriteriaProbe()
                         self.scheduleDisplayCriteriaProbe()
+                    }
+                case MPV_EVENT_PLAYBACK_RESTART:
+                    // MPV completes a restart after queuing the initial video
+                    // frame even when pause=yes. FILE_LOADED / VIDEO_RECONFIG
+                    // alone only prove loading/configuration, not this stage.
+                    let frameToken = self.firstFrameReadiness.token
+                    let entryID = self.eventPlaylistEntryID
+                    DispatchQueue.main.async {
+                        guard self.mpv == mpv, !self.isApplicationBackgrounded,
+                              self.firstFrameReadiness.matches(token: frameToken, playlistEntryID: entryID) else { return }
+                        self.updateState()
+                        let size = self.videoFrameSize
+                        let videoPTS = self.readDoubleProperty("video-pts")
+                        if self.firstFrameReadiness.receiveRestart(
+                            token: frameToken, playlistEntryID: entryID,
+                            hasVideoFrame: size.width > 0 && size.height > 0 && videoPTS?.isFinite == true
+                        ) {
+                            self.onFirstFrameReady?()
+                        }
                     }
                 case MPV_EVENT_VIDEO_RECONFIG:
                     // Fires once decode starts and whenever the video params
@@ -2345,6 +2808,8 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
 #endif
                         }
                     }
+                case MPV_EVENT_COMMAND_REPLY:
+                    self.handleTrackCommandReply(eventPtr)
                 case MPV_EVENT_SHUTDOWN:
                     return
                 case MPV_EVENT_LOG_MESSAGE:
@@ -2384,6 +2849,119 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
 
     // MARK: - MPV Helpers
 
+    /// Adding a remote subtitle/audio track can wait for its URL to open. Queue it
+    /// asynchronously so a slow server cannot block the main thread during FILE_LOADED.
+    private func commandAsyncTrack(
+        _ command: String,
+        args: [String?],
+        url: String,
+        selectionGeneration: UInt64,
+        selectsWhenReady: Bool
+    ) {
+        guard let mpv else { return }
+
+        pendingTrackCommandsLock.lock()
+        let replyID = nextTrackCommandReplyID
+        nextTrackCommandReplyID &+= 1
+        pendingTrackCommands[replyID] = PendingTrackCommand(
+            loadGeneration: loadGeneration,
+            command: command,
+            url: url,
+            selectionGeneration: selectionGeneration,
+            selectsWhenReady: selectsWhenReady
+        )
+        pendingTrackCommandsLock.unlock()
+
+        var cargs = makeCArgs(command, args).map { $0.flatMap { UnsafePointer<CChar>(strdup($0)) } }
+        defer { for ptr in cargs where ptr != nil { free(UnsafeMutablePointer(mutating: ptr!)) } }
+        let status = mpv_command_async(mpv, replyID, &cargs)
+        if status < 0 {
+            pendingTrackCommandsLock.lock()
+            pendingTrackCommands.removeValue(forKey: replyID)
+            pendingTrackCommandsLock.unlock()
+            checkError(status, context: command)
+        }
+    }
+
+    private func handleTrackCommandReply(_ event: UnsafeMutablePointer<mpv_event>) {
+        let replyID = event.pointee.reply_userdata
+        pendingTrackCommandsLock.lock()
+        let pending = pendingTrackCommands.removeValue(forKey: replyID)
+        pendingTrackCommandsLock.unlock()
+        guard let pending else { return }
+        let status = event.pointee.error
+        let message = status < 0 ? String(cString: mpv_error_string(status)) : nil
+        DispatchQueue.main.async { [weak self] in
+            guard let self,
+                  self.mpv != nil,
+                  self.loadGeneration == pending.loadGeneration else { return }
+            if let message {
+                self.appendPlaybackLog(prefix: pending.command, level: "error", text: message)
+            } else {
+                self.completeTrackCommand(pending)
+            }
+        }
+    }
+
+    private func completeTrackCommand(_ pending: PendingTrackCommand) {
+        switch pending.command {
+        case "sub-add":
+            guard subtitleSelectionGeneration == pending.selectionGeneration else {
+                reapplyDesiredSubtitleSelection()
+                return
+            }
+            guard pending.selectsWhenReady else {
+                reapplyDesiredSubtitleSelection()
+                return
+            }
+            refreshTracks()
+            guard let track = subtitleTracks.last(where: { $0.externalFilename == pending.url }) else {
+                appendPlaybackLog(prefix: pending.command, level: "error", text: "Loaded subtitle track was not found")
+                return
+            }
+            desiredSubtitleSelection = .trackID(track.id)
+            applySubtitleSelection(track.id)
+            subtitleSelectionGeneration &+= 1
+        case "audio-add":
+            guard audioSelectionGeneration == pending.selectionGeneration else {
+                reapplyDesiredAudioSelection()
+                return
+            }
+            guard pending.selectsWhenReady else {
+                reapplyDesiredAudioSelection()
+                return
+            }
+            refreshTracks()
+            guard let track = audioTracks.last(where: { $0.externalFilename == pending.url }) else {
+                appendPlaybackLog(prefix: pending.command, level: "error", text: "Loaded audio track was not found")
+                return
+            }
+            desiredAudioSelection = .trackID(track.id)
+            applyAudioSelection(track.id)
+            audioSelectionGeneration &+= 1
+        default:
+            break
+        }
+    }
+
+    private func reapplyDesiredSubtitleSelection() {
+        guard let desiredSubtitleSelection,
+              case .trackID(let trackID) = desiredSubtitleSelection else { return }
+        applySubtitleSelection(trackID)
+    }
+
+    private func reapplyDesiredAudioSelection() {
+        guard let desiredAudioSelection,
+              case .trackID(let trackID) = desiredAudioSelection else { return }
+        applyAudioSelection(trackID)
+    }
+
+    private func clearPendingTrackCommands() {
+        pendingTrackCommandsLock.lock()
+        pendingTrackCommands.removeAll()
+        pendingTrackCommandsLock.unlock()
+    }
+
     private func command(_ command: String, args: [String?] = [], checkForErrors: Bool = true) {
         guard mpv != nil else { return }
         var cargs = makeCArgs(command, args).map { $0.flatMap { UnsafePointer<CChar>(strdup($0)) } }
@@ -2405,6 +2983,13 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
         let result = mpv_get_property(mpv, name, MPV_FORMAT_DOUBLE, &data)
         guard result >= 0, data.isFinite else { return nil }
         return data
+    }
+
+    private func readOptionalInt64Property(_ name: String) -> Int64? {
+        guard mpv != nil else { return nil }
+        var value = Int64()
+        guard mpv_get_property(mpv, name, MPV_FORMAT_INT64, &value) >= 0 else { return nil }
+        return value
     }
 
 #if NUVIO_MPV_MEMORY_WATCHDOG && os(tvOS)
@@ -2437,13 +3022,6 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
             demuxerMaxBackBytes: readOptionalStringProperty("demuxer-max-back-bytes"),
             localOrDiskCache: isLocalOrDiskCacheStream
         ))
-    }
-
-    private func readOptionalInt64Property(_ name: String) -> Int64? {
-        guard mpv != nil else { return nil }
-        var value = Int64()
-        guard mpv_get_property(mpv, name, MPV_FORMAT_INT64, &value) >= 0 else { return nil }
-        return value
     }
 
     private func readOptionalFlagProperty(_ name: String) -> Bool? {

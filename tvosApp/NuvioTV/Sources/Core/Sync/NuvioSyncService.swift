@@ -1671,15 +1671,18 @@ final class NuvioSyncManager: ObservableObject {
             print("[NuvioSync] raw account inputs ready in \(String(format: "%.0f", rawInputsElapsedMs))ms")
             releasePostLoginGate(generation: generation)
 
+            // Record the pull time so background passive refreshes (refreshAccountIfIdle)
+            // respect the minimum refresh interval floor and do not hammer the server in a tight loop.
+            if let key = currentSyncKey() {
+                lastCompletedPullAt[key] = Date()
+                if !pullWasIncomplete {
+                    completedInitialPullKeys.insert(key)
+                }
+            }
+
             // Enable pushes only after a complete pull; pushing a snapshot built
             // from a partial pull could overwrite remote state we never saw.
             guard !pullWasIncomplete else { return }
-            if let key = currentSyncKey() {
-                completedInitialPullKeys.insert(key)
-                // Only a complete pull arms the refresh floor; a partial one has
-                // to stay re-pullable.
-                lastCompletedPullAt[key] = Date()
-            }
             pendingPushScopes.formUnion(.all)
             // Collection visibility can be edited while isApplyingRemote blocks
             // scheduling, or before the first Home snapshot/initial pull exists.
@@ -1697,6 +1700,9 @@ final class NuvioSyncManager: ObservableObject {
             guard generation == pullGeneration else { return }
             isApplyingRemoteProfiles = false
             isApplyingRemote = false
+            if let key = currentSyncKey() {
+                lastCompletedPullAt[key] = Date()
+            }
             // "JWT expired" on every request is not a sync failure to retry —
             // it is a session the user has to renew, and saying so is the only
             // way an account that syncs nothing stops looking like an empty one.
@@ -2198,7 +2204,8 @@ private enum ProfileSyncIndexStore {
 
 /// Stable per-install identity required by current Nuvio mutation RPCs. It lets
 /// delta/event sync distinguish this Apple TV's writes from another client.
-private enum SyncClientIdentity {
+/// Shared installation identity for sync registration and Watch Party membership.
+enum SyncClientIdentity {
     private static let defaultsKey = "client_instance_id"
     private static let prefix = "nuvio-tv-"
 

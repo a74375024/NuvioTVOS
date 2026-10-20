@@ -1,5 +1,7 @@
 import Foundation
 import OSLog
+import Darwin
+import AetherEngine
 
 let diskCacheLog = Logger(subsystem: "com.pyksel.nuviotvos", category: "diskcache")
 
@@ -17,6 +19,171 @@ struct PlaybackStreamManifest: Codable, Equatable, Sendable {
     var normalizedURLPath: String
     var createdAt: Date
     var lastAccessedAt: Date
+}
+
+/// Independent, cache-only byte reader for bounded scrub previews. It never asks the playback server
+/// for a missing chunk, and retains no more than the current complete cache chunk.
+final class PlaybackStreamCacheIOReader: IOReader, @unchecked Sendable {
+    private let source: PlaybackStreamThumbnailSource
+    private let cursorLock = NSLock()
+    private let cancellationLock = NSLock()
+    private var position: Int64 = 0
+    private var closed = false
+    private var cancellationGeneration: UInt64 = 0
+    private var retainedChunkIndex: Int?
+    private var retainedChunkData: Data?
+
+    init(source: PlaybackStreamThumbnailSource) {
+        self.source = source
+    }
+
+    var discImageProbeEnabled: Bool { false }
+
+    func read(_ buffer: UnsafeMutablePointer<UInt8>?, size: Int32) -> Int32 {
+        guard size >= 0, let buffer else { return -1 }
+        guard size > 0 else { return 0 }
+
+        cursorLock.lock()
+        defer { cursorLock.unlock() }
+        guard !closed, validMetadata else { return -1 }
+        let operationGeneration = currentCancellationGeneration()
+        guard !wasCancelled(since: operationGeneration) else { return -1 }
+        guard position < source.fileLength else { return 0 }
+
+        let requested = Int(min(Int64(size), source.fileLength - position))
+        var copied = 0
+        while copied < requested {
+            guard !wasCancelled(since: operationGeneration) else { return copied > 0 ? Int32(copied) : -1 }
+            let chunkIndex = Int(position / source.chunkSize)
+            guard let data = chunkData(for: chunkIndex),
+                  !wasCancelled(since: operationGeneration) else {
+                return copied > 0 ? Int32(copied) : -1
+            }
+            let chunkOffset = Int(position % source.chunkSize)
+            guard chunkOffset >= 0, chunkOffset < data.count else { return copied > 0 ? Int32(copied) : -1 }
+            let amount = min(data.count - chunkOffset, requested - copied)
+            let didCopy = data.withUnsafeBytes { raw -> Bool in
+                guard let base = raw.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return false }
+                buffer.advanced(by: copied).update(from: base.advanced(by: chunkOffset), count: amount)
+                return true
+            }
+            guard didCopy else { return copied > 0 ? Int32(copied) : -1 }
+            copied += amount
+            position += Int64(amount)
+        }
+        return Int32(copied)
+    }
+
+    func seek(offset: Int64, whence: Int32) -> Int64 {
+        cursorLock.lock()
+        defer { cursorLock.unlock() }
+        guard !closed, validMetadata else { return -1 }
+        let operationGeneration = currentCancellationGeneration()
+        guard !wasCancelled(since: operationGeneration) else { return -1 }
+        if whence & 65_536 != 0 { return source.fileLength } // AVSEEK_SIZE
+
+        let base: Int64
+        switch whence & ~0x20000 { // Ignore AVSEEK_FORCE when present.
+        case Int32(SEEK_SET): base = 0
+        case Int32(SEEK_CUR): base = position
+        case Int32(SEEK_END): base = source.fileLength
+        default: return -1
+        }
+        let (target, overflow) = base.addingReportingOverflow(offset)
+        guard !overflow, target >= 0, target <= source.fileLength,
+              !wasCancelled(since: operationGeneration) else { return -1 }
+        position = target
+        if let retainedChunkIndex,
+           target == source.fileLength || target / source.chunkSize != Int64(retainedChunkIndex) {
+            self.retainedChunkIndex = nil
+            retainedChunkData = nil
+        }
+        return target
+    }
+
+    func cancel() {
+        cancellationLock.lock()
+        cancellationGeneration &+= 1
+        cancellationLock.unlock()
+    }
+
+    func close() {
+        cancel()
+        cursorLock.lock()
+        closed = true
+        retainedChunkIndex = nil
+        retainedChunkData = nil
+        cursorLock.unlock()
+    }
+
+    func makeIndependentReader() -> IOReader? {
+        cursorLock.lock()
+        let canClone = !closed
+        cursorLock.unlock()
+        return canClone ? PlaybackStreamCacheIOReader(source: source) : nil
+    }
+
+    private var validMetadata: Bool {
+        source.fileLength >= 0 && source.chunkSize > 0 && !source.sessionID.isEmpty
+    }
+
+    private func chunkData(for index: Int) -> Data? {
+        guard index >= 0, source.chunkSize > 0 else { return nil }
+        let (start, overflow) = Int64(index).multipliedReportingOverflow(by: source.chunkSize)
+        guard !overflow, start >= 0, start < source.fileLength else { return nil }
+        let expectedCount64 = min(source.chunkSize, source.fileLength - start)
+        guard expectedCount64 > 0, expectedCount64 <= Int64(Int.max) else { return nil }
+        let expectedCount = Int(expectedCount64)
+        let fileURL = source.cacheDirectory.appendingPathComponent("chunk_\(index).bin")
+
+        if retainedChunkIndex == index, let retainedChunkData {
+            guard fileSize(at: fileURL) == expectedCount else {
+                self.retainedChunkIndex = nil
+                self.retainedChunkData = nil
+                return nil
+            }
+            return retainedChunkData
+        }
+
+        retainedChunkIndex = nil
+        retainedChunkData = nil
+        // Bound allocation even when a damaged file advertises an enormous length. One extra byte
+        // distinguishes an exact chunk from an oversized one without reading or retaining the rest.
+        guard expectedCount < Int.max,
+              let handle = try? FileHandle(forReadingFrom: fileURL) else { return nil }
+        defer { try? handle.close() }
+        let data: Data
+        do {
+            guard let boundedData = try handle.read(upToCount: expectedCount + 1) else { return nil }
+            data = boundedData
+        } catch {
+            return nil
+        }
+        guard data.count == expectedCount else {
+            return nil
+        }
+        retainedChunkIndex = index
+        retainedChunkData = data
+        return data
+    }
+
+    private func fileSize(at url: URL) -> Int? {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let size = attributes[.size] as? NSNumber else { return nil }
+        return size.intValue
+    }
+
+    private func currentCancellationGeneration() -> UInt64 {
+        cancellationLock.lock()
+        defer { cancellationLock.unlock() }
+        return cancellationGeneration
+    }
+
+    private func wasCancelled(since generation: UInt64) -> Bool {
+        cancellationLock.lock()
+        defer { cancellationLock.unlock() }
+        return cancellationGeneration != generation
+    }
 }
 
 /// Manages chunk-based video caching to Apple TV local flash storage with a sliding-window FIFO eviction policy.
