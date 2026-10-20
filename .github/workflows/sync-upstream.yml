@@ -1,0 +1,63 @@
+name: Sync with bobsupra
+
+# Once a day, merges bobsupra/NuvioTVOS main into the multiview branch and,
+# when anything new came in, starts a fresh IPA build. If bobsupra's changes
+# conflict with Multiview/Calendar, this run fails (GitHub emails you) and
+# nothing is changed; resolve the conflict and push, then the next run resumes.
+on:
+  schedule:
+    - cron: "17 13 * * *" # daily, ~6:17 AM Pacific
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: multiview
+          fetch-depth: 0
+
+      - name: Merge bobsupra main
+        id: merge
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/bobsupra/NuvioTVOS.git
+          git fetch --no-tags upstream main
+
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "Already up to date with bobsupra $(git rev-parse --short upstream/main)."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "New upstream commits:"
+          git log --oneline HEAD..upstream/main | head -40
+
+          if ! git merge --no-edit -m "Merge bobsupra/NuvioTVOS main ($(git rev-parse --short upstream/main))" upstream/main; then
+            conflicts=$(git diff --name-only --diff-filter=U | tr '\n' ' ')
+            git merge --abort
+            echo "::error title=Merge conflict::bobsupra's latest changes conflict with the Multiview/Calendar changes in: ${conflicts}. Nothing was changed; the conflict needs resolving by hand."
+            exit 1
+          fi
+
+          git push origin HEAD:multiview
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Start a new IPA build
+        if: steps.merge.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # A push made with the workflow token doesn't trigger other workflows,
+        # so kick the build off explicitly.
+        run: gh workflow run build-multiview-ipa.yml --ref multiview -R "$GITHUB_REPOSITORY"
