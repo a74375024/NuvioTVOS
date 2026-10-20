@@ -270,6 +270,12 @@ class PlayerViewModel: ObservableObject {
     /// page's shuffle button, off otherwise; toggled from the player controls.
     @Published private(set) var isShuffleOn = false
     var shuffleOptions = EpisodeShuffleOptions.wholeShow
+    /// Auto-skip choices for the show playing now (remembered per show).
+    @Published private(set) var autoSkipIntro = false
+    @Published private(set) var autoSkipEnding = false
+    private var autoSkipLoadedShowID: String?
+    /// Segments already skipped automatically this episode; never skipped twice.
+    private var autoSkippedIntervalIds: Set<String> = []
     /// Whether the Next Episode card is visible (near the end of an episode
     /// that has a follow-up).
     @Published var showNextEpisodeCard: Bool = false
@@ -1435,6 +1441,7 @@ class PlayerViewModel: ObservableObject {
         self.skipSegmentCountdown = nil
         self.autoHiddenSkipIntervalId = nil
         self.dismissedSkipIntervalIds = []
+        self.autoSkippedIntervalIds = []
         self.skipSegmentAutoHideDeadline = nil
         self.showNextEpisodeCard = false
         self.nextEpisodeCountdown = nil
@@ -1914,6 +1921,11 @@ class PlayerViewModel: ObservableObject {
             if activeSkipInterval != nil { activeSkipInterval = nil }
             if skipSegmentCountdown != nil { skipSegmentCountdown = nil }
             skipSegmentAutoHideDeadline = nil
+            return
+        }
+
+        if shouldAutoSkip(interval) {
+            performAutoSkip(interval)
             return
         }
 
@@ -7382,5 +7394,109 @@ extension PlayerViewModel {
             currentID: current?.id,
             isWatched: { WatchedStore.containsEpisode(meta: watchedMeta, season: $0.season, episode: $0.episode) }
         ) ?? Self.nextEpisode(after: current, in: seriesEpisodes)
+    }
+}
+
+// MARK: - Auto-skip
+
+extension PlayerViewModel {
+    /// Auto-skip applies to TV episodes outside Watch Party.
+    var canAutoSkip: Bool {
+        (activeMeta?.isSeries ?? false) && !isStandalonePlaybackSession && watchPartyPlayerBridge == nil && !isLiveStream
+    }
+
+    /// Exact (not season-estimated) IntroDB data for this episode.
+    var hasExactIntroData: Bool {
+        skipIntervals.contains { $0.provider == "introdb" && !$0.isEnding }
+    }
+
+    var hasExactEndingData: Bool {
+        skipIntervals.contains { $0.provider == "introdb" && $0.isEnding }
+    }
+
+    var hasEstimatedSkipData: Bool {
+        skipIntervals.contains { $0.provider != "introdb" }
+    }
+
+    var autoSkipShowName: String {
+        activeMeta?.name ?? ""
+    }
+
+    func setAutoSkipIntro(_ value: Bool) {
+        guard let showID = activeMeta?.id else { return }
+        AutoSkipPreferences.setSkipsIntro(value, showID: showID)
+        autoSkipIntro = value
+    }
+
+    func setAutoSkipEnding(_ value: Bool) {
+        guard let showID = activeMeta?.id else { return }
+        AutoSkipPreferences.setSkipsEnding(value, showID: showID)
+        autoSkipEnding = value
+    }
+
+    /// Reads this show's choices once per show rather than every tick.
+    func refreshAutoSkipPreferencesIfNeeded() {
+        let showID = activeMeta?.id
+        guard showID != autoSkipLoadedShowID else { return }
+        autoSkipLoadedShowID = showID
+        if let showID {
+            autoSkipIntro = AutoSkipPreferences.skipsIntro(showID: showID)
+            autoSkipEnding = AutoSkipPreferences.skipsEnding(showID: showID)
+        } else {
+            autoSkipIntro = false
+            autoSkipEnding = false
+        }
+    }
+
+    fileprivate func shouldAutoSkip(_ interval: SkipInterval) -> Bool {
+        refreshAutoSkipPreferencesIfNeeded()
+        guard canAutoSkip,
+              // Season estimates can be off; only exact timestamps jump on their own.
+              interval.provider == "introdb",
+              !autoSkippedIntervalIds.contains(interval.id),
+              !dismissedSkipIntervalIds.contains(interval.id),
+              hasRenderedFirstFrame,
+              status == .playing,
+              !isScrubbing,
+              !isHoldingSeek,
+              !isAdvanceInFlight,
+              !isAdvancingEpisode,
+              // Not worth a jump for the last couple of seconds of a segment.
+              interval.endTime - time.current > 2 else { return false }
+        return interval.isEnding ? autoSkipEnding : autoSkipIntro
+    }
+
+    fileprivate func performAutoSkip(_ interval: SkipInterval) {
+        autoSkippedIntervalIds.insert(interval.id)
+        dismissedSkipIntervalIds.insert(interval.id)
+        autoHiddenSkipIntervalId = interval.id
+        skipSegmentCountdown = nil
+        skipSegmentAutoHideDeadline = nil
+        activeSkipInterval = nil
+
+        if interval.isEnding {
+            // Straight into the next episode when auto-play would take us there.
+            if autoPlayNextEnabled,
+               !isAutoPlayCancelled,
+               let next = nextEpisode,
+               EpisodeReleasePolicy.hasAired(next.released),
+               resolveNextStream != nil {
+                showPlayerToast(L10n.string("player_auto_skipped_ending", fallback: "Ending skipped"))
+                advance()
+                return
+            }
+            postPlayController.showImmediately()
+        }
+
+        let message: String
+        if interval.isEnding {
+            message = L10n.string("player_auto_skipped_ending", fallback: "Ending skipped")
+        } else if interval.type.lowercased() == "recap" {
+            message = L10n.string("player_auto_skipped_recap", fallback: "Recap skipped")
+        } else {
+            message = L10n.string("player_auto_skipped_intro", fallback: "Intro skipped")
+        }
+        seek(to: min(interval.endTime + 0.25, max(time.duration - 0.5, interval.endTime)))
+        showPlayerToast(message)
     }
 }

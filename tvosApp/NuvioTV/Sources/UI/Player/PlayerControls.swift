@@ -1675,6 +1675,7 @@ struct PlayerSettingsPanel: View {
         case subtitles = "Subtitles"
         case audio = "Audio"
         case speed = "Speed"
+        case skip = "Skip"
         case picture = "Picture"
         case logs = "Logs"
     }
@@ -1710,6 +1711,8 @@ struct PlayerSettingsPanel: View {
         case seekPreview
         case loadingStatus
         case debugOverlay
+        case autoSkipIntro
+        case autoSkipEnding
         case aspect(String)
         case style(StyleControl)
     }
@@ -1739,6 +1742,7 @@ struct PlayerSettingsPanel: View {
                 case .subtitles: subtitlesPage
                 case .audio: audioPage
                 case .speed: speedPage
+                case .skip: skipPage
                 case .picture: picturePage
                 case .logs: PlaybackLogsPage()
                 }
@@ -2611,6 +2615,86 @@ struct PlayerSettingsPanel: View {
             .frame(width: 420, alignment: .leading)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    // MARK: Skip page
+
+    private var skipPage: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            columnHeader(viewModel.autoSkipShowName.isEmpty
+                ? L10n.string("player_auto_skip", fallback: "Auto-Skip")
+                : L10n.format("player_auto_skip_for_show", fallback: "Auto-Skip for %@", viewModel.autoSkipShowName))
+
+            if viewModel.canAutoSkip {
+                VStack(spacing: 12) {
+                    toggleRow(
+                        title: L10n.string("player_auto_skip_intro", fallback: "Skip Intros & Recaps"),
+                        isOn: viewModel.autoSkipIntro,
+                        focusKey: .autoSkipIntro
+                    ) {
+                        viewModel.setAutoSkipIntro(!viewModel.autoSkipIntro)
+                    }
+                    toggleRow(
+                        title: L10n.string("player_auto_skip_ending", fallback: "Skip Endings"),
+                        isOn: viewModel.autoSkipEnding,
+                        focusKey: .autoSkipEnding
+                    ) {
+                        viewModel.setAutoSkipEnding(!viewModel.autoSkipEnding)
+                    }
+                }
+                .frame(width: 700)
+                .focusSection()
+
+                VStack(alignment: .leading, spacing: 10) {
+                    Text(L10n.string(
+                        "player_auto_skip_remembered",
+                        fallback: "Remembered for this show. Set defaults for other shows in Settings → Playback."
+                    ))
+                    Text(skipDataStatus)
+                    if viewModel.autoSkipEnding {
+                        Text(L10n.string(
+                            "player_auto_skip_post_credits",
+                            fallback: "Skipping endings can miss post-credits scenes."
+                        ))
+                    }
+                }
+                .font(.system(size: 22, weight: .medium))
+                .foregroundColor(.white.opacity(0.55))
+                .frame(width: 900, alignment: .leading)
+                .padding(.top, 8)
+            } else {
+                Text(L10n.string(
+                    "player_auto_skip_unavailable",
+                    fallback: "Auto-skip is available for TV episodes outside Watch Party."
+                ))
+                .font(.system(size: 24, weight: .medium))
+                .foregroundColor(.white.opacity(0.6))
+                // Something focusable keeps the page reachable from the tab bar.
+                .focusable()
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    private var skipDataStatus: String {
+        let intro = viewModel.hasExactIntroData
+        let ending = viewModel.hasExactEndingData
+        switch (intro, ending) {
+        case (true, true):
+            return L10n.string("player_skip_data_both", fallback: "This episode has intro and ending times.")
+        case (true, false):
+            return L10n.string("player_skip_data_intro", fallback: "This episode has intro times; no ending times.")
+        case (false, true):
+            return L10n.string("player_skip_data_ending", fallback: "This episode has ending times; no intro times.")
+        case (false, false):
+            if viewModel.hasEstimatedSkipData {
+                return L10n.string(
+                    "player_skip_data_estimated",
+                    fallback: "Only estimated times for this episode, so the Skip button shows instead of skipping automatically."
+                )
+            }
+            return L10n.string("player_skip_data_none", fallback: "No skip data for this episode yet.")
+        }
     }
 
     private var picturePage: some View {

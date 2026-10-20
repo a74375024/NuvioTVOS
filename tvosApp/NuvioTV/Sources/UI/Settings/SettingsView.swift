@@ -7769,6 +7769,8 @@ private struct PlaybackSettingsView: View {
     @AppStorage(SettingsKey.showAddonLogo) private var showAddonLogo = false
     @AppStorage(SettingsKey.streamBadgePlacement) private var streamBadgePlacement = StreamBadgePlacement.bottom.rawValue
     @AppStorage(SettingsKey.autoPlayNext) private var autoPlayNext = true
+    @AppStorage(AutoSkipPreferences.defaultIntroKey) private var autoSkipIntroDefault = false
+    @AppStorage(AutoSkipPreferences.defaultEndingKey) private var autoSkipEndingDefault = false
     @AppStorage(SettingsKey.streamAutoPlayPreferBingeGroup) private var streamAutoPlayPreferBingeGroup = true
     @AppStorage(SettingsKey.streamAutoPlayReuseBingeGroup) private var streamAutoPlayReuseBingeGroup = true
     @AppStorage(SettingsKey.seekPreviewEnabled) private var seekPreviewEnabled = true
@@ -7904,6 +7906,26 @@ private struct PlaybackSettingsView: View {
                         fallback: "Play the next episode after the current episode fully ends. You can cancel from the Next Episode prompt."
                     ),
                     isOn: $autoPlayNext,
+                    accentColor: accentColor
+                )
+
+                SettingsToggleRow(
+                    title: L10n.string("tvos_settings_auto_skip_intro", fallback: "Auto-Skip Intros & Recaps"),
+                    subtitle: L10n.string(
+                        "tvos_settings_auto_skip_intro_subtitle",
+                        fallback: "Default for shows you haven't set yet. Change it per show from the player's ••• menu → Skip. Uses IntroDB times when available."
+                    ),
+                    isOn: $autoSkipIntroDefault,
+                    accentColor: accentColor
+                )
+
+                SettingsToggleRow(
+                    title: L10n.string("tvos_settings_auto_skip_ending", fallback: "Auto-Skip Endings"),
+                    subtitle: L10n.string(
+                        "tvos_settings_auto_skip_ending_subtitle",
+                        fallback: "Default for shows you haven't set yet. With Auto-Play on, goes straight to the next episode. May skip post-credits scenes."
+                    ),
+                    isOn: $autoSkipEndingDefault,
                     accentColor: accentColor
                 )
 
