@@ -58,11 +58,11 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: multiview-latest
-          name: Multiview build (${{ github.sha }})
+          name: Enhancements build (${{ github.sha }})
           prerelease: true
           make_latest: false
           target_commitish: ${{ github.sha }}
           body: |
-            Unsigned tvOS build of the `multiview` branch, commit ${{ github.sha }}.
+            Unsigned tvOS build of the `multiview` branch (Multiview + Release Calendar), commit ${{ github.sha }}.
             Install with your sideloading tool; it re-signs the app on install.
           files: build-ipa/NuvioTV-unsigned.ipa

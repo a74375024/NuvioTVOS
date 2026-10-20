@@ -270,10 +270,10 @@ private enum DetailsReturnDestination {
 }
 
 enum TVTab: Hashable, Identifiable, CaseIterable {
-    case profile, home, search, library, settings
+    case profile, home, search, library, calendar, settings
     case collection(CollectionHomeID)
 
-    static var allCases: [Self] { [.profile, .home, .search, .library, .settings] }
+    static var allCases: [Self] { [.profile, .home, .search, .library, .calendar, .settings] }
     var id: String { rawValue }
     var rawValue: String {
         switch self {
@@ -281,6 +281,7 @@ enum TVTab: Hashable, Identifiable, CaseIterable {
         case .home: return "Home"
         case .search: return "Search"
         case .library: return "Library"
+        case .calendar: return "Calendar"
         case .settings: return "Settings"
         case .collection(let id): return "Collection:\(id.key)"
         }
@@ -291,6 +292,7 @@ enum TVTab: Hashable, Identifiable, CaseIterable {
         case .home: return L10n.string("nav_home", fallback: "Home")
         case .search: return L10n.string("nav_search", fallback: "Search")
         case .library: return L10n.string("nav_library", fallback: "Library")
+        case .calendar: return L10n.string("nav_calendar", fallback: "Calendar")
         case .settings: return L10n.string("nav_settings", fallback: "Settings")
         case .collection: return L10n.string("tmdb_collections_title", fallback: "Collections")
         }
@@ -301,6 +303,7 @@ enum TVTab: Hashable, Identifiable, CaseIterable {
         case .home: return "house"
         case .search: return "magnifyingglass"
         case .library: return "rectangle.stack"
+        case .calendar: return "calendar"
         case .settings: return "gearshape"
         case .collection: return "rectangle.stack.fill"
         }
@@ -3337,6 +3340,14 @@ private struct TVMainTabView: View {
             .id(activeProfile?.id ?? "none")
     }
 
+    private var calendarTabContent: some View {
+        ReleaseCalendarView(
+            libraryItems: libraryViewModel.items,
+            onOpenShow: onNavigateToDetails
+        )
+            .id(activeProfile?.id ?? "none")
+    }
+
     private var settingsTabContent: some View {
         SettingsView(
             activeProfile: displayedProfile,
@@ -3405,6 +3416,9 @@ private struct TVMainTabView: View {
             libraryTabContent
                 .tabItem { Label(TVTab.library.title, systemImage: TVTab.library.symbol) }
                 .tag(TVTab.library)
+            calendarTabContent
+                .tabItem { Label(TVTab.calendar.title, systemImage: TVTab.calendar.symbol) }
+                .tag(TVTab.calendar)
             settingsTabContent.tabItem { settingsTabLabel }.tag(TVTab.settings)
         }
     }
@@ -3423,6 +3437,9 @@ private struct TVMainTabView: View {
             }
             Tab(TVTab.library.title, systemImage: TVTab.library.symbol, value: TVTab.library) {
                 libraryTabContent
+            }
+            Tab(TVTab.calendar.title, systemImage: TVTab.calendar.symbol, value: TVTab.calendar) {
+                calendarTabContent
             }
             Tab(value: TVTab.settings) { settingsTabContent } label: { settingsTabLabel }
             if !directCollectionDestinations.isEmpty {
