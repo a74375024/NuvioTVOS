@@ -3295,6 +3295,8 @@ struct TvDetailsContent: View {
 
     @FocusState private var actionFocus: DetailsActionFocus?
     @FocusState private var castHeaderFocus: DetailsCastHeaderFocus?
+    /// Non-nil while the shuffle options sheet is open.
+    @State private var shuffleMenuContext: ShuffleMenuContext?
     /// Which episode control holds focus, as `TvEpisodeFocus` keys. Owned here
     /// rather than per card so focus can be put back on a specific episode.
     @FocusState private var episodeFocus: String?
@@ -3551,6 +3553,7 @@ struct TvDetailsContent: View {
     private func actionRowView(
         meta: NuvioMeta,
         playTarget: TvDetailsPlayTarget,
+        shuffleEpisodes: [NuvioVideo],
         scrollProxy: ScrollViewProxy
     ) -> some View {
         let canBypassPicker = smartStreamSelection || (reuseLastLink && hasStoredPlaybackStream(for: playTarget))
@@ -3566,6 +3569,17 @@ struct TvDetailsContent: View {
             },
             onPlayLongPress: canBypassPicker ? {
                 handlePlayLongPress(playTarget: playTarget)
+            } : nil,
+            onShuffleClick: canShuffle(meta: meta, episodes: shuffleEpisodes) ? {
+                startShuffle(meta: meta, episodes: shuffleEpisodes, options: .wholeShow, chooseSource: false)
+            } : nil,
+            onShuffleLongPress: canShuffle(meta: meta, episodes: shuffleEpisodes) ? {
+                stopBackgroundTrailer(manual: false)
+                shuffleMenuContext = ShuffleMenuContext(
+                    meta: meta,
+                    episodes: shuffleEpisodes,
+                    currentSeason: playTarget.episode?.season
+                )
             } : nil,
             onHostWatchParty: onHostWatchParty,
             onWatchlistClick: onWatchlistClick,
@@ -3600,9 +3614,81 @@ struct TvDetailsContent: View {
                 || isFullscreenTrailerPresented
                 || !isDetailsFocusReachable(.actions)
         )
+        .confirmationDialog(
+            L10n.string("details_shuffle_options", fallback: "Shuffle"),
+            isPresented: Binding(
+                get: { shuffleMenuContext != nil },
+                set: { if !$0 { shuffleMenuContext = nil } }
+            ),
+            titleVisibility: .visible,
+            presenting: shuffleMenuContext
+        ) { context in
+            Button(L10n.string("details_shuffle_all", fallback: "Shuffle All Episodes")) {
+                startShuffle(meta: context.meta, episodes: context.episodes, options: .wholeShow, chooseSource: false)
+            }
+            if let season = context.currentSeason {
+                Button(L10n.format("details_shuffle_season", fallback: "Shuffle Season %d", season)) {
+                    var options = EpisodeShuffleOptions.wholeShow
+                    options.season = season
+                    startShuffle(meta: context.meta, episodes: context.episodes, options: options, chooseSource: false)
+                }
+            }
+            Button(L10n.string("details_shuffle_unwatched", fallback: "Shuffle Unwatched")) {
+                var options = EpisodeShuffleOptions.wholeShow
+                options.unwatchedOnly = true
+                startShuffle(meta: context.meta, episodes: context.episodes, options: options, chooseSource: false)
+            }
+            if EpisodeShuffler.hasRatings(context.episodes) {
+                Button(L10n.string("details_shuffle_top_rated", fallback: "Shuffle Top-Rated")) {
+                    var options = EpisodeShuffleOptions.wholeShow
+                    options.topRatedOnly = true
+                    startShuffle(meta: context.meta, episodes: context.episodes, options: options, chooseSource: false)
+                }
+            }
+            Button(L10n.string("details_shuffle_choose_source", fallback: "Shuffle and Choose Source")) {
+                startShuffle(meta: context.meta, episodes: context.episodes, options: .wholeShow, chooseSource: true)
+            }
+            Button(L10n.string("action_cancel", fallback: "Cancel"), role: .cancel) {}
+        } message: { _ in
+            Text(L10n.string(
+                "details_shuffle_message",
+                fallback: "Plays a random episode, then keeps shuffling. Your place in Continue Watching stays where it is."
+            ))
+        }
+    }
+
+    private func canShuffle(meta: NuvioMeta, episodes: [NuvioVideo]) -> Bool {
+        guard meta.isSeries else { return false }
+        return !EpisodeShuffler.pool(from: episodes, options: .wholeShow, isWatched: { _ in false }).isEmpty
+    }
+
+    /// Picks a random episode, arms shuffle mode for the player, and plays it
+    /// through the normal episode path (auto-play best link or source picker).
+    private func startShuffle(
+        meta: NuvioMeta,
+        episodes: [NuvioVideo],
+        options: EpisodeShuffleOptions,
+        chooseSource: Bool
+    ) {
+        stopBackgroundTrailer(manual: false)
+        let store = ShuffleLaunchStore.shared
+        guard let episode = EpisodeShuffler.pick(
+            from: episodes,
+            options: options,
+            excluding: store.recentPicks(showID: meta.id),
+            currentID: nil,
+            isWatched: { WatchedStore.containsEpisode(meta: meta, season: $0.season, episode: $0.episode) }
+        ) else { return }
+        store.arm(showID: meta.id, episodeID: episode.id, options: options)
+        if chooseSource, let onEpisodePlayManually {
+            onEpisodePlayManually(episode)
+        } else {
+            onEpisodeSelected(episode)
+        }
     }
 
     private func handlePlayClick(playTarget: TvDetailsPlayTarget) {
+        ShuffleLaunchStore.shared.disarm()
         stopBackgroundTrailer(manual: false)
         guard playTarget.isPlayable else { return }
         if let episode = playTarget.episode {
@@ -3613,6 +3699,7 @@ struct TvDetailsContent: View {
     }
 
     private func handlePlayLongPress(playTarget: TvDetailsPlayTarget) {
+        ShuffleLaunchStore.shared.disarm()
         stopBackgroundTrailer(manual: false)
         guard playTarget.isPlayable else { return }
         if let episode = playTarget.episode {
@@ -3679,9 +3766,9 @@ struct TvDetailsContent: View {
                                             isSynopsisFocused: false
                                         )
 
-                                        actionRowView(meta: meta, playTarget: playTarget, scrollProxy: scrollProxy)
+                                        actionRowView(meta: meta, playTarget: playTarget, shuffleEpisodes: episodes, scrollProxy: scrollProxy)
                                     } else {
-                                        actionRowView(meta: meta, playTarget: playTarget, scrollProxy: scrollProxy)
+                                        actionRowView(meta: meta, playTarget: playTarget, shuffleEpisodes: episodes, scrollProxy: scrollProxy)
 
                                         TvDetailsSummary(
                                             meta: meta,
@@ -4393,7 +4480,7 @@ private struct TvDetailsLogo: View {
 /// (tvOS doesn't auto-focus the primary button when the details content swaps in
 /// after the async load — see `TvDetailsContent`).
 private enum DetailsActionFocus: Hashable {
-    case play, party, watchlist, watched, rate, trailer
+    case play, shuffle, party, watchlist, watched, rate, trailer
 }
 
 private enum DetailsCastHeaderFocus: Hashable {
@@ -4407,6 +4494,9 @@ private struct TvDetailsActionRow: View {
     var playHint: String = L10n.string("details_play_hint", fallback: "Starts playback or opens stream sources")
     let onPlayClick: () -> Void
     var onPlayLongPress: (() -> Void)? = nil
+    /// Plays a random episode (series only); long-press opens shuffle options.
+    var onShuffleClick: (() -> Void)? = nil
+    var onShuffleLongPress: (() -> Void)? = nil
     var onHostWatchParty: (() -> Void)? = nil
     let onWatchlistClick: () -> Void
     let onWatchedClick: () -> Void
@@ -4434,6 +4524,26 @@ private struct TvDetailsActionRow: View {
                 longPressAction: onPlayLongPress,
                 onBack: onBack
             )
+
+            if let onShuffleClick {
+                TvDetailsActionButton(
+                    title: nil,
+                    systemName: "shuffle",
+                    accessibilityLabel: L10n.string("details_shuffle", fallback: "Shuffle"),
+                    accessibilityHint: L10n.string(
+                        "details_shuffle_hint",
+                        fallback: "Plays a random episode in shuffle mode. Hold Select for shuffle options."
+                    ),
+                    isPrimary: false,
+                    focus: focus,
+                    tag: .shuffle,
+                    action: onShuffleClick,
+                    onFocus: onFocus,
+                    longPressAction: onShuffleLongPress,
+                    onBack: onBack
+                )
+                .disabled(entryLocked)
+            }
 
             if let onHostWatchParty {
                 TvDetailsActionButton(
@@ -9203,4 +9313,11 @@ struct ErrorView: View {
         }
         .padding(32)
     }
+}
+
+/// What the shuffle options sheet needs to start a shuffle.
+private struct ShuffleMenuContext {
+    let meta: NuvioMeta
+    let episodes: [NuvioVideo]
+    let currentSeason: Int?
 }

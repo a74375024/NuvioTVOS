@@ -528,7 +528,8 @@ extension PlayerView {
                         episode: next,
                         isAdvancing: viewModel.isAdvancingEpisode,
                         isFocused: nextEpisodeFocused,
-                        isAutoPlayCancelled: viewModel.isAutoPlayCancelled
+                        isAutoPlayCancelled: viewModel.isAutoPlayCancelled,
+                        isShuffle: viewModel.isShuffleOn
                     )
                 }
                 .buttonStyle(PosterCardButtonStyle())

@@ -949,7 +949,9 @@ enum ContinueWatchingBuilder {
                 print("[ContinueWatchingBuilder] watched fixture inspection: \(diagnostic)")
             }
         }
-        let watched = visibleItems.filter { !isKnownWatchedHistoryFixture($0) }
+        // Episodes watched in shuffle mode stay watched but never decide where
+        // you are in a show (see ShuffleWatchLog).
+        let watched = visibleItems.filter { !isKnownWatchedHistoryFixture($0) && !ShuffleWatchLog.contains($0) }
         var selectedByContentId: [String: WatchProgressRecord] = [:]
         var hasEpisodeSeed: Set<String> = []
 

@@ -266,6 +266,10 @@ class PlayerViewModel: ObservableObject {
     /// The episode that will play after this one, if any. Drives the Next
     /// Episode card; nil for movies, trailers, or the last episode.
     @Published var nextEpisode: NuvioVideo?
+    /// Shuffle mode for this playback session: on when started from the show
+    /// page's shuffle button, off otherwise; toggled from the player controls.
+    @Published private(set) var isShuffleOn = false
+    var shuffleOptions = EpisodeShuffleOptions.wholeShow
     /// Whether the Next Episode card is visible (near the end of an episode
     /// that has a follow-up).
     @Published var showNextEpisodeCard: Bool = false
@@ -1636,7 +1640,7 @@ class PlayerViewModel: ObservableObject {
         nextEpisodeAutoHideDeadline = nil
         nextEpisodeAutoPlayDeadline = nil
         isAutoPlayCancelled = false
-        nextEpisode = Self.nextEpisode(after: current, in: episodes)
+        nextEpisode = computeNextEpisode(after: current)
 
         if let meta = activeMeta, let urlString = activeStreamURL, let url = URL(string: urlString) {
             let context = ActivePlaybackContext(
@@ -2051,7 +2055,7 @@ class PlayerViewModel: ObservableObject {
         // existing local rollover behavior.
         if let activeMeta {
             markWatchedIfNeeded()
-            if !usesTraktProgress {
+            if !usesTraktProgress && !isShuffleOn {
                 ContinueWatchingStore.saveUpNext(
                     meta: activeMeta,
                     duration: time.duration,
@@ -2157,7 +2161,10 @@ class PlayerViewModel: ObservableObject {
         }
         if let episode {
             currentEpisodeVideo = episode
-            nextEpisode = Self.nextEpisode(after: episode, in: seriesEpisodes)
+            if isShuffleOn, let meta = activeMeta {
+                ShuffleLaunchStore.shared.remember(showID: meta.id, episodeID: episode.id)
+            }
+            nextEpisode = computeNextEpisode(after: episode)
             isAutoPlayCancelled = false
             fetchExternalSubtitles(
                 contentId: episode.id,
@@ -3148,7 +3155,7 @@ class PlayerViewModel: ObservableObject {
                !isSwitchingSource, !isReloadingStream, !isFailingOver,
                time.duration >= 60, time.current / time.duration >= 0.85 {
                 markWatchedIfNeeded()
-                if !usesTraktProgress {
+                if !usesTraktProgress && !isShuffleOn {
                     // Retire the episode that just finished. This keeps a
                     // completed row in the ledger, which is what produces the
                     // Next Up card below — and what lets a later season still
@@ -6527,7 +6534,7 @@ class PlayerViewModel: ObservableObject {
                 episode: resolvedEpisodeNumbers?.episode,
                 profileId: WatchedStore.activeProfileId
             )
-            if !usesTraktProgress {
+            if !usesTraktProgress && !isShuffleOn {
                 // The card is up because this episode reached its ending, so
                 // retire it in the ledger before suggesting the next one.
                 ContinueWatchingStore.markPlaybackCompleted(
@@ -6572,7 +6579,13 @@ class PlayerViewModel: ObservableObject {
                 profileId: WatchedStore.activeProfileId
             )
         }
-        if usesTraktProgress {
+        if isShuffleOn {
+            // Shuffle never moves your place in Continue Watching: no resume
+            // rows, no Up Next. A finished episode is still marked watched below.
+            if completesPlayback {
+                print("[ContinueWatching][Player] shuffle: marking watched without moving Continue Watching")
+            }
+        } else if usesTraktProgress {
             if completesPlayback {
                 markWatchedIfNeeded()
             } else {
@@ -6967,6 +6980,9 @@ class PlayerViewModel: ObservableObject {
             completionAccounts: tracker.completionAccounts
         )
         guard accepted else { return }
+        if isShuffleOn, let season, let episode {
+            ShuffleWatchLog.record(meta: activeMeta, season: season, episode: episode)
+        }
         sessionCoordinator.markPlaybackCompletionRecorded(completionID: completionID)
         finishPlaybackCompletion(
             meta: activeMeta,
@@ -7313,5 +7329,58 @@ extension PlayerViewModel {
             httpHeaders: activeHTTPHeaders,
             artworkURL: artwork
         )
+    }
+}
+
+// MARK: - Shuffle
+
+extension PlayerViewModel {
+    /// Shuffle applies to series sessions outside Watch Party.
+    var canShuffle: Bool {
+        !seriesEpisodes.isEmpty && !isStandalonePlaybackSession && watchPartyPlayerBridge == nil && !isLiveStream
+    }
+
+    /// Sets the session's starting shuffle state. Call before
+    /// `configureNextEpisode` so the first Next Episode pick honours it.
+    func prepareShuffle(launch: ShuffleLaunchStore.Launch?) {
+        guard watchPartyPlayerBridge == nil else {
+            isShuffleOn = false
+            return
+        }
+        if let launch {
+            isShuffleOn = true
+            shuffleOptions = launch.options
+        } else {
+            isShuffleOn = false
+            shuffleOptions = .wholeShow
+        }
+    }
+
+    func toggleShuffle() {
+        guard canShuffle else { return }
+        isShuffleOn.toggle()
+        if isShuffleOn, let meta = activeMeta, let current = currentEpisodeVideo {
+            ShuffleLaunchStore.shared.remember(showID: meta.id, episodeID: current.id)
+        }
+        nextEpisode = computeNextEpisode(after: currentEpisodeVideo)
+        isAutoPlayCancelled = false
+        showPlayerToast(isShuffleOn
+            ? L10n.string("player_shuffle_on", fallback: "Shuffle on")
+            : L10n.string("player_shuffle_off", fallback: "Shuffle off"))
+    }
+
+    /// Next episode in order, or a random one while shuffling.
+    fileprivate func computeNextEpisode(after current: NuvioVideo?) -> NuvioVideo? {
+        guard isShuffleOn, let meta = activeMeta else {
+            return Self.nextEpisode(after: current, in: seriesEpisodes)
+        }
+        let watchedMeta = meta
+        return EpisodeShuffler.pick(
+            from: seriesEpisodes,
+            options: shuffleOptions,
+            excluding: ShuffleLaunchStore.shared.recentPicks(showID: meta.id),
+            currentID: current?.id,
+            isWatched: { WatchedStore.containsEpisode(meta: watchedMeta, season: $0.season, episode: $0.episode) }
+        ) ?? Self.nextEpisode(after: current, in: seriesEpisodes)
     }
 }

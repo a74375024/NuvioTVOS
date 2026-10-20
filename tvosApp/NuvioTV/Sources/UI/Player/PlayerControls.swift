@@ -5,6 +5,7 @@ import CoreGraphics
 enum PlayerControlFocus: Hashable {
     case pip
     case episodes
+    case shuffle
     case sources
     case subtitles
     case audio
@@ -239,6 +240,7 @@ struct PlayerControls: View {
         var order: [PlayerControlFocus] = []
         if viewModel.isPictureInPictureSupported && playerShowPiP { order.append(.pip) }
         if viewModel.canShowEpisodesPanel && playerShowEpisodes { order.append(.episodes) }
+        if viewModel.canShuffle { order.append(.shuffle) }
         if viewModel.canShowSourcesPanel && playerShowSources { order.append(.sources) }
         if canShowSubtitlePicker && playerShowSubtitles { order.append(.subtitles) }
         if canShowAudioPicker && playerShowAudio { order.append(.audio) }
@@ -437,6 +439,32 @@ struct PlayerControls: View {
                     Image(systemName: "list.bullet")
                 }
                 .id("episodes_button")
+            }
+
+            if viewModel.canShuffle {
+                glassIconButton(
+                    size: 70,
+                    iconSize: 28,
+                    focusKey: .shuffle,
+                    isFocused: focusedControl == .shuffle
+                ) {
+                    viewModel.toggleShuffle()
+                } icon: {
+                    // A dot marks shuffle as on even when the button isn't focused.
+                    Image(systemName: "shuffle")
+                        .overlay(alignment: .topTrailing) {
+                            if viewModel.isShuffleOn {
+                                Circle()
+                                    .fill(Color(red: 0.35, green: 0.85, blue: 0.55))
+                                    .frame(width: 11, height: 11)
+                                    .offset(x: 9, y: -7)
+                            }
+                        }
+                }
+                .id("shuffle_button")
+                .accessibilityLabel(Text(viewModel.isShuffleOn
+                    ? L10n.string("player_shuffle_on", fallback: "Shuffle on")
+                    : L10n.string("player_shuffle_off", fallback: "Shuffle off")))
             }
 
             if viewModel.canShowSourcesPanel && playerShowSources {
@@ -1264,6 +1292,7 @@ struct NextEpisodeOverlay: View {
     let isAdvancing: Bool
     var isFocused: Bool
     let isAutoPlayCancelled: Bool
+    var isShuffle: Bool = false
 
     @AppStorage(SettingsKey.cardCornerRadius) private var cardCornerRadiusSetting = AppCardStyle.defaultCornerRadiusRaw
 
@@ -1292,9 +1321,17 @@ struct NextEpisodeOverlay: View {
             thumbnail
 
             VStack(alignment: .leading, spacing: 4) {
-                Text(L10n.string("player_next_episode", fallback: "Next Episode"))
-                    .font(.system(size: 21, weight: .semibold))
-                    .foregroundColor(.white.opacity(0.62))
+                HStack(spacing: 8) {
+                    if isShuffle {
+                        Image(systemName: "shuffle")
+                            .font(.system(size: 18, weight: .bold))
+                    }
+                    Text(isShuffle
+                         ? L10n.string("player_next_episode_shuffle", fallback: "Up Next · Shuffle")
+                         : L10n.string("player_next_episode", fallback: "Next Episode"))
+                }
+                .font(.system(size: 21, weight: .semibold))
+                .foregroundColor(.white.opacity(0.62))
                 Text(episodeLine)
                     .font(.system(size: 29, weight: .bold))
                     .foregroundColor(.white)

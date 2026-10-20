@@ -83,6 +83,9 @@ extension PlayerView {
                     )
                 }
                 if !isStandalonePlaybackSession, let resolveNextStream {
+                    viewModel.prepareShuffle(
+                        launch: ShuffleLaunchStore.shared.consume(showID: meta.id, episodeID: currentEpisode?.id)
+                    )
                     viewModel.configureNextEpisode(
                         episodes: episodes,
                         current: currentEpisode,
