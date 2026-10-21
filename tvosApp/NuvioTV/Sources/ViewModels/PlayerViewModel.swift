@@ -1343,7 +1343,7 @@ class PlayerViewModel: ObservableObject {
         }
         self.activeStreamURL = url.absoluteString
         self.activeHTTPHeaders = httpHeaders
-        if !isStandalonePlaybackSession && watchPartyPlayerBridge == nil {
+        if !isStandalonePlaybackSession && watchPartyPlayerBridge == nil && !isChannelPlayback {
             postPlayController.start(
                 contentId: meta.id,
                 contentType: meta.isSeries ? "series" : meta.type,
@@ -2067,7 +2067,7 @@ class PlayerViewModel: ObservableObject {
         // existing local rollover behavior.
         if let activeMeta {
             markWatchedIfNeeded()
-            if !usesTraktProgress && !isShuffleOn {
+            if !usesTraktProgress && !keepsContinueWatchingPlace {
                 ContinueWatchingStore.saveUpNext(
                     meta: activeMeta,
                     duration: time.duration,
@@ -3167,7 +3167,7 @@ class PlayerViewModel: ObservableObject {
                !isSwitchingSource, !isReloadingStream, !isFailingOver,
                time.duration >= 60, time.current / time.duration >= 0.85 {
                 markWatchedIfNeeded()
-                if !usesTraktProgress && !isShuffleOn {
+                if !usesTraktProgress && !keepsContinueWatchingPlace {
                     // Retire the episode that just finished. This keeps a
                     // completed row in the ledger, which is what produces the
                     // Next Up card below — and what lets a later season still
@@ -3927,7 +3927,7 @@ class PlayerViewModel: ObservableObject {
         skipSegmentCountdown = nil
         skipSegmentAutoHideDeadline = nil
         activeSkipInterval = nil
-        if interval.isEnding {
+        if interval.isEnding && !isChannelPlayback {
             postPlayController.showImmediately()
         }
         seek(to: min(interval.endTime + 0.25, max(time.duration - 0.5, interval.endTime)))
@@ -6546,7 +6546,7 @@ class PlayerViewModel: ObservableObject {
                 episode: resolvedEpisodeNumbers?.episode,
                 profileId: WatchedStore.activeProfileId
             )
-            if !usesTraktProgress && !isShuffleOn {
+            if !usesTraktProgress && !keepsContinueWatchingPlace {
                 // The card is up because this episode reached its ending, so
                 // retire it in the ledger before suggesting the next one.
                 ContinueWatchingStore.markPlaybackCompleted(
@@ -6591,8 +6591,8 @@ class PlayerViewModel: ObservableObject {
                 profileId: WatchedStore.activeProfileId
             )
         }
-        if isShuffleOn {
-            // Shuffle never moves your place in Continue Watching: no resume
+        if keepsContinueWatchingPlace {
+            // Shuffle and Channels never move your place in Continue Watching: no resume
             // rows, no Up Next. A finished episode is still marked watched below.
             if completesPlayback {
                 print("[ContinueWatching][Player] shuffle: marking watched without moving Continue Watching")
@@ -6992,7 +6992,7 @@ class PlayerViewModel: ObservableObject {
             completionAccounts: tracker.completionAccounts
         )
         guard accepted else { return }
-        if isShuffleOn, let season, let episode {
+        if keepsContinueWatchingPlace, let season, let episode {
             ShuffleWatchLog.record(meta: activeMeta, season: season, episode: episode)
         }
         sessionCoordinator.markPlaybackCompletionRecorded(completionID: completionID)
@@ -7440,8 +7440,15 @@ extension PlayerViewModel {
         guard showID != autoSkipLoadedShowID else { return }
         autoSkipLoadedShowID = showID
         if let showID {
-            autoSkipIntro = AutoSkipPreferences.skipsIntro(showID: showID)
-            autoSkipEnding = AutoSkipPreferences.skipsEnding(showID: showID)
+            if isChannelPlayback {
+                // Channels are lean-back: skip unless this show says otherwise.
+                let choice = AutoSkipPreferences.explicitChoice(showID: showID)
+                autoSkipIntro = choice.intro ?? true
+                autoSkipEnding = choice.ending ?? true
+            } else {
+                autoSkipIntro = AutoSkipPreferences.skipsIntro(showID: showID)
+                autoSkipEnding = AutoSkipPreferences.skipsEnding(showID: showID)
+            }
         } else {
             autoSkipIntro = false
             autoSkipEnding = false
@@ -7485,7 +7492,9 @@ extension PlayerViewModel {
                 advance()
                 return
             }
-            postPlayController.showImmediately()
+            if !isChannelPlayback {
+                postPlayController.showImmediately()
+            }
         }
 
         let message: String
@@ -7498,5 +7507,19 @@ extension PlayerViewModel {
         }
         seek(to: min(interval.endTime + 0.25, max(time.duration - 0.5, interval.endTime)))
         showPlayerToast(message)
+    }
+}
+
+// MARK: - Channels
+
+extension PlayerViewModel {
+    /// True while the player is showing a program from a Channel.
+    var isChannelPlayback: Bool {
+        ChannelSessionStore.shared.isActive && !isStandalonePlaybackSession
+    }
+
+    /// Shuffle and Channels both leave Continue Watching where it was.
+    var keepsContinueWatchingPlace: Bool {
+        isShuffleOn || isChannelPlayback
     }
 }

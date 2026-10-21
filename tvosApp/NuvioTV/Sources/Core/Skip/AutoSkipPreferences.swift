@@ -24,6 +24,12 @@ enum AutoSkipPreferences {
         choice(for: showID)?.ending ?? ProfileSettings.current.bool(forKey: defaultEndingKey)
     }
 
+    /// The show's own choices, nil where it uses the default.
+    static func explicitChoice(showID: String) -> (intro: Bool?, ending: Bool?) {
+        let saved = choice(for: showID)
+        return (saved?.intro, saved?.ending)
+    }
+
     static func setSkipsIntro(_ value: Bool, showID: String) {
         update(showID: showID) { $0.intro = value }
     }

@@ -271,14 +271,14 @@ private enum DetailsReturnDestination {
 }
 
 enum TVTab: Hashable, Identifiable, CaseIterable {
-    case profile, home, party, search, library, calendar, settings
+    case profile, home, party, search, library, channels, calendar, settings
     case collection(CollectionHomeID)
 
     static var allCases: [Self] {
         if WatchPartyConfiguration.isEnabled {
-            return [.profile, .home, .party, .search, .library, .calendar, .settings]
+            return [.profile, .home, .party, .search, .library, .channels, .calendar, .settings]
         } else {
-            return [.profile, .home, .search, .library, .calendar, .settings]
+            return [.profile, .home, .search, .library, .channels, .calendar, .settings]
         }
     }
     var id: String { rawValue }
@@ -289,6 +289,7 @@ enum TVTab: Hashable, Identifiable, CaseIterable {
         case .search: return "Search"
         case .library: return "Library"
         case .calendar: return "Calendar"
+        case .channels: return "Channels"
         case .settings: return "Settings"
         case .party: return "Watch Party"
         case .collection(let id): return "Collection:\(id.key)"
@@ -301,6 +302,7 @@ enum TVTab: Hashable, Identifiable, CaseIterable {
         case .search: return L10n.string("nav_search", fallback: "Search")
         case .library: return L10n.string("nav_library", fallback: "Library")
         case .calendar: return L10n.string("nav_calendar", fallback: "Calendar")
+        case .channels: return L10n.string("nav_channels", fallback: "Channels")
         case .settings: return L10n.string("nav_settings", fallback: "Settings")
         case .party: return "Watch Party"
         case .collection: return L10n.string("tmdb_collections_title", fallback: "Collections")
@@ -313,6 +315,7 @@ enum TVTab: Hashable, Identifiable, CaseIterable {
         case .search: return "magnifyingglass"
         case .library: return "rectangle.stack"
         case .calendar: return "calendar"
+        case .channels: return "tv"
         case .settings: return "gearshape"
         case .party: return "person.2.fill"
         case .collection: return "rectangle.stack.fill"
@@ -510,6 +513,8 @@ struct ContentView: View {
                 // card (tvOS focus memory) -- instead of rebuilding it from
                 // scratch and snapping back to the first card.
                 appContainer
+                    // Channels' tuning / Up Next card sits above the player.
+                    .overlay { ChannelTransitionOverlay() }
                     // Live Multiview grid; opened from the live player controls.
                     .modifier(MultiviewPresenter())
                     .transition(.opacity)
@@ -618,6 +623,7 @@ struct ContentView: View {
             syncManager.attach(authManager: authManager, profileViewModel: profileViewModel)
             ICloudSettingsSyncManager.shared.start()
             setupPictureInPicture()
+            configureChannels()
             guard !resolvedInitialScreen else { return }
             resolvedInitialScreen = true
             // Skip the login gate if a session was restored or the user has
@@ -1928,6 +1934,53 @@ struct ContentView: View {
         }
     }
 
+    /// Hands Channels the app's stream resolution and built-in player.
+    private func configureChannels() {
+        let channels = ChannelSessionStore.shared
+        channels.resolveStream = { item in
+            let profileId = ProfileSettings.activeProfileID
+            if let episode = item.episode {
+                return await Self.resolveStream(
+                    contentId: item.meta.canonicalEpisodeStreamId(for: episode),
+                    type: "series",
+                    subtitleLine: item.subtitleLine,
+                    profileId: profileId,
+                    seriesMetaId: item.meta.id
+                )
+            }
+            return await Self.resolveStream(
+                contentId: item.meta.id,
+                type: item.meta.type,
+                subtitleLine: "",
+                profileId: profileId
+            )
+        }
+        channels.presentItem = { item, prepared in
+            // Channels always use the built-in player so they can roll on.
+            playbackEpisodes = []
+            playbackCurrentEpisode = item.episode
+            presentBuiltInPlayer(
+                url: prepared.url,
+                meta: item.meta,
+                subtitle: prepared.subtitleLine,
+                httpHeaders: prepared.httpHeaders,
+                externalSubtitles: prepared.subtitles,
+                resumeFrom: nil,
+                origin: .main,
+                cacheFileIdentity: prepared.cacheFileIdentity,
+                filename: prepared.filename,
+                videoSize: prepared.videoSize,
+                videoHash: prepared.videoHash,
+                sourceID: prepared.sourceID
+            )
+        }
+        channels.leavePlayer = {
+            withAnimation(.easeInOut(duration: 0.2)) {
+                activeScreen = .main
+            }
+        }
+    }
+
     private func setupPictureInPicture() {
         PictureInPictureManager.shared.onDidLoseWatchPartyPiP = { coordinator in
             guard watchPartyOwner.owns(coordinator),
@@ -3070,7 +3123,10 @@ struct ContentView: View {
                 withAnimation(.easeInOut(duration: 0.24)) {
                     activeScreen = .details(id: meta.id, type: meta.type)
                 }
-            } : nil),
+            } : (ChannelSessionStore.shared.isActive ? {
+                // Channels: the program ended, so roll into the next one.
+                ChannelSessionStore.shared.itemFinished()
+            } : nil)),
             onPlaybackStarted: {
                 playbackDidStart = true
                 if !isStandalonePlaybackSession, let provenance,
@@ -3149,6 +3205,14 @@ struct ContentView: View {
     }
 
     private func dismissPlayer(meta: NuvioMeta, subtitle: String) {
+        if ChannelSessionStore.shared.isActive {
+            // Leaving a channel returns to the Channels guide.
+            ChannelSessionStore.shared.stop()
+            withAnimation(.easeInOut(duration: 0.24)) {
+                activeScreen = .main
+            }
+            return
+        }
         if playbackPartyID != nil {
             let pip = PictureInPictureManager.shared
             let keepsPiP = watchPartyOwner.owns(pip.activeCoordinator)
@@ -3726,6 +3790,11 @@ private struct TVMainTabView: View {
             .id(activeProfile?.id ?? "none")
     }
 
+    private var channelsTabContent: some View {
+        ChannelsView()
+            .id(activeProfile?.id ?? "none")
+    }
+
     private var calendarTabContent: some View {
         ReleaseCalendarView(
             libraryItems: libraryViewModel.items,
@@ -3807,6 +3876,9 @@ private struct TVMainTabView: View {
             libraryTabContent
                 .tabItem { Label(TVTab.library.title, systemImage: TVTab.library.symbol) }
                 .tag(TVTab.library)
+            channelsTabContent
+                .tabItem { Label(TVTab.channels.title, systemImage: TVTab.channels.symbol) }
+                .tag(TVTab.channels)
             calendarTabContent
                 .tabItem { Label(TVTab.calendar.title, systemImage: TVTab.calendar.symbol) }
                 .tag(TVTab.calendar)
@@ -3846,6 +3918,9 @@ private struct TVMainTabView: View {
             }
             Tab(TVTab.library.title, systemImage: TVTab.library.symbol, value: TVTab.library) {
                 libraryTabContent
+            }
+            Tab(TVTab.channels.title, systemImage: TVTab.channels.symbol, value: TVTab.channels) {
+                channelsTabContent
             }
             Tab(TVTab.calendar.title, systemImage: TVTab.calendar.symbol, value: TVTab.calendar) {
                 calendarTabContent
