@@ -1,4 +1,4 @@
-name: Build Multiview IPA
+name: Build Enhancements IPA
 
 # Builds an unsigned tvOS .ipa from this fork so it can be sideloaded
 # (Feather, Sideloadly, etc. re-sign it on install).
@@ -23,6 +23,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+          # Full history and tags, for the release notes.
+          fetch-depth: 0
 
       - name: Show toolchain
         run: |
@@ -54,23 +56,66 @@ jobs:
           path: build-ipa/NuvioTV-unsigned.ipa
           if-no-files-found: error
 
-      - name: Replace the previous release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        # A fresh release each build keeps the tag on the latest commit and
-        # makes GitHub send "new release" notifications. The download link
-        # (releases/download/multiview-latest/NuvioTV-unsigned.ipa) stays the same.
-        run: gh release delete multiview-latest --cleanup-tag --yes -R "$GITHUB_REPOSITORY" || true
+      - name: Write release notes
+        id: notes
+        shell: bash
+        run: |
+          version=$(sed -n 's/^let marketingVersion = "\(.*\)"/\1/p' tvosApp/Project.swift)
+          [ -z "$version" ] && version="dev"
+          tag="enh-${version}-b${{ github.run_number }}"
 
-      - name: Publish to the multiview-latest pre-release
+          git remote add upstream https://github.com/bobsupra/NuvioTVOS.git 2>/dev/null || true
+          git fetch --no-tags --quiet upstream main || true
+          prev=$(git tag --list 'enh-*' --sort=-creatordate | head -1)
+          if [ -n "$prev" ]; then
+            range="$prev..HEAD"
+          else
+            range="$(git merge-base HEAD upstream/main 2>/dev/null || git rev-list --max-parents=0 HEAD | tail -1)..HEAD"
+          fi
+
+          ours=$(git log "$range" --no-merges --author="a74375024" --format='%s' | { grep -v '^ci:' || true; } | sed 's/^/- /')
+          upstream_count=$(git log "$range" --no-merges --format='%ae' | grep -v 'a74375024@users.noreply.github.com' | grep -vc 'github-actions' || true)
+
+          {
+            echo "## What's new in this build"
+            if [ -n "$ours" ]; then echo "$ours"; else echo "- No changes to the enhancements."; fi
+            echo
+            echo "## From bobsupra"
+            if [ "${upstream_count:-0}" -gt 0 ]; then
+              echo "- ${upstream_count} new upstream commits (Nuvio ${version})."
+            else
+              echo "- No new upstream changes (Nuvio ${version})."
+            fi
+            echo
+            echo "**Includes:** Multiview + Spotlight · Release Calendar · Shuffle · Auto-skip intros & endings"
+            echo
+            echo "Unsigned tvOS build of commit ${GITHUB_SHA::7}. Install with your sideloading tool; it re-signs the app on install."
+            echo "Always-newest download: https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/NuvioTV-unsigned.ipa"
+          } > release-notes.md
+          cat release-notes.md
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "name=Nuvio ${version} + Enhancements · build ${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: multiview-latest
-          name: Enhancements build (${{ github.sha }})
-          prerelease: true
-          make_latest: false
+          tag_name: ${{ steps.notes.outputs.tag }}
+          name: ${{ steps.notes.outputs.name }}
+          body_path: release-notes.md
+          prerelease: false
+          make_latest: true
           target_commitish: ${{ github.sha }}
-          body: |
-            Unsigned tvOS build of the `multiview` branch (Multiview + Release Calendar), commit ${{ github.sha }}.
-            Install with your sideloading tool; it re-signs the app on install.
           files: build-ipa/NuvioTV-unsigned.ipa
+
+      - name: Tidy up old releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        # Drops the old single rolling release and keeps the 15 newest builds.
+        run: |
+          gh release delete multiview-latest --cleanup-tag --yes -R "$GITHUB_REPOSITORY" 2>/dev/null || true
+          gh release list -R "$GITHUB_REPOSITORY" --limit 100 --json tagName -q '.[].tagName' \
+            | { grep '^enh-' || true; } | tail -n +16 \
+            | while read -r old; do gh release delete "$old" --cleanup-tag --yes -R "$GITHUB_REPOSITORY" || true; done \
+            || true
