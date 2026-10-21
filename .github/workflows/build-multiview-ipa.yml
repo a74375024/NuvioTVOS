@@ -54,6 +54,14 @@ jobs:
           path: build-ipa/NuvioTV-unsigned.ipa
           if-no-files-found: error
 
+      - name: Replace the previous release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # A fresh release each build keeps the tag on the latest commit and
+        # makes GitHub send "new release" notifications. The download link
+        # (releases/download/multiview-latest/NuvioTV-unsigned.ipa) stays the same.
+        run: gh release delete multiview-latest --cleanup-tag --yes -R "$GITHUB_REPOSITORY" || true
+
       - name: Publish to the multiview-latest pre-release
         uses: softprops/action-gh-release@v2
         with:
