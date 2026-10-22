@@ -225,11 +225,21 @@ enum OutsideGuide {
             for channel in channels {
                 let isLocal = (channel.group ?? "").lowercased().contains("local")
                 var signs = OutsideGuide.callsigns(in: channel.name, strongContext: isLocal)
+                // A call sign written alone in capitals ("(US) (Prime) KAGS").
+                if signs.isEmpty, let sign = ChannelCatalog.bareCallsign(channel.name) { signs = [sign] }
                 if signs.isEmpty, let sign = OutsideGuide.stationCallsign(for: channel.name, stations: stationsByNetwork) {
                     signs = [sign]
                 }
+                // The provider's XMLTV id ("KGO.us", "ESPN.us") is another key.
+                if let epg = channel.epgID {
+                    signs += OutsideGuide.callsigns(in: epg, strongContext: true).filter { !signs.contains($0) }
+                }
                 for sign in signs { bySign[sign, default: []].append(channel.id) }
-                for text in Set([channel.displayName, channel.name]) {
+                var texts = Set([channel.displayName, channel.name])
+                if let epg = channel.epgID {
+                    texts.insert(epg.rxReplace("\\.[a-z]{2,3}$", with: "", caseInsensitive: true))
+                }
+                for text in texts {
                     let key = OutsideGuide.normalize(text)
                     if key.count >= 2 { byName[key, default: []].append(channel.id) }
                 }
@@ -264,7 +274,9 @@ enum OutsideGuide {
     static func stationCallsign(for name: String, stations: [String: [Station]]) -> String? {
         guard !stations.isEmpty else { return nil }
         let lowered = name.lowercased()
-            .replacingOccurrences(of: "^\\s*[^:|]{1,24}[:|]\\s*", with: "", options: .regularExpression)
+            .rxReplace("^\\s*[^:|]{1,24}[:|]\\s*", with: "")
+            // "PBS12" → "pbs 12", "[Denver]" → "denver"
+            .rxReplace("([a-z])(\\d)", with: "$1 $2")
         let tokens = lowered.split(whereSeparator: { !($0.isLetter || $0.isNumber) }).map(String.init)
         // "NBC Sports Chicago" / "CBS News Chicago" are their own channels.
         guard !tokens.contains(where: { ["sports", "news", "network", "plus"].contains($0) }),
@@ -320,9 +332,9 @@ enum OutsideGuide {
         var s = name.lowercased()
             .replacingOccurrences(of: "&", with: " and ")
             .replacingOccurrences(of: "+", with: " plus ")
-        let west = s.range(of: "\\b(west|pacific)\\b", options: .regularExpression) != nil
-        s = s.replacingOccurrences(of: "[\\[\\(][^\\]\\)]*[\\]\\)]", with: " ", options: .regularExpression)
-        s = s.replacingOccurrences(of: "^\\s*[^:|]{1,24}[:|]\\s*", with: "", options: .regularExpression)
+        let west = RX.test("\\b(west|pacific)\\b", s)
+        s = s.rxReplace("[\\[\\(][^\\]\\)]*[\\]\\)]", with: " ")
+        s = s.rxReplace("^\\s*[^:|]{1,24}[:|]\\s*", with: "")
         let tokens = s.split(whereSeparator: { !($0.isLetter || $0.isNumber) || !$0.isASCII })
             .map(String.init)
             .filter { !dropTokens.contains($0) }

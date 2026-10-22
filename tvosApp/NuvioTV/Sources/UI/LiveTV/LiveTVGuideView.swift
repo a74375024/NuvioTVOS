@@ -1,22 +1,32 @@
 import SwiftUI
 
-private enum LiveGuideMetrics {
+enum LiveGuideMetrics {
     static let sideInset: CGFloat = 60
     static let channelColumn: CGFloat = 320
-    static let rowHeight: CGFloat = 100
+    static let rowHeight: CGFloat = 96
     static let rowSpacing: CGFloat = 10
     static let cellGap: CGFloat = 8
-    static let heroHeight: CGFloat = 400
-    static let artWidth: CGFloat = 560
+    static let heroHeight: CGFloat = 300
     static let windowMinutes = 180
 }
 
-/// Which channels the guide lists.
-enum LiveScope: Equatable {
+/// Which entries the guide lists.
+enum LiveView: Equatable {
+    case lineup
     case all
     case favorites
     case recent
     case group(String)
+
+    var title: String {
+        switch self {
+        case .lineup: return L10n.string("live_view_lineup", fallback: "My Lineup")
+        case .all: return L10n.string("live_view_all", fallback: "All Channels")
+        case .favorites: return L10n.string("live_filter_favorites", fallback: "Favorites")
+        case .recent: return L10n.string("live_filter_recent", fallback: "Recent")
+        case .group(let name): return name
+        }
+    }
 }
 
 /// Optional genre filter, from the guide's program flags.
@@ -41,33 +51,57 @@ enum LiveGenre: String, CaseIterable, Identifiable {
     }
 }
 
-/// Live TV guide for the channels on the user's Emby / Jellyfin server: real
-/// guide times, a now line, favorites first, Select to watch, long press for
-/// Multiview and favorites.
+/// A row in the guide; hidden rows (not in My Lineup) show dimmed when
+/// "Show hidden channels" is on.
+struct LiveGuideRow: Identifiable {
+    let channel: LiveTVChannel
+    let dimmed: Bool
+    var id: String { channel.id }
+}
+
+/// Picks one version of a channel, or one feed of an event family.
+struct LiveFeedPicker: Identifiable {
+    let id = UUID()
+    let title: String
+    let channel: LiveTVChannel?
+    let family: EventFamily?
+}
+
+/// Live TV guide for the channels on the user's Emby / Jellyfin server: My
+/// Lineup (or all channels), real guide times with a now line, Live Events,
+/// search, and long press for lineup, favorites and feed choice.
 struct LiveTVGuideView: View {
     @ObservedObject private var store = LiveTVStore.shared
     @ObservedObject private var multiview = MultiviewStore.shared
     @AppStorage(SettingsKey.amoled) private var amoled = false
     @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
+    @AppStorage("nuvio.tv.livetv.setupOffered") private var setupOffered = false
     @FocusState private var focusedCell: String?
     @State private var focusedChannel: LiveTVChannel?
     @State private var focusedProgram: LiveTVProgram?
-    @State private var scope: LiveScope = .all
+    @State private var chosenView: LiveView?
     @State private var genre: LiveGenre?
+    @State private var showingEvents = false
     @State private var showSearch = false
-    @State private var showGroups = false
+    @State private var showViewPicker = false
     @State private var showGenres = false
-    @State private var showSources = false
+    @State private var showOptions = false
+    @State private var showSetup = false
+    @State private var feedPicker: LiveFeedPicker?
     @State private var now = Date()
 
     private let ticker = Timer.publish(every: 30, on: .main, in: .common).autoconnect()
+
+    private var currentView: LiveView {
+        chosenView ?? (store.prefs.configured ? .lineup : .all)
+    }
 
     var body: some View {
         ZStack(alignment: .top) {
             Color.nuvioBackground(amoled: amoled, body: bodyColor).ignoresSafeArea()
             switch store.state {
             case .loaded:
-                guide
+                content
             case .idle, .loading:
                 statusView(symbol: "antenna.radiowaves.left.and.right", title: L10n.string("live_loading", fallback: "Loading your channels…"), message: nil, showsProgress: true, showsRetry: false)
             case .empty(let message):
@@ -75,7 +109,7 @@ struct LiveTVGuideView: View {
             case .failed(let message):
                 statusView(symbol: "exclamationmark.triangle", title: L10n.string("live_failed", fallback: "Couldn't load Live TV"), message: message, showsProgress: false, showsRetry: true)
             }
-            if let toast = store.toast {
+            if let toast = store.toast, !store.isWatching {
                 VStack {
                     Spacer()
                     Text(toast)
@@ -83,7 +117,7 @@ struct LiveTVGuideView: View {
                         .foregroundColor(.white)
                         .padding(.horizontal, 30)
                         .padding(.vertical, 16)
-                        .background(Capsule().fill(Color.black.opacity(0.75)))
+                        .background(Capsule().fill(Color.black.opacity(0.8)))
                         .padding(.bottom, 50)
                 }
                 .transition(.move(edge: .bottom).combined(with: .opacity))
@@ -94,42 +128,54 @@ struct LiveTVGuideView: View {
         .onAppear {
             now = Date()
             store.loadIfNeeded()
-            // CI screenshot tour only.
-            if ScreenTour.requested == "live-demo-search" {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1) { showSearch = true }
-            } else if ScreenTour.requested == "live-demo-groups" {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1) { showGroups = true }
-            } else if ScreenTour.requested == "live-demo-sources" {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1) { showSources = true }
-            }
+            runScreenTourHooks()
         }
         .onReceive(ticker) { date in
             now = date
             store.refreshGuideIfNeeded()
         }
-        .onChange(of: genre) { _, newGenre in
-            // Genre filtering needs guide data for the whole list, not just
-            // the rows on screen.
-            guard newGenre != nil else { return }
-            store.requestGuide(scopedChannels.prefix(1500).map(\.id))
+        .onChange(of: store.state) { _, newState in
+            // Offer setup once, the first time channels load.
+            guard newState == .loaded, !store.prefs.configured, !setupOffered, !ScreenTour.isActive else { return }
+            setupOffered = true
+            showSetup = true
         }
-        .onChange(of: scope) { _, _ in
-            if genre != nil { store.requestGuide(scopedChannels.prefix(1500).map(\.id)) }
+        .onChange(of: genre) { _, newGenre in
+            // Genre filtering needs guide data for the whole list.
+            guard newGenre != nil else { return }
+            store.requestGuide(baseRows.prefix(1500).map(\.channel.id))
         }
         .fullScreenCover(isPresented: $showSearch) {
-            LiveTVSearchView(initialQuery: ScreenTour.requested == "live-demo-search" ? "sports" : "") { channel, lineup in
-                showSearch = false
-                store.watch(channel, lineup: lineup)
+            LiveTVSearchView(
+                initialQuery: ScreenTour.requested == "live-demo-search" ? "sports" : "",
+                onWatch: { channel, lineup in
+                    showSearch = false
+                    store.watch(channel, lineup: lineup)
+                },
+                onWatchEvent: { event in
+                    showSearch = false
+                    store.watchEvent(event)
+                }
+            )
+        }
+        .fullScreenCover(isPresented: $showSetup) {
+            LineupSetupView { showSetup = false; chosenView = nil }
+        }
+        .sheet(isPresented: $showViewPicker) {
+            LiveTVViewPicker(current: currentView) { view in
+                chosenView = view
+                showingEvents = false
+                showViewPicker = false
             }
         }
-        .sheet(isPresented: $showSources) {
-            LiveTVGuideSourcesView()
+        .sheet(isPresented: $showOptions) {
+            LiveTVOptionsView(onSetup: {
+                showOptions = false
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { showSetup = true }
+            })
         }
-        .sheet(isPresented: $showGroups) {
-            LiveTVGroupsView(selected: scopeGroup) { group in
-                scope = group.map(LiveScope.group) ?? .all
-                showGroups = false
-            }
+        .sheet(item: $feedPicker) { picker in
+            LiveFeedPickerView(picker: picker) { feedPicker = nil }
         }
         .confirmationDialog(
             L10n.string("live_genre_title", fallback: "Show channels airing"),
@@ -142,9 +188,19 @@ struct LiveTVGuideView: View {
         }
     }
 
-    private var scopeGroup: String? {
-        if case .group(let name) = scope { return name }
-        return nil
+    private func runScreenTourHooks() {
+        guard let request = ScreenTour.requested else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+            switch request {
+            case "live-demo-search": showSearch = true
+            case "live-demo-groups": showViewPicker = true
+            case "live-demo-sources": showOptions = true
+            case "live-demo-events": showingEvents = true
+            case "live-demo-all": chosenView = .all; store.setShowHidden(true)
+            case "live-demo-setup": showSetup = true
+            default: break
+            }
+        }
     }
 
     // MARK: Status
@@ -180,74 +236,129 @@ struct LiveTVGuideView: View {
         .focusSection()
     }
 
-    // MARK: Guide
+    // MARK: Rows
 
     private var windowStart: Date { LiveTVStore.windowStart(for: now) }
 
+    /// Rows for the current view, before the genre filter.
+    private var baseRows: [LiveGuideRow] {
+        let showHidden = store.prefs.showHidden
+        switch currentView {
+        case .lineup:
+            var rows = store.lineupEntries.map { LiveGuideRow(channel: $0, dimmed: false) }
+            if showHidden {
+                rows += store.entries.filter { !store.isInLineup($0) }.map { LiveGuideRow(channel: $0, dimmed: true) }
+            }
+            return rows
+        case .all:
+            return store.entries.compactMap { entry in
+                let hidden = store.isHidden(entry)
+                if hidden && !showHidden { return nil }
+                return LiveGuideRow(channel: entry, dimmed: hidden)
+            }
+        case .favorites:
+            return store.entries.filter(\.isFavorite).map { LiveGuideRow(channel: $0, dimmed: false) }
+        case .recent:
+            return store.recentChannels.map { LiveGuideRow(channel: $0, dimmed: false) }
+        case .group(let name):
+            return store.entries.filter { store.groupName(of: $0) == name }.map { LiveGuideRow(channel: $0, dimmed: false) }
+        }
+    }
+
+    private var rows: [LiveGuideRow] {
+        let base = baseRows
+        guard let genre else { return base }
+        return base.filter { row in (store.programs[row.channel.id] ?? []).contains(where: genre.matches) }
+    }
+
     private var emptyMessage: String {
         if genre != nil { return L10n.string("live_filter_empty", fallback: "Nothing on that matches this filter right now.") }
-        switch scope {
+        switch currentView {
+        case .lineup: return L10n.string("live_lineup_empty", fallback: "My Lineup is empty. Open Options → Edit My Lineup, or hold Select on any channel in All Channels to add it.")
         case .favorites: return L10n.string("live_favorites_empty", fallback: "No favorites yet. Hold Select on a channel and choose Add to Favorites.")
         case .recent: return L10n.string("live_recent_empty", fallback: "Channels you watch will show up here.")
         default: return L10n.string("live_filter_empty", fallback: "Nothing on that matches this filter right now.")
         }
     }
 
-    /// Channels in the chosen scope, before the genre filter.
-    private var scopedChannels: [LiveTVChannel] {
-        switch scope {
-        case .all: return store.channels.filter { !store.isHidden($0) }
-        case .favorites: return store.channels.filter(\.isFavorite)
-        case .recent: return store.recentChannels
-        case .group(let name): return store.channels.filter { store.groupName(of: $0) == name }
-        }
-    }
+    // MARK: Layout
 
-    private var visibleChannels: [LiveTVChannel] {
-        let scoped = scopedChannels
-        guard let genre else { return scoped }
-        return scoped.filter { channel in
-            (store.programs[channel.id] ?? []).contains(where: genre.matches)
-        }
-    }
-
-    private var guide: some View {
+    private var content: some View {
         GeometryReader { proxy in
             let gridWidth = max(600, proxy.size.width - LiveGuideMetrics.sideInset * 2 - LiveGuideMetrics.channelColumn)
             let ppm = gridWidth / CGFloat(LiveGuideMetrics.windowMinutes)
-            let channels = visibleChannels
             VStack(alignment: .leading, spacing: 0) {
-                hero.frame(width: max(0, proxy.size.width - LiveGuideMetrics.sideInset * 2), height: LiveGuideMetrics.heroHeight).clipped()
-                filterBar.padding(.bottom, 14)
-                timeRuler(gridWidth: gridWidth, ppm: ppm).padding(.bottom, 8)
-                ScrollView(.vertical, showsIndicators: false) {
-                    LazyVStack(alignment: .leading, spacing: LiveGuideMetrics.rowSpacing) {
-                        if channels.isEmpty {
-                            Text(emptyMessage)
-                                .font(.system(size: 24))
-                                .foregroundColor(.white.opacity(0.6))
-                                .padding(.vertical, 40)
-                        }
-                        ForEach(channels) { channel in
-                            row(channel, gridWidth: gridWidth, ppm: ppm)
-                        }
+                if showingEvents {
+                    eventsHeader
+                    filterBar.padding(.bottom, 16)
+                    LiveEventsView(onPickFamily: { family in
+                        feedPicker = LiveFeedPicker(title: family.name, channel: nil, family: family)
+                    })
+                } else {
+                    hero.frame(width: max(0, proxy.size.width - LiveGuideMetrics.sideInset * 2), height: LiveGuideMetrics.heroHeight).clipped()
+                    filterBar.padding(.bottom, 14)
+                    if !store.prefs.configured {
+                        setupPrompt.padding(.bottom, 14)
                     }
-                    .padding(.bottom, 60)
+                    timeRuler(gridWidth: gridWidth, ppm: ppm).padding(.bottom, 8)
+                    guideList(gridWidth: gridWidth, ppm: ppm)
                 }
-                .mask(Rectangle().padding(.horizontal, -60).padding(.bottom, -200))
-                .focusSection()
             }
             .padding(.horizontal, LiveGuideMetrics.sideInset)
             .frame(width: proxy.size.width, alignment: .leading)
             .overlay(alignment: .topLeading) {
-                nowLine(gridWidth: gridWidth, ppm: ppm, height: proxy.size.height)
+                if !showingEvents {
+                    nowLine(gridWidth: gridWidth, ppm: ppm, height: proxy.size.height)
+                }
             }
         }
     }
 
+    private func guideList(gridWidth: CGFloat, ppm: CGFloat) -> some View {
+        let list = rows
+        return ScrollView(.vertical, showsIndicators: false) {
+            LazyVStack(alignment: .leading, spacing: LiveGuideMetrics.rowSpacing) {
+                if list.isEmpty {
+                    Text(emptyMessage)
+                        .font(.system(size: 24))
+                        .foregroundColor(.white.opacity(0.6))
+                        .padding(.vertical, 40)
+                }
+                ForEach(list) { row in
+                    guideRow(row, list: list, gridWidth: gridWidth, ppm: ppm)
+                }
+            }
+            .padding(.bottom, 60)
+        }
+        .mask(Rectangle().padding(.horizontal, -60).padding(.bottom, -200))
+        .focusSection()
+    }
+
+    private var setupPrompt: some View {
+        HStack(spacing: 20) {
+            Image(systemName: "sparkles.tv")
+                .font(.system(size: 30, weight: .semibold))
+                .foregroundColor(.white)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(L10n.string("live_setup_prompt_title", fallback: "Make Live TV yours"))
+                    .font(.system(size: 24, weight: .bold)).foregroundColor(.white)
+                Text(L10n.format("live_setup_prompt_detail", fallback: "Set up My Lineup: your local stations and the networks you watch, one entry each, instead of %d channels.", store.channels.count))
+                    .font(.system(size: 20)).foregroundColor(.white.opacity(0.7)).lineLimit(1)
+            }
+            Spacer()
+            SourceModeChip(title: L10n.string("live_setup_prompt_button", fallback: "Set Up My Lineup"), isSelected: true) {
+                showSetup = true
+            }
+        }
+        .padding(.horizontal, 24)
+        .padding(.vertical, 14)
+        .background(RoundedRectangle(cornerRadius: 18, style: .continuous).fill(Color.white.opacity(0.08)))
+        .focusSection()
+    }
+
     // MARK: Hero
 
-    private var heroChannel: LiveTVChannel? { focusedChannel ?? store.channels.first }
+    private var heroChannel: LiveTVChannel? { focusedChannel ?? rows.first?.channel }
 
     private var heroProgram: LiveTVProgram? {
         if let focusedProgram { return focusedProgram }
@@ -256,116 +367,115 @@ struct LiveTVGuideView: View {
     }
 
     private var hero: some View {
-        HStack(alignment: .top, spacing: 50) {
-            VStack(alignment: .leading, spacing: 12) {
-                HStack(spacing: 14) {
-                    Text(L10n.string("nav_live_tv", fallback: "Live TV"))
-                        .font(.system(size: 26, weight: .bold))
-                        .foregroundColor(.white.opacity(0.55))
-                    if store.isLoadingGuide { ProgressView().tint(.white).scaleEffect(0.7) }
-                    if case .updating(let line) = store.outsideStatus {
-                        Text(line)
-                            .font(.system(size: 18, weight: .medium))
-                            .foregroundColor(.white.opacity(0.45))
-                            .lineLimit(1)
-                    } else if case .ready(let matched, let total, _) = store.outsideStatus, ScreenTour.isActive {
-                        Text("Outside listings: \(matched) of \(total) channels")
-                            .font(.system(size: 18, weight: .medium))
-                            .foregroundColor(.white.opacity(0.45))
-                    } else if case .failed(let message) = store.outsideStatus, ScreenTour.isActive {
-                        Text(message).font(.system(size: 16)).foregroundColor(.red.opacity(0.8)).lineLimit(2)
-                    }
-                }
-                if let channel = heroChannel {
-                    HStack(spacing: 12) {
-                        Text(store.number(of: channel))
-                            .font(.system(size: 24, weight: .heavy).monospacedDigit())
-                            .foregroundColor(.black)
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 3)
-                            .background(RoundedRectangle(cornerRadius: 6).fill(Color.white))
-                        Text(channel.name)
-                            .font(.system(size: 26, weight: .semibold))
-                            .foregroundColor(.white)
-                            .lineLimit(1)
-                        if channel.isFavorite {
-                            Image(systemName: "star.fill").foregroundColor(.yellow)
-                        }
-                    }
-                }
-                if let program = heroProgram {
-                    Text(program.title)
-                        .font(.system(size: 52, weight: .bold))
-                        .foregroundColor(.white)
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 14) {
+                Text(currentView.title)
+                    .font(.system(size: 24, weight: .bold))
+                    .foregroundColor(.white.opacity(0.55))
+                if store.isLoadingGuide { ProgressView().tint(.white).scaleEffect(0.7) }
+                if case .updating(let line) = store.outsideStatus {
+                    Text(line)
+                        .font(.system(size: 18, weight: .medium))
+                        .foregroundColor(.white.opacity(0.45))
                         .lineLimit(1)
-                    HStack(spacing: 12) {
-                        if program.isOn(at: now) { badge(L10n.string("live_badge_live", fallback: "LIVE"), color: Color(red: 1, green: 0.3, blue: 0.3)) }
-                        if program.isPremiere { badge(L10n.string("live_badge_new", fallback: "NEW"), color: .blue) }
-                        Text(timeRange(program))
-                            .font(.system(size: 24, weight: .semibold).monospacedDigit())
-                            .foregroundColor(.white.opacity(0.8))
-                        if program.fromOutsideGuide {
-                            Text(L10n.string("live_outside_badge", fallback: "OUTSIDE LISTING"))
-                                .font(.system(size: 14, weight: .heavy))
-                                .tracking(0.6)
-                                .foregroundColor(.white.opacity(0.6))
-                                .padding(.horizontal, 8)
-                                .padding(.vertical, 3)
-                                .overlay(RoundedRectangle(cornerRadius: 5).strokeBorder(Color.white.opacity(0.35), lineWidth: 1))
-                        }
-                        if let episode = program.episodeTitle {
-                            Text("· \(episode)")
-                                .font(.system(size: 24, weight: .medium))
-                                .foregroundColor(.white.opacity(0.75))
-                                .lineLimit(1)
-                        }
-                    }
-                    if program.isOn(at: now) {
-                        progressBar(program).frame(width: 420, height: 6)
-                    }
-                    if let overview = program.overview {
-                        Text(overview)
-                            .font(.system(size: 22))
-                            .foregroundColor(.white.opacity(0.7))
-                            .lineLimit(3)
-                            .frame(maxWidth: 900, alignment: .leading)
-                    }
-                } else if heroChannel != nil {
-                    Text(L10n.string("live_no_guide", fallback: "No guide information"))
-                        .font(.system(size: 40, weight: .bold))
-                        .foregroundColor(.white.opacity(0.85))
+                } else if case .ready(let matched, let total, _) = store.outsideStatus, ScreenTour.isActive {
+                    Text("Outside listings: \(matched) of \(total) channels")
+                        .font(.system(size: 18, weight: .medium))
+                        .foregroundColor(.white.opacity(0.45))
+                } else if case .failed(let message) = store.outsideStatus, ScreenTour.isActive {
+                    Text(message).font(.system(size: 16)).foregroundColor(.red.opacity(0.8)).lineLimit(2)
                 }
-                Spacer(minLength: 0)
-            }
-            .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
-            .layoutPriority(-1)
-
-            VStack(alignment: .trailing, spacing: 10) {
+                Spacer()
                 Text(ChannelsView.clockFormatter.string(from: now))
                     .font(.system(size: 26, weight: .semibold).monospacedDigit())
                     .foregroundColor(.white.opacity(0.7))
-                heroArt
             }
+            if let channel = heroChannel {
+                HStack(spacing: 12) {
+                    Text(store.number(of: channel))
+                        .font(.system(size: 22, weight: .heavy).monospacedDigit())
+                        .foregroundColor(.black)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 3)
+                        .background(RoundedRectangle(cornerRadius: 6).fill(Color.white))
+                    logo(channel, size: 30)
+                    Text(channel.name)
+                        .font(.system(size: 26, weight: .semibold))
+                        .foregroundColor(.white)
+                        .lineLimit(1)
+                    if channel.isFavorite { Image(systemName: "star.fill").foregroundColor(.yellow) }
+                    let versions = store.versions(of: channel).count
+                    if versions > 1 {
+                        Text(L10n.format("live_versions", fallback: "%d feeds", versions))
+                            .font(.system(size: 16, weight: .bold))
+                            .foregroundColor(.white.opacity(0.6))
+                            .padding(.horizontal, 8).padding(.vertical, 3)
+                            .overlay(Capsule().strokeBorder(Color.white.opacity(0.3), lineWidth: 1))
+                    }
+                }
+            }
+            if let program = heroProgram {
+                Text(program.title)
+                    .font(.system(size: 50, weight: .bold))
+                    .foregroundColor(.white)
+                    .lineLimit(1)
+                HStack(spacing: 12) {
+                    if program.isOn(at: now) { badge(L10n.string("live_badge_live", fallback: "LIVE"), color: Color(red: 1, green: 0.3, blue: 0.3)) }
+                    if program.isPremiere { badge(L10n.string("live_badge_new", fallback: "NEW"), color: .blue) }
+                    Text(timeRange(program))
+                        .font(.system(size: 24, weight: .semibold).monospacedDigit())
+                        .foregroundColor(.white.opacity(0.8))
+                    if program.fromOutsideGuide {
+                        Text(L10n.string("live_outside_badge", fallback: "OUTSIDE LISTING"))
+                            .font(.system(size: 14, weight: .heavy))
+                            .tracking(0.6)
+                            .foregroundColor(.white.opacity(0.6))
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 3)
+                            .overlay(RoundedRectangle(cornerRadius: 5).strokeBorder(Color.white.opacity(0.35), lineWidth: 1))
+                    }
+                    if let episode = program.episodeTitle {
+                        Text("· \(episode)")
+                            .font(.system(size: 24, weight: .medium))
+                            .foregroundColor(.white.opacity(0.75))
+                            .lineLimit(1)
+                    }
+                }
+                if program.isOn(at: now) {
+                    progressBar(program).frame(width: 420, height: 6)
+                }
+                if let overview = program.overview {
+                    Text(overview)
+                        .font(.system(size: 22))
+                        .foregroundColor(.white.opacity(0.7))
+                        .lineLimit(2)
+                        .frame(maxWidth: 1200, alignment: .leading)
+                }
+            } else if heroChannel != nil {
+                Text(L10n.string("live_no_guide", fallback: "No guide information"))
+                    .font(.system(size: 40, weight: .bold))
+                    .foregroundColor(.white.opacity(0.85))
+            }
+            Spacer(minLength: 0)
         }
-        .padding(.top, 30)
+        .padding(.top, 26)
     }
 
-    private var heroArt: some View {
-        let height = LiveGuideMetrics.artWidth * 9 / 16
-        return ZStack {
-            Color.white.opacity(0.06)
-            if let image = heroProgram?.imageURL {
-                CachedPosterArtwork(urlString: image.absoluteString, width: LiveGuideMetrics.artWidth, height: height, maximumWidth: LiveGuideMetrics.artWidth) {
-                    logo(heroChannel, size: 160)
-                }
-            } else {
-                logo(heroChannel, size: 160)
-            }
+    private var eventsHeader: some View {
+        HStack(spacing: 14) {
+            Text(L10n.string("live_events_title", fallback: "Live Events"))
+                .font(.system(size: 44, weight: .bold))
+                .foregroundColor(.white)
+            Text(L10n.format("live_events_count", fallback: "%d events", store.events.count))
+                .font(.system(size: 22, weight: .medium))
+                .foregroundColor(.white.opacity(0.5))
+            Spacer()
+            Text(ChannelsView.clockFormatter.string(from: now))
+                .font(.system(size: 26, weight: .semibold).monospacedDigit())
+                .foregroundColor(.white.opacity(0.7))
         }
-        .frame(width: LiveGuideMetrics.artWidth, height: height)
-        .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).strokeBorder(Color.white.opacity(0.15), lineWidth: 1))
-        .shadow(color: .black.opacity(0.5), radius: 24, y: 10)
+        .padding(.top, 30)
+        .padding(.bottom, 20)
     }
 
     @ViewBuilder
@@ -375,12 +485,13 @@ struct LiveTVGuideView: View {
                 if let image = phase.image {
                     image.resizable().scaledToFit()
                 } else {
-                    Image(systemName: "tv").font(.system(size: size * 0.4)).foregroundColor(.white.opacity(0.4))
+                    Image(systemName: "tv").font(.system(size: size * 0.5)).foregroundColor(.white.opacity(0.4))
                 }
             }
             .frame(width: size * 1.6, height: size)
         } else {
-            Image(systemName: "tv").font(.system(size: size * 0.4)).foregroundColor(.white.opacity(0.4))
+            Image(systemName: "tv").font(.system(size: size * 0.5)).foregroundColor(.white.opacity(0.4))
+                .frame(width: size * 1.6, height: size)
         }
     }
 
@@ -417,25 +528,19 @@ struct LiveTVGuideView: View {
             SourceModeChip(title: L10n.string("live_search", fallback: "Search"), isSelected: false) {
                 showSearch = true
             }
-            SourceModeChip(title: L10n.string("live_filter_all", fallback: "All"), isSelected: scope == .all) {
-                scope = .all
+            SourceModeChip(title: currentView.title + " ▾", isSelected: !showingEvents) {
+                if showingEvents { showingEvents = false } else { showViewPicker = true }
             }
-            SourceModeChip(title: L10n.string("live_filter_favorites", fallback: "Favorites"), isSelected: scope == .favorites) {
-                scope = .favorites
+            SourceModeChip(title: L10n.string("live_events_chip", fallback: "Live Events"), isSelected: showingEvents) {
+                showingEvents.toggle()
             }
-            SourceModeChip(title: L10n.string("live_filter_recent", fallback: "Recent"), isSelected: scope == .recent) {
-                scope = .recent
-            }
-            if store.groups.count > 1 {
-                SourceModeChip(title: (scopeGroup ?? L10n.string("live_groups", fallback: "Groups")) + " ▾", isSelected: scopeGroup != nil) {
-                    showGroups = true
+            if !showingEvents {
+                SourceModeChip(title: (genre?.title ?? L10n.string("live_genre", fallback: "Genre")) + " ▾", isSelected: genre != nil) {
+                    showGenres = true
                 }
             }
-            SourceModeChip(title: (genre?.title ?? L10n.string("live_genre", fallback: "Genre")) + " ▾", isSelected: genre != nil) {
-                showGenres = true
-            }
-            SourceModeChip(title: L10n.string("live_listings", fallback: "Listings"), isSelected: false) {
-                showSources = true
+            SourceModeChip(title: L10n.string("live_options", fallback: "Options"), isSelected: false) {
+                showOptions = true
             }
             Spacer(minLength: 0)
             if !multiview.channels.isEmpty {
@@ -479,7 +584,7 @@ struct LiveTVGuideView: View {
     private func nowLine(gridWidth: CGFloat, ppm: CGFloat, height: CGFloat) -> some View {
         let minutes = now.timeIntervalSince(windowStart) / 60
         let x = LiveGuideMetrics.sideInset + LiveGuideMetrics.channelColumn + CGFloat(minutes) * ppm
-        let top = LiveGuideMetrics.heroHeight + 74 + 20
+        let top = LiveGuideMetrics.heroHeight + 74 + 20 + (store.prefs.configured ? 0 : 98)
         return Rectangle()
             .fill(Color(red: 1, green: 0.32, blue: 0.32))
             .frame(width: 3, height: max(0, height - top))
@@ -487,14 +592,14 @@ struct LiveTVGuideView: View {
             .allowsHitTesting(false)
     }
 
-    // MARK: Rows
+    // MARK: Guide rows
 
     private enum Segment {
         case program(LiveTVProgram, width: CGFloat, startsEarlier: Bool)
         case gap(width: CGFloat)
     }
 
-    private func segments(for channel: LiveTVChannel, gridWidth: CGFloat, ppm: CGFloat) -> [Segment] {
+    private func segments(for channel: LiveTVChannel, ppm: CGFloat) -> [Segment] {
         let start = windowStart
         let end = start.addingTimeInterval(TimeInterval(LiveGuideMetrics.windowMinutes * 60))
         var cursor = start
@@ -519,11 +624,13 @@ struct LiveTVGuideView: View {
         return result
     }
 
-    private func row(_ channel: LiveTVChannel, gridWidth: CGFloat, ppm: CGFloat) -> some View {
-        let parts = segments(for: channel, gridWidth: gridWidth, ppm: ppm)
+    private func guideRow(_ row: LiveGuideRow, list: [LiveGuideRow], gridWidth: CGFloat, ppm: CGFloat) -> some View {
+        let channel = row.channel
+        let parts = segments(for: channel, ppm: ppm)
         let isRowFocused = focusedChannel?.id == channel.id && focusedCell != nil
+        let lineup = list.map(\.channel)
         return HStack(spacing: 0) {
-            channelCell(channel, isRowFocused: isRowFocused)
+            channelCell(channel, dimmed: row.dimmed, isRowFocused: isRowFocused)
                 .frame(width: LiveGuideMetrics.channelColumn, height: LiveGuideMetrics.rowHeight)
             HStack(spacing: 0) {
                 if parts.contains(where: { if case .program = $0 { return true }; return false }) {
@@ -532,35 +639,40 @@ struct LiveTVGuideView: View {
                         case .gap(let width):
                             Color.clear.frame(width: width)
                         case .program(let program, let width, let earlier):
-                            programCell(program, channel: channel, width: width, startsEarlier: earlier)
+                            programCell(program, channel: channel, lineup: lineup, width: width, startsEarlier: earlier)
                         }
                     }
                 } else {
-                    noGuideCell(channel, width: gridWidth)
+                    noGuideCell(channel, lineup: lineup, width: gridWidth)
                 }
             }
             .frame(width: gridWidth, height: LiveGuideMetrics.rowHeight, alignment: .leading)
             .clipped()
         }
+        .opacity(row.dimmed && !isRowFocused ? 0.45 : 1)
         .onAppear { store.requestGuide([channel.id]) }
     }
 
-    private func channelCell(_ channel: LiveTVChannel, isRowFocused: Bool) -> some View {
+    private func channelCell(_ channel: LiveTVChannel, dimmed: Bool, isRowFocused: Bool) -> some View {
         HStack(spacing: 12) {
             Text(store.number(of: channel))
                 .font(.system(size: 20, weight: .heavy).monospacedDigit())
                 .foregroundColor(isRowFocused ? .black : .white.opacity(0.7))
-                .frame(width: 58)
+                .frame(width: 62)
                 .lineLimit(1)
                 .minimumScaleFactor(0.6)
-            logo(channel, size: 44)
-                .frame(width: 72)
-            Text(channel.displayName)
+            logo(channel, size: 40)
+                .frame(width: 66)
+            Text(channel.name)
                 .font(.system(size: 20, weight: .bold))
                 .foregroundColor(isRowFocused ? .black : .white)
                 .lineLimit(2)
             Spacer(minLength: 0)
-            if channel.isFavorite {
+            if dimmed {
+                Image(systemName: "eye.slash")
+                    .font(.system(size: 15))
+                    .foregroundColor(isRowFocused ? .black.opacity(0.6) : .white.opacity(0.5))
+            } else if channel.isFavorite {
                 Image(systemName: "star.fill")
                     .font(.system(size: 16))
                     .foregroundColor(isRowFocused ? .orange : .yellow)
@@ -576,28 +688,28 @@ struct LiveTVGuideView: View {
         .animation(.easeOut(duration: 0.12), value: isRowFocused)
     }
 
-    private func programCell(_ program: LiveTVProgram, channel: LiveTVChannel, width: CGFloat, startsEarlier: Bool) -> some View {
+    private func programCell(_ program: LiveTVProgram, channel: LiveTVChannel, lineup: [LiveTVChannel], width: CGFloat, startsEarlier: Bool) -> some View {
         let key = "\(channel.id)#\(program.id)"
         let isFocused = focusedCell == key
         let isNow = program.isOn(at: now)
         let cellWidth = max(4, width - LiveGuideMetrics.cellGap)
         return Button {
-            store.watch(channel, lineup: visibleChannels)
+            store.watch(channel, lineup: lineup)
         } label: {
             VStack(alignment: .leading, spacing: 4) {
                 if cellWidth >= 110 {
-                HStack(spacing: 6) {
-                    if startsEarlier {
-                        Image(systemName: "chevron.left").font(.system(size: 14, weight: .bold)).opacity(0.6)
+                    HStack(spacing: 6) {
+                        if startsEarlier {
+                            Image(systemName: "chevron.left").font(.system(size: 14, weight: .bold)).opacity(0.6)
+                        }
+                        Text(program.title)
+                            .font(.system(size: 21, weight: .bold))
+                            .lineLimit(1)
                     }
-                    Text(program.title)
-                        .font(.system(size: 21, weight: .bold))
+                    Text(program.episodeTitle ?? timeRange(program))
+                        .font(.system(size: 17, weight: .medium))
+                        .opacity(0.7)
                         .lineLimit(1)
-                }
-                Text(program.episodeTitle ?? timeRange(program))
-                    .font(.system(size: 17, weight: .medium))
-                    .opacity(0.7)
-                    .lineLimit(1)
                 }
             }
             .foregroundColor(isFocused ? .black : .white)
@@ -617,7 +729,7 @@ struct LiveTVGuideView: View {
         .buttonStyle(PosterCardButtonStyle())
         .focused($focusedCell, equals: key)
         .focusEffectDisabledIfAvailable()
-        .contextMenu { menu(for: channel) }
+        .contextMenu { menu(for: channel, lineup: lineup) }
         .onChange(of: focusedCell == key) { _, focused in
             guard focused else { return }
             focusedChannel = channel
@@ -630,15 +742,15 @@ struct LiveTVGuideView: View {
         switch store.guideState[channel.id] {
         case .loading, nil: return L10n.string("live_guide_loading", fallback: "Live · Loading guide…")
         case .failed: return L10n.string("live_guide_failed", fallback: "Live · Guide didn't load")
-        case .loaded: return L10n.string("live_guide_none", fallback: "Live · No guide info from your server")
+        case .loaded: return L10n.string("live_guide_none", fallback: "Live · No guide info")
         }
     }
 
-    private func noGuideCell(_ channel: LiveTVChannel, width: CGFloat) -> some View {
+    private func noGuideCell(_ channel: LiveTVChannel, lineup: [LiveTVChannel], width: CGFloat) -> some View {
         let key = "\(channel.id)#none"
         let isFocused = focusedCell == key
         return Button {
-            store.watch(channel, lineup: visibleChannels)
+            store.watch(channel, lineup: lineup)
         } label: {
             HStack(spacing: 10) {
                 Circle().fill(Color(red: 1, green: 0.32, blue: 0.32)).frame(width: 9, height: 9)
@@ -660,7 +772,7 @@ struct LiveTVGuideView: View {
         .buttonStyle(PosterCardButtonStyle())
         .focused($focusedCell, equals: key)
         .focusEffectDisabledIfAvailable()
-        .contextMenu { menu(for: channel) }
+        .contextMenu { menu(for: channel, lineup: lineup) }
         .onChange(of: focusedCell == key) { _, focused in
             guard focused else { return }
             focusedChannel = channel
@@ -669,23 +781,31 @@ struct LiveTVGuideView: View {
     }
 
     @ViewBuilder
-    private func menu(for channel: LiveTVChannel) -> some View {
+    private func menu(for channel: LiveTVChannel, lineup: [LiveTVChannel]) -> some View {
         Button {
-            store.watch(channel)
+            store.watch(channel, lineup: lineup)
         } label: {
             Label(L10n.string("live_watch", fallback: "Watch"), systemImage: "play.fill")
         }
-        Button {
-            let group = store.groupName(of: channel)
-            store.setGroup(group, hidden: !store.hiddenGroups.contains(group))
-        } label: {
-            let group = store.groupName(of: channel)
-            Label(
-                store.hiddenGroups.contains(group)
-                    ? L10n.format("live_show_group", fallback: "Show “%@” in All", group)
-                    : L10n.format("live_hide_group", fallback: "Hide “%@” from All", group),
-                systemImage: store.hiddenGroups.contains(group) ? "eye" : "eye.slash"
-            )
+        if store.isInLineup(channel) {
+            Button {
+                store.setInLineup(channel, false)
+            } label: {
+                Label(L10n.string("live_lineup_remove", fallback: "Remove from My Lineup"), systemImage: "minus.circle")
+            }
+        } else {
+            Button {
+                store.setInLineup(channel, true)
+            } label: {
+                Label(L10n.string("live_lineup_add", fallback: "Add to My Lineup"), systemImage: "plus.circle")
+            }
+        }
+        if store.versions(of: channel).count > 1 {
+            Button {
+                feedPicker = LiveFeedPicker(title: channel.name, channel: channel, family: nil)
+            } label: {
+                Label(L10n.format("live_choose_feed", fallback: "Choose Feed (%d)", store.versions(of: channel).count), systemImage: "list.bullet")
+            }
         }
         Button {
             store.toggleFavorite(channel)
@@ -706,10 +826,11 @@ struct LiveTVGuideView: View {
     }()
 }
 
-// MARK: - Tuning card and info banner
+// MARK: - Tuning card, info banner and notices
 
 /// Mounted at the app root next to the Channels overlay: the card shown while
-/// a live channel opens (or fails), and the info bar after it starts.
+/// a live channel opens (or fails), the info bar after it starts, and short
+/// notices ("Switched to a backup feed") over the player.
 struct LiveTVOverlay: View {
     @ObservedObject private var store = LiveTVStore.shared
     @FocusState private var buttonFocused: Bool
@@ -725,9 +846,24 @@ struct LiveTVOverlay: View {
                     .transition(.move(edge: .bottom).combined(with: .opacity))
                     .allowsHitTesting(false)
             }
+            if store.isWatching, store.overlay == nil, let toast = store.toast {
+                VStack {
+                    Text(toast)
+                        .font(.system(size: 22, weight: .semibold))
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 26)
+                        .padding(.vertical, 12)
+                        .background(Capsule().fill(Color.black.opacity(0.75)))
+                        .padding(.top, 50)
+                    Spacer()
+                }
+                .transition(.move(edge: .top).combined(with: .opacity))
+                .allowsHitTesting(false)
+            }
         }
         .animation(.easeInOut(duration: 0.3), value: store.overlay)
         .animation(.easeInOut(duration: 0.35), value: store.banner)
+        .animation(.easeInOut(duration: 0.25), value: store.toast)
     }
 
     private func card(_ overlay: LiveTVStore.Overlay) -> some View {
@@ -743,15 +879,18 @@ struct LiveTVOverlay: View {
             VStack(alignment: .leading, spacing: 18) {
                 Spacer()
                 HStack(spacing: 14) {
-                    Text(store.number(of: channel))
-                        .font(.system(size: 28, weight: .heavy).monospacedDigit())
-                        .foregroundColor(.black)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 4)
-                        .background(RoundedRectangle(cornerRadius: 8).fill(Color.white))
+                    if channel.number != nil {
+                        Text(store.number(of: channel))
+                            .font(.system(size: 28, weight: .heavy).monospacedDigit())
+                            .foregroundColor(.black)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 4)
+                            .background(RoundedRectangle(cornerRadius: 8).fill(Color.white))
+                    }
                     Text(channel.name)
                         .font(.system(size: 34, weight: .bold))
                         .foregroundColor(.white)
+                        .lineLimit(2)
                 }
                 Text(message == nil
                      ? L10n.string("channels_tuning", fallback: "TUNING IN")
@@ -806,7 +945,7 @@ struct LiveTVOverlay: View {
         VStack {
             Spacer()
             HStack(alignment: .center, spacing: 28) {
-                Text(store.number(of: banner.channel))
+                Text(banner.channel.number.map { _ in store.number(of: banner.channel) } ?? "LIVE")
                     .font(.system(size: 34, weight: .heavy).monospacedDigit())
                     .foregroundColor(.white)
                     .frame(minWidth: 110)
@@ -816,7 +955,8 @@ struct LiveTVOverlay: View {
                         .font(.system(size: 17, weight: .heavy))
                         .tracking(1)
                         .foregroundColor(.white.opacity(0.55))
-                    Text(banner.now?.title ?? L10n.string("live_no_guide", fallback: "No guide information"))
+                        .lineLimit(1)
+                    Text(banner.now?.title ?? banner.channel.name)
                         .font(.system(size: 36, weight: .bold))
                         .foregroundColor(.white)
                         .lineLimit(1)

@@ -129,6 +129,10 @@ class PlayerViewModel: ObservableObject {
         didSet {
             if case .error = status, oldValue != status {
                 PlaybackTimelineRecorder.record(.playbackError, engine: activeEngineKind)
+                // Live TV switches to a backup feed when one fails to start.
+                if let id = activeMeta?.id, id.hasPrefix("live:"), !hasRenderedFirstFrame {
+                    NotificationCenter.default.post(name: LiveTVStore.playbackFailedNotification, object: id)
+                }
             }
             guard case .error(let message) = status,
                   ProfileSettings.current.bool(forKey: SettingsKey.playbackDiagnostics) else { return }
@@ -3020,6 +3024,9 @@ class PlayerViewModel: ObservableObject {
         if isPresentingFrames {
             if !hasRenderedFirstFrame {
                 hasRenderedFirstFrame = true
+                if let id = activeMeta?.id, id.hasPrefix("live:") {
+                    NotificationCenter.default.post(name: LiveTVStore.firstFrameNotification, object: id)
+                }
                 if let meta = activeMeta {
                     prewarmSceneIfNeeded(meta: meta, isTrailerPlayback: subtitle == PlaybackMarkers.trailerSubtitle)
                 }

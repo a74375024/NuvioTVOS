@@ -17,6 +17,8 @@ struct LiveTVChannel: Identifiable, Hashable {
     var group: String?
     /// Name without the group prefix ("US: NBC 4" → "NBC 4").
     var shortName: String = ""
+    /// XMLTV id the provider gives the channel (Xtream "epg_channel_id").
+    var epgID: String?
 
     var displayName: String { shortName.isEmpty ? name : shortName }
 

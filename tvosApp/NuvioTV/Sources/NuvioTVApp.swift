@@ -707,6 +707,7 @@ struct ContentView: View {
             guard profile != nil else { return }
             SMBServerStore.shared.reload()
             JellyfinServerStore.shared.reload()
+            XtreamStore.shared.reload()
             Task(priority: .utility) {
                 await SMBSessionManager.shared.connectAll()
                 await JellyfinSessionManager.shared.connectAll()
@@ -1204,7 +1205,7 @@ struct ContentView: View {
                 if ScreenTour.requested == "live-demo-outside" {
                     LiveTVStore.shared.loadOutsideDemo()
                 } else if ScreenTour.requested?.hasPrefix("live-demo") == true {
-                    LiveTVStore.shared.loadDemo()
+                    LiveTVStore.shared.loadDemo(configureLineup: ScreenTour.requested != "live-demo-setup")
                 }
                 selectedTab = tab
             case .details(let id, let type):
@@ -3659,6 +3660,7 @@ final class ProfileTabAvatarRenderer: ObservableObject {
 private struct TVMainTabView: View {
     @Binding var selectedTab: TVTab
     @ObservedObject private var jellyfinServers = JellyfinServerStore.shared
+    @ObservedObject private var xtreamAccounts = XtreamStore.shared
     let activeProfile: Profile?
     @ObservedObject var searchViewModel: SearchViewModel
     @ObservedObject var netflixSearchViewModel: NetflixSearchViewModel
@@ -3865,7 +3867,7 @@ private struct TVMainTabView: View {
 
     /// Live TV appears once an Emby / Jellyfin server is added in Settings.
     private var showsLiveTab: Bool {
-        !jellyfinServers.servers.isEmpty || ScreenTour.isActive
+        !jellyfinServers.servers.isEmpty || !xtreamAccounts.accounts.isEmpty || ScreenTour.isActive
     }
 
     private var liveTabContent: some View {

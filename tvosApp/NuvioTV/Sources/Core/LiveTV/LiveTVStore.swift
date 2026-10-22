@@ -3,21 +3,33 @@ import Combine
 import UIKit
 
 /// Live TV from the Emby / Jellyfin servers signed in under Settings →
-/// Jellyfin: channel list, a few hours of real guide data, and tuning (with
-/// cable-style channel up / down from the player).
+/// Jellyfin. Raw server channels are turned into one guide entry per real
+/// channel (other versions become automatic backup feeds), numbered event
+/// feeds into Live Events, and a suggested, editable My Lineup.
 @MainActor
 final class LiveTVStore: ObservableObject {
     static let shared = LiveTVStore()
 
-    private var backgroundObserver: NSObjectProtocol?
+    private var observers: [NSObjectProtocol] = []
 
     private init() {
-        backgroundObserver = NotificationCenter.default.addObserver(
-            forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main
-        ) { [weak self] _ in
+        let center = NotificationCenter.default
+        observers.append(center.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor in self?.appDidEnterBackground() }
-        }
+        })
+        observers.append(center.addObserver(forName: Self.playbackFailedNotification, object: nil, queue: .main) { [weak self] note in
+            let metaID = note.object as? String
+            Task { @MainActor in self?.playerFailed(metaID: metaID) }
+        })
+        observers.append(center.addObserver(forName: Self.firstFrameNotification, object: nil, queue: .main) { [weak self] note in
+            let metaID = note.object as? String
+            Task { @MainActor in self?.playerStarted(metaID: metaID) }
+        })
     }
+
+    /// Posted by the player (object: meta id) for Emby / Jellyfin live streams.
+    nonisolated static let playbackFailedNotification = Notification.Name("nuvio.livetv.playbackFailed")
+    nonisolated static let firstFrameNotification = Notification.Name("nuvio.livetv.firstFrame")
 
     enum LoadState: Equatable {
         case idle
@@ -61,13 +73,21 @@ final class LiveTVStore: ObservableObject {
         let token = UUID()
     }
 
+    /// Raw server channels (every variant and event feed).
     @Published private(set) var channels: [LiveTVChannel] = []
+    /// One per real channel, in guide order (lineup numbers first).
+    @Published private(set) var entries: [LiveTVChannel] = []
+    /// My Lineup, in lineup-number order.
+    @Published private(set) var lineupEntries: [LiveTVChannel] = []
+    @Published private(set) var events: [LiveEvent] = []
+    @Published private(set) var families: [EventFamily] = []
+    @Published private(set) var prefs = LineupPrefs()
     @Published private(set) var programs: [String: [LiveTVProgram]] = [:]
     @Published private(set) var state: LoadState = .idle
     @Published private(set) var isLoadingGuide = false
     /// Where each channel's guide stands, so a row can say "loading" vs "none".
     @Published private(set) var guideState: [String: GuideState] = [:]
-    /// Provider groups with channel counts, largest first.
+    /// Provider groups with entry counts, largest first.
     @Published private(set) var groups: [ChannelGroup] = []
     @Published private(set) var hiddenGroups: Set<String> = []
     @Published private(set) var recentIDs: [String] = []
@@ -75,7 +95,8 @@ final class LiveTVStore: ObservableObject {
     @Published private(set) var watching: LiveTVChannel?
     @Published private(set) var overlay: Overlay?
     @Published private(set) var banner: Banner?
-    /// Short confirmation shown in the guide ("Added to Multiview").
+    @Published private(set) var lineupBuild: String?
+    /// Short confirmation shown over the guide or player.
     @Published var toast: String?
 
     var isWatching: Bool { watching != nil }
@@ -85,22 +106,30 @@ final class LiveTVStore: ObservableObject {
     var leavePlayer: (() -> Void)?
 
     static let guideHours = 3.0
-    private static let guideLifetime: TimeInterval = 20 * 60
-    private static let channelLifetime: TimeInterval = 6 * 60 * 60
+    /// Event feeds rename themselves through the day, so the channel list is
+    /// re-read this often while Live TV is open.
+    private static let channelLifetime: TimeInterval = 30 * 60
     private static let programBatch = 25
     private static let guideConcurrency = 4
     private static let otherGroup = "Other"
+    private static let firstFrameTimeout: UInt64 = 25
 
+    private(set) var entryInfo: [String: LiveTVEntryInfo] = [:]
+    private(set) var traits: [String: ChannelTraits] = [:]
+    private var entryOf: [String: String] = [:]
+    private var entryIndex: [String: Int] = [:]
+    private var lineupNumbers: [String: Int] = [:]
+    private(set) var lineupIDs: Set<String> = []
     private var loadedSignature: String?
     private var channelsLoadedAt: Date?
     private var guideLoadedAt: Date?
     private var guideWindowStart: Date?
     private var loadTask: Task<Void, Never>?
-    private var guideTask: Task<Void, Never>?
     private var tuneGeneration = 0
     private var streamWork: Task<Void, Never>?
     private var bannerTask: Task<Void, Never>?
     private var toastTask: Task<Void, Never>?
+    private var watchdogTask: Task<Void, Never>?
     /// Streams currently open on the server (at most one in practice).
     private var openStreams: [(stream: LiveTVStream, serverID: String)] = []
     private var indexByID: [String: Int] = [:]
@@ -120,6 +149,12 @@ final class LiveTVStore: ObservableObject {
     private var activeGuideFetches = 0
     /// What Up / Down flips through: the list the channel was picked from.
     private var flipList: [LiveTVChannel] = []
+    // Failover state for what's playing.
+    private var candidates: [LiveTVChannel] = []
+    private var candidateIndex = 0
+    private var playingMetaID: String?
+    private var sawFirstFrame = false
+    private var surfStep = 0
 
     // MARK: Servers
 
@@ -141,15 +176,42 @@ final class LiveTVStore: ObservableObject {
         servers().first { $0.config.id == serverID }?.client
     }
 
-    var hasServers: Bool { !JellyfinServerStore.shared.servers.isEmpty }
+    private func xtreamClients() -> [XtreamClient] {
+        XtreamStore.shared.accounts.compactMap { account in
+            let password = XtreamCredentialStore.password(forAccountID: account.id)
+            guard account.serverURL != nil, !password.isEmpty else { return nil }
+            return XtreamClient(account: account, password: password)
+        }
+    }
+
+    private func xtreamClient(for serverID: String) -> XtreamClient? {
+        xtreamClients().first { $0.account.sourceID == serverID }
+    }
+
+    /// Output formats each Xtream account allows (learned when channels load).
+    private var xtreamFormats: [String: [String]] = [:]
+
+    var hasServers: Bool { !JellyfinServerStore.shared.servers.isEmpty || !XtreamStore.shared.accounts.isEmpty }
+
+    private var currentSignature: String {
+        ProfileSettings.activeProfileScope + "|" + JellyfinServerStore.shared.servers.map(\.id).joined(separator: ",")
+            + "|" + XtreamStore.shared.accounts.map(\.id).joined(separator: ",")
+    }
 
     // MARK: Loading
 
     func loadIfNeeded(force: Bool = false) {
-        let signature = ProfileSettings.activeProfileScope + "|" + JellyfinServerStore.shared.servers.map(\.id).joined(separator: ",")
+        let signature = currentSignature
         if signature != loadedSignature {
             channels = []
+            entries = []
+            lineupEntries = []
+            events = []
+            families = []
             indexByID = [:]
+            entryInfo = [:]
+            entryOf = [:]
+            traits = [:]
             pendingGuide = []
             pendingGuideSet = []
             programs = [:]
@@ -163,6 +225,7 @@ final class LiveTVStore: ObservableObject {
             state = .idle
             hiddenGroups = Self.loadSet(Self.hiddenGroupsKey)
             recentIDs = Self.loadList(Self.recentKey)
+            prefs = LineupPrefs.load()
         }
         let channelsFresh = channelsLoadedAt.map { Date().timeIntervalSince($0) < Self.channelLifetime } ?? false
         if !force, channelsFresh, signature == loadedSignature, !channels.isEmpty {
@@ -172,10 +235,11 @@ final class LiveTVStore: ObservableObject {
         guard loadTask == nil else { return }
         loadedSignature = signature
         let configured = servers()
-        guard !configured.isEmpty else {
+        let xtream = xtreamClients()
+        guard !configured.isEmpty || !xtream.isEmpty else {
             state = .empty(hasServers
-                ? "Sign in to your server again in Settings → Jellyfin."
-                : "Add your Emby or Jellyfin server in Settings → Jellyfin (server address, username and password) to see its live channels here.")
+                ? "Sign in again in Settings → Integrations (Jellyfin or Xtream)."
+                : "Add an Xtream account or your Emby / Jellyfin server in Settings → Integrations to see live channels here.")
             return
         }
         if channels.isEmpty { state = .loading }
@@ -201,22 +265,121 @@ final class LiveTVStore: ObservableObject {
                     problems.append("\(server.config.displayName): \(error.localizedDescription)")
                 }
             }
+            for client in xtream {
+                do {
+                    if let info = try? await client.accountInfo() {
+                        self.xtreamFormats[client.account.sourceID] = info.formats
+                    }
+                    let list = try await client.channels()
+                    all += list
+                    var updated = client.account
+                    updated.lastChannelCount = list.count
+                    XtreamStore.shared.upsert(updated)
+                } catch {
+                    problems.append("\(client.account.displayName): \(error.localizedDescription)")
+                }
+            }
+            // Favorites kept on this Apple TV (Xtream has no favorites API).
+            let localFavorites = Set(Self.loadList(Self.localFavoritesKey))
+            for index in all.indices where localFavorites.contains(all[index].id) { all[index].isFavorite = true }
             guard !Task.isCancelled else { return }
-            self.setChannels(Self.annotated(all))
-            self.channelsLoadedAt = Date()
             if all.isEmpty {
-                self.state = problems.isEmpty
-                    ? .empty("Your server didn't list any live channels for this account.")
-                    : .failed(problems.joined(separator: "\n"))
-            } else {
-                self.state = .loaded
-                self.guideLoadedAt = nil
-                // Favorites, recents and the top of the list first.
+                self.channelsLoadedAt = Date()
+                if self.channels.isEmpty {
+                    self.state = problems.isEmpty
+                        ? .empty("Your server didn't list any live channels for this account.")
+                        : .failed(problems.joined(separator: "\n"))
+                }
+                return
+            }
+            let isFirstLoad = self.channels.isEmpty
+            let annotated = Self.annotated(all)
+            let catalog = await Task.detached(priority: .userInitiated) {
+                ChannelCatalog.build(annotated)
+            }.value
+            guard !Task.isCancelled else { return }
+            self.channelsLoadedAt = Date()
+            self.apply(channels: annotated, catalog: catalog)
+            self.state = .loaded
+            if isFirstLoad {
                 self.loadOutsideGuide()
-                let favorites = self.channels.filter(\.isFavorite).prefix(60).map(\.id)
-                self.requestGuide(Array(favorites) + self.recentIDs.prefix(20) + self.channels.prefix(80).map(\.id))
+                let first = self.visibleEntries().prefix(60).map(\.id)
+                let favorites = self.entries.filter(\.isFavorite).prefix(40).map(\.id)
+                self.requestGuide(Array(favorites) + self.recentIDs.prefix(20) + first)
+            } else {
+                self.rebuildOutsidePrograms()
             }
         }
+    }
+
+    /// Installs a freshly built catalog: raw channels, entries, events.
+    private func apply(channels list: [LiveTVChannel], catalog: ChannelCatalog.Result) {
+        channels = list
+        indexByID = Dictionary(list.enumerated().map { ($1.id, $0) }, uniquingKeysWith: { first, _ in first })
+        traits = catalog.traits
+        entryOf = catalog.entryOf
+        entryInfo = Dictionary(uniqueKeysWithValues: catalog.entries.map { ($0.id, $0) })
+        events = catalog.events
+        families = catalog.families
+        rebuildEntries()
+    }
+
+    /// Recomputes lineup membership, numbering and the entry list.
+    private func rebuildEntries() {
+        let infos = Array(entryInfo.values)
+        var lineup = Set<String>()
+        for info in infos {
+            let favorite = info.members.contains { indexByID[$0].map { channels[$0].isFavorite } ?? false }
+            if prefs.removed.contains(info.id) { continue }
+            if favorite || prefs.added.contains(info.id) || prefs.suggested.contains(info.id) {
+                lineup.insert(info.id)
+            } else if prefs.configured, info.category == .local,
+                      LineupEngine.suggests(info, prefs: prefs, hasGuide: true, name: info.name) {
+                // Locals for the user's market always join.
+                lineup.insert(info.id)
+            }
+        }
+        lineupIDs = lineup
+        lineupNumbers = LineupEngine.numbers(for: infos.filter { lineup.contains($0.id) })
+        // Everything else gets numbers after the lineup, by category.
+        var allNumbers = lineupNumbers
+        let rest = infos.filter { !lineup.contains($0.id) }
+        var next = (lineupNumbers.values.max() ?? 0) / 1000 * 1000 + 5000
+        for category in LineupCategory.allCases {
+            for info in rest.filter({ $0.category == category }).sorted(by: { $0.name.localizedStandardCompare($1.name) == .orderedAscending }) {
+                allNumbers[info.id] = next
+                next += 1
+            }
+        }
+        let built: [LiveTVChannel] = infos.compactMap { info in
+            let members = info.members.compactMap { indexByID[$0].map { channels[$0] } }
+            guard let primary = members.first else { return nil }
+            return LiveTVChannel(
+                id: info.id, serverID: primary.serverID, itemID: primary.itemID, name: info.name,
+                number: allNumbers[info.id].map(String.init),
+                imageURL: members.lazy.compactMap(\.imageURL).first,
+                isFavorite: members.contains(where: \.isFavorite),
+                tags: primary.tags, isRadio: primary.isRadio, group: primary.group, shortName: info.name
+            )
+        }.sorted { (Int($0.number ?? "") ?? Int.max) < (Int($1.number ?? "") ?? Int.max) }
+        entries = built
+        entryIndex = Dictionary(built.enumerated().map { ($1.id, $0) }, uniquingKeysWith: { first, _ in first })
+        lineupEntries = built.filter { lineup.contains($0.id) }
+        var counts: [String: Int] = [:]
+        for entry in built { counts[entry.group ?? Self.otherGroup, default: 0] += 1 }
+        groups = counts.map { ChannelGroup(name: $0.key, count: $0.value) }
+            .sorted { $0.count != $1.count ? $0.count > $1.count : $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+        // Entry guides from whatever member data is already here.
+        var merged = programs
+        var states = guideState
+        applyEntryGuides(&merged, &states, entryIDs: Array(entryInfo.keys))
+        programs = merged
+        guideState = states
+    }
+
+    /// The entries the guide starts with: My Lineup once set up, else all.
+    func visibleEntries() -> [LiveTVChannel] {
+        prefs.configured ? lineupEntries : entries.filter { !isHidden($0) }
     }
 
     /// Favorites first, then by channel number (numeric where possible), then name.
@@ -241,8 +404,12 @@ final class LiveTVStore: ObservableObject {
     }
 
     /// Called on a timer by the guide: when the half-hour window moves on,
-    /// the rows looked at recently are fetched again for the new window.
+    /// the rows looked at recently are fetched again for the new window; the
+    /// channel list (event names) is re-read every half hour.
     func refreshGuideIfNeeded() {
+        if let loaded = channelsLoadedAt, Date().timeIntervalSince(loaded) > Self.channelLifetime, loadTask == nil, !isWatching {
+            loadIfNeeded()
+        }
         let start = Self.windowStart()
         guard guideWindowStart != start else { return }
         guideWindowStart = start
@@ -250,12 +417,20 @@ final class LiveTVStore: ObservableObject {
         requestGuide(recentlyRequested)
     }
 
-    /// Queues guide fetches for channels (by id). Rows call this as they come
-    /// on screen, so the part of the guide being looked at fills in first.
+    // MARK: Server guide
+
+    /// Queues guide fetches for entries or channels (by id). Rows call this as
+    /// they come on screen, so the part of the guide being looked at fills in
+    /// first. An entry asks for its first two versions.
     func requestGuide(_ ids: [String]) {
         let start = Self.windowStart()
         if guideWindowStart == nil { guideWindowStart = start }
-        for id in ids where indexByID[id] != nil {
+        var raw: [String] = []
+        for id in ids {
+            if let info = entryInfo[id] { raw += info.members.prefix(2) } else { raw.append(id) }
+        }
+        for id in raw where indexByID[id] != nil {
+            if traits[id]?.familyKey != nil { continue }     // event feeds: names, not guides
             if guideState[id] == .loading || pendingGuideSet.contains(id) { continue }
             if guideState[id] == .loaded, guideWindowByChannel[id] == start { continue }
             pendingGuide.append(id)
@@ -299,6 +474,14 @@ final class LiveTVStore: ObservableObject {
                 index -= 1
             }
             guard !batch.isEmpty else { break }
+            if serverID.hasPrefix("xt:") {
+                if let client = xtreamClient(for: serverID) {
+                    fetchXtreamGuide(batch, client: client)
+                } else {
+                    batch.forEach { guideState[$0] = .failed }
+                }
+                continue
+            }
             guard let client = clients[serverID] else {
                 batch.forEach { guideState[$0] = .failed }
                 continue
@@ -340,10 +523,96 @@ final class LiveTVStore: ObservableObject {
             } else {
                 ids.forEach { states[$0] = .failed }
             }
+            self.applyEntryGuides(&merged, &states, entryIDs: Array(Set(ids.compactMap { self.entryOf[$0] })))
             self.programs = merged
             self.guideState = states
             self.guideLoadedAt = Date()
             self.startGuideFetches()
+        }
+    }
+
+    /// Xtream guides come per channel ("short EPG"), a few at a time.
+    private func fetchXtreamGuide(_ ids: [String], client: XtreamClient) {
+        let start = Self.windowStart()
+        let items = ids.compactMap { id in indexByID[id].map { (id, channels[$0].itemID) } }
+        var states = guideState
+        ids.forEach { states[$0] = .loading }
+        guideState = states
+        activeGuideFetches += 1
+        isLoadingGuide = true
+        Task { [weak self] in
+            var results: [String: [LiveTVProgram]] = [:]
+            await withTaskGroup(of: (String, [LiveTVProgram]).self) { group in
+                var iterator = items.makeIterator()
+                for _ in 0..<6 {
+                    guard let (id, stream) = iterator.next() else { break }
+                    group.addTask { (id, await client.shortEPG(streamID: stream, channelID: id)) }
+                }
+                while let (id, list) = await group.next() {
+                    results[id] = list
+                    if let (nextID, stream) = iterator.next() {
+                        group.addTask { (nextID, await client.shortEPG(streamID: stream, channelID: nextID)) }
+                    }
+                }
+            }
+            guard let self else { return }
+            self.activeGuideFetches -= 1
+            var merged = self.programs
+            var states = self.guideState
+            for id in ids {
+                let server = (results[id] ?? []).sorted { $0.start < $1.start }
+                self.serverPrograms[id] = server
+                merged[id] = self.bestListing(server: server, outside: self.outsideListing(for: id))
+                states[id] = .loaded
+                self.guideWindowByChannel[id] = start
+            }
+            self.applyEntryGuides(&merged, &states, entryIDs: Array(Set(ids.compactMap { self.entryOf[$0] })))
+            self.programs = merged
+            self.guideState = states
+            self.guideLoadedAt = Date()
+            self.startGuideFetches()
+        }
+    }
+
+    /// An entry's guide is the best of its versions' guides.
+    private func applyEntryGuides(_ merged: inout [String: [LiveTVProgram]], _ states: inout [String: GuideState], entryIDs: [String]) {
+        let start = Self.windowStart()
+        let end = start.addingTimeInterval(Self.guideHours * 3600)
+        func coverage(_ list: [LiveTVProgram]) -> TimeInterval {
+            list.reduce(0) { total, p in total + max(0, min(p.end, end).timeIntervalSince(max(p.start, start))) }
+        }
+        for id in entryIDs {
+            guard let info = entryInfo[id] else { continue }
+            var best: [LiveTVProgram] = []
+            var bestCoverage: TimeInterval = -1
+            var anyLoading = false, anyLoaded = false, anyFailed = false
+            for member in info.members {
+                if let list = merged[member], !list.isEmpty {
+                    let value = coverage(list)
+                    if value > bestCoverage { best = list; bestCoverage = value }
+                }
+                switch states[member] {
+                case .loading: anyLoading = true
+                case .loaded: anyLoaded = true
+                case .failed: anyFailed = true
+                case nil: break
+                }
+            }
+            merged[id] = best.isEmpty ? nil : best.map { program in
+                LiveTVProgram(
+                    id: "\(id)|\(program.id)", channelID: id, title: program.title, episodeTitle: program.episodeTitle,
+                    overview: program.overview, start: program.start, end: program.end, isMovie: program.isMovie,
+                    isSports: program.isSports, isNews: program.isNews, isKids: program.isKids, isLive: program.isLive,
+                    isPremiere: program.isPremiere, imageURL: program.imageURL, fromOutsideGuide: program.fromOutsideGuide
+                )
+            }
+            if !best.isEmpty || anyLoaded {
+                states[id] = .loaded
+            } else if anyLoading {
+                states[id] = .loading
+            } else if anyFailed {
+                states[id] = .failed
+            }
         }
     }
 
@@ -361,7 +630,8 @@ final class LiveTVStore: ObservableObject {
         }
         let shardIDs = OutsideGuide.enabledShards
         let signature = loadedSignature ?? "default"
-        let snapshot = channels
+        // Event feeds are named per event; listings don't apply to them.
+        let snapshot = channels.filter { traits[$0.id]?.familyKey == nil }
         let saved = OutsideGuide.loadSaved(signature: signature)
         if let saved, Set(saved.shards) == shardIDs {
             outsideMatches = saved.programs
@@ -410,14 +680,18 @@ final class LiveTVStore: ObservableObject {
     }
 
     /// Re-merges every channel's listing (after outside data loads or the
-    /// window moves on).
+    /// window moves on), then the entries built from them.
     private func rebuildOutsidePrograms() {
-        var merged = programs
+        var merged = programs.filter { !$0.key.hasPrefix("e|") }
         let ids = Set(outsideMatches.keys).union(merged.keys)
         for id in ids {
             merged[id] = bestListing(server: serverPrograms[id], outside: outsideListing(for: id))
         }
-        programs = merged.filter { !$0.value.isEmpty }
+        merged = merged.filter { !$0.value.isEmpty }
+        var states = guideState
+        applyEntryGuides(&merged, &states, entryIDs: Array(entryInfo.keys))
+        programs = merged
+        guideState = states
     }
 
     /// Picks whichever listing covers more of the next three hours; the
@@ -444,16 +718,95 @@ final class LiveTVStore: ObservableObject {
         return result.sorted { $0.start < $1.start }
     }
 
+    /// Whether any version of an entry has guide data (server or outside).
+    func entryHasGuide(_ id: String) -> Bool {
+        guard let info = entryInfo[id] else { return !(programs[id] ?? []).isEmpty }
+        return info.members.contains { outsideMatches[$0] != nil || !(serverPrograms[$0] ?? []).isEmpty }
+    }
+
+    // MARK: My Lineup
+
+    func entry(id: String) -> LiveTVChannel? {
+        entryIndex[id].map { entries[$0] }
+    }
+
+    func isInLineup(_ channel: LiveTVChannel) -> Bool {
+        lineupIDs.contains(channel.id)
+    }
+
+    func setInLineup(_ channel: LiveTVChannel, _ included: Bool) {
+        var updated = prefs
+        if included {
+            updated.removed.remove(channel.id)
+            if !updated.suggested.contains(channel.id) { updated.added.insert(channel.id) }
+        } else {
+            updated.added.remove(channel.id)
+            updated.removed.insert(channel.id)
+        }
+        setPrefs(updated)
+        flash(included ? "Added \(channel.name) to My Lineup" : "Removed \(channel.name) from My Lineup")
+    }
+
+    func setShowHidden(_ show: Bool) {
+        var updated = prefs
+        updated.showHidden = show
+        setPrefs(updated)
+    }
+
+    func setPrefs(_ updated: LineupPrefs) {
+        prefs = updated
+        updated.save()
+        rebuildEntries()
+    }
+
+    /// Category counts for the setup screen: (in the suggested lineup, total).
+    func categoryCounts(for draft: LineupPrefs) -> [LineupCategory: (Int, Int)] {
+        var result: [LineupCategory: (Int, Int)] = [:]
+        var everything = draft
+        everything.categories = Set(LineupCategory.allCases)
+        for info in entryInfo.values {
+            var counts = result[info.category] ?? (0, 0)
+            counts.1 += 1
+            if LineupEngine.suggests(info, prefs: everything, hasGuide: entryHasGuide(info.id), name: info.name) {
+                counts.0 += 1
+            }
+            result[info.category] = counts
+        }
+        return result
+    }
+
+    /// Builds the suggested lineup: checks which channels have guide data
+    /// (server and outside), then applies the market and category choices.
+    func buildLineup(_ draft: LineupPrefs) async {
+        lineupBuild = "Checking which channels have listings…"
+        let ids = entries.map(\.id)
+        await checkGuides(ids: ids, timeout: 150) { [weak self] done, total in
+            self?.lineupBuild = "Checking listings: \(done) of \(total) channels…"
+        }
+        var updated = draft
+        updated.suggested = Set(entryInfo.values.filter { info in
+            LineupEngine.suggests(info, prefs: draft, hasGuide: entryHasGuide(info.id), name: info.name)
+        }.map(\.id))
+        updated.configured = true
+        updated.builtAt = Date()
+        setPrefs(updated)
+        lineupBuild = nil
+    }
+
     // MARK: Channel report
 
     /// Fetches the server guide for every channel (for the report), waiting
     /// up to `timeout` for it to finish. `progress` gets "checked / total".
     func checkAllGuides(timeout: TimeInterval = 240, progress: @escaping (Int, Int) -> Void) async {
-        requestGuide(channels.map(\.id))
+        await checkGuides(ids: channels.filter { traits[$0.id]?.familyKey == nil }.map(\.id), timeout: timeout, progress: progress)
+    }
+
+    private func checkGuides(ids: [String], timeout: TimeInterval, progress: @escaping (Int, Int) -> Void) async {
+        requestGuide(ids)
         let started = Date()
         while Date().timeIntervalSince(started) < timeout {
-            let done = channels.reduce(0) { $0 + (guideState[$1.id] == .loaded || guideState[$1.id] == .failed ? 1 : 0) }
-            progress(done, channels.count)
+            let done = ids.reduce(0) { $0 + (guideState[$1] == .loaded || guideState[$1] == .failed ? 1 : 0) }
+            progress(done, ids.count)
             if pendingGuide.isEmpty, activeGuideFetches == 0 { break }
             try? await Task.sleep(nanoseconds: 700_000_000)
         }
@@ -479,7 +832,7 @@ final class LiveTVStore: ObservableObject {
             "number", "name", "group", "tags", "hidden_group", "favorite",
             "callsign_in_name", "station_lookup", "match_key",
             "server_guide", "server_programs_next_3h", "outside_listing", "outside_programs_next_3h",
-            "now_title", "now_source"
+            "now_title", "now_source", "entry", "category", "in_my_lineup", "event_family", "event_text"
         ].joined(separator: ",")]
         for channel in channels {
             let isLocal = (channel.group ?? "").lowercased().contains("local")
@@ -496,14 +849,19 @@ final class LiveTVStore: ObservableObject {
             case nil: serverState = "not checked"
             }
             let current = self.current(on: channel.id, at: now)
+            let trait = traits[channel.id]
+            let entryID = entryOf[channel.id]
             lines.append([
-                cell(number(of: channel)), cell(channel.name), cell(channel.group ?? ""),
+                cell(channel.number ?? ""), cell(channel.name), cell(channel.group ?? ""),
                 cell(channel.tags.joined(separator: " | ")), cell(isHidden(channel) ? "yes" : ""),
                 cell(channel.isFavorite ? "yes" : ""), cell(signs.joined(separator: " ")), cell(station ?? ""),
                 cell(OutsideGuide.normalize(channel.displayName)), cell(serverState), cell(String(serverCount)),
                 cell(outsideNotes[channel.id] ?? (outsideMatches[channel.id] == nil ? "no match" : "matched")),
                 cell(String(outsideCount)), cell(current?.title ?? ""),
-                cell(current.map { $0.fromOutsideGuide ? "outside" : "server" } ?? "")
+                cell(current.map { $0.fromOutsideGuide ? "outside" : "server" } ?? ""),
+                cell(entryID.flatMap { entryInfo[$0]?.name } ?? ""), cell(trait?.category.rawValue ?? ""),
+                cell(entryID.map { lineupIDs.contains($0) ? "yes" : "" } ?? ""),
+                cell(trait?.familyKey ?? ""), cell(trait?.eventText ?? "")
             ].joined(separator: ","))
         }
         return lines.joined(separator: "\n") + "\n"
@@ -524,17 +882,30 @@ final class LiveTVStore: ObservableObject {
         return String((indexByID[channel.id] ?? 0) + 1)
     }
 
+    /// A raw server channel.
     func channel(id: String) -> LiveTVChannel? {
         indexByID[id].map { channels[$0] }
     }
 
-    private func setChannels(_ list: [LiveTVChannel]) {
-        channels = Self.ordered(list)
-        indexByID = Dictionary(channels.enumerated().map { ($1.id, $0) }, uniquingKeysWith: { first, _ in first })
-        var counts: [String: Int] = [:]
-        for channel in channels { counts[channel.group ?? Self.otherGroup, default: 0] += 1 }
-        groups = counts.map { ChannelGroup(name: $0.key, count: $0.value) }
-            .sorted { $0.count != $1.count ? $0.count > $1.count : $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+    /// An entry, an event, or a raw channel by id.
+    func anyChannel(id: String) -> LiveTVChannel? {
+        if let entry = entry(id: id) { return entry }
+        if let event = events.first(where: { $0.id == id }) { return eventChannel(event) }
+        return channel(id: id)
+    }
+
+    /// Raw versions of an entry, best first (reliable sources moved up).
+    func versions(of channel: LiveTVChannel) -> [LiveTVChannel] {
+        if let info = entryInfo[channel.id] {
+            return orderedByReliability(info.members.compactMap { self.channel(id: $0) })
+        }
+        if let event = events.first(where: { $0.id == channel.id }) {
+            let feeds = event.feeds.compactMap { self.channel(id: $0) }
+            // Xtream feeds first, server feeds as backup.
+            return orderedByReliability(feeds.filter { $0.serverID.hasPrefix("xt:") })
+                + orderedByReliability(feeds.filter { !$0.serverID.hasPrefix("xt:") })
+        }
+        return [channel]
     }
 
     // MARK: Groups
@@ -594,33 +965,42 @@ final class LiveTVStore: ObservableObject {
 
     // MARK: Search
 
-    /// Channels matching by number, name or group, best matches first.
+    /// Entries matching by number, name or group, best matches first. Lineup
+    /// channels rank above hidden ones.
     func searchChannels(_ text: String, limit: Int = 80) -> [LiveTVChannel] {
         let query = text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !query.isEmpty else { return [] }
         var scored: [(LiveTVChannel, Int)] = []
-        for channel in channels {
-            let name = channel.displayName.lowercased()
-            let full = channel.name.lowercased()
+        for channel in entries {
+            let name = channel.name.lowercased()
             var score = 0
             if let number = channel.number?.lowercased() {
-                if number == query { score = 100 } else if number.hasPrefix(query) { score = 60 }
+                if number == query { score = 100 } else if number.hasPrefix(query), lineupIDs.contains(channel.id) { score = 60 }
             }
             if name == query { score = max(score, 95) }
             else if name.hasPrefix(query) { score = max(score, 80) }
             else if name.split(whereSeparator: { !$0.isLetter && !$0.isNumber }).contains(where: { $0.hasPrefix(query) }) { score = max(score, 70) }
-            else if full.contains(query) { score = max(score, 50) }
+            else if name.contains(query) { score = max(score, 50) }
+            else if let callsign = entryInfo[channel.id]?.callsign?.lowercased(), callsign.hasPrefix(query) { score = max(score, 75) }
             else if channel.group?.lowercased().contains(query) == true { score = max(score, 20) }
             if score > 0 {
                 if channel.isFavorite { score += 5 }
+                if lineupIDs.contains(channel.id) { score += 10 }
                 if isHidden(channel) { score -= 15 }
                 scored.append((channel, score))
             }
         }
         return scored
-            .sorted { $0.1 != $1.1 ? $0.1 > $1.1 : $0.0.displayName.localizedStandardCompare($1.0.displayName) == .orderedAscending }
+            .sorted { $0.1 != $1.1 ? $0.1 > $1.1 : $0.0.name.localizedStandardCompare($1.0.name) == .orderedAscending }
             .prefix(limit)
             .map(\.0)
+    }
+
+    /// Live events whose title or league matches.
+    func searchEvents(_ text: String) -> [LiveEvent] {
+        let query = text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard query.count >= 2 else { return [] }
+        return events.filter { $0.title.lowercased().contains(query) || $0.league.lowercased().contains(query) }
     }
 
     /// Programs on now or later whose title matches: the loaded guide first,
@@ -631,14 +1011,20 @@ final class LiveTVStore: ObservableObject {
         let needle = query.lowercased()
         let now = Date()
         var found: [String: LiveTVProgram] = [:]
-        for list in programs.values {
+        for (id, list) in programs where id.hasPrefix("e|") {
             for program in list where program.end > now && program.title.lowercased().contains(needle) {
                 found[program.id] = program
             }
         }
         for server in servers() {
-            for program in await server.client.searchPrograms(query) where indexByID[program.channelID] != nil {
-                found[program.id] = program
+            for program in await server.client.searchPrograms(query) {
+                guard let entryID = entryOf[program.channelID], entryInfo[entryID] != nil else { continue }
+                found[program.id] = LiveTVProgram(
+                    id: program.id, channelID: entryID, title: program.title, episodeTitle: program.episodeTitle,
+                    overview: program.overview, start: program.start, end: program.end, isMovie: program.isMovie,
+                    isSports: program.isSports, isNews: program.isNews, isKids: program.isKids, isLive: program.isLive,
+                    isPremiere: program.isPremiere, imageURL: program.imageURL
+                )
             }
         }
         return found.values.sorted { $0.start != $1.start ? $0.start < $1.start : $0.title < $1.title }
@@ -648,6 +1034,8 @@ final class LiveTVStore: ObservableObject {
 
     private static let hiddenGroupsKey = "nuvio.tv.livetv.hiddenGroups"
     private static let recentKey = "nuvio.tv.livetv.recentChannels"
+    private static let reliabilityKey = "nuvio.tv.livetv.sourceReliability"
+    private static let localFavoritesKey = "nuvio.tv.livetv.localFavorites"
 
     private static func loadList(_ key: String) -> [String] {
         guard let data = ProfileSettings.current.data(forKey: key),
@@ -670,74 +1058,269 @@ final class LiveTVStore: ObservableObject {
         Self.save(list, key: Self.recentKey)
     }
 
-    var recentChannels: [LiveTVChannel] { recentIDs.compactMap(channel(id:)) }
+    var recentChannels: [LiveTVChannel] { recentIDs.compactMap(anyChannel(id:)) }
+
+    // MARK: Source reliability
+
+    /// Successes / failures per source marker ("(A)", "US:"…), so feeds from
+    /// sources that work move ahead of ones that don't.
+    private var reliability: [String: [Int]] = {
+        (UserDefaults.standard.dictionary(forKey: "nuvio.tv.livetv.sourceReliability") as? [String: [Int]]) ?? [:]
+    }()
+
+    private func record(_ channel: LiveTVChannel, worked: Bool) {
+        let tag = traits[channel.id]?.sourceTag ?? ""
+        var counts = reliability[tag] ?? [0, 0]
+        counts[worked ? 0 : 1] += 1
+        reliability[tag] = counts
+        UserDefaults.standard.set(reliability, forKey: Self.reliabilityKey)
+    }
+
+    private func orderedByReliability(_ list: [LiveTVChannel]) -> [LiveTVChannel] {
+        func score(_ channel: LiveTVChannel) -> Double {
+            let counts = reliability[traits[channel.id]?.sourceTag ?? ""] ?? [0, 0]
+            return Double(counts[0] + 1) / Double(counts[0] + counts[1] + 2)
+        }
+        // Keep the catalog's order unless a source is clearly worse.
+        return list.enumerated().sorted { a, b in
+            let sa = score(a.element), sb = score(b.element)
+            if abs(sa - sb) > 0.25 { return sa > sb }
+            return a.offset < b.offset
+        }.map(\.element)
+    }
 
     // MARK: Watching
 
-    /// Watches a channel. `lineup` is the list it was picked from, which
-    /// Up / Down then flips through (a group, favorites, search results…).
+    /// Watches an entry, event or raw channel. `lineup` is the list it was
+    /// picked from, which Up / Down then flips through.
     ///
     /// Emby Live TV is held to ONE open stream at a time: every open first
     /// closes whatever is open, opens run strictly one after another, and a
-    /// tune that's been superseded (fast Up / Down) never opens anything.
+    /// tune that's been superseded (fast Up / Down) never opens anything. If a
+    /// version won't open, or fails before showing a picture, the next version
+    /// of the same channel is tried automatically.
     func watch(_ channel: LiveTVChannel, lineup: [LiveTVChannel]? = nil) {
         if let lineup, lineup.contains(channel) { flipList = lineup }
-        else if !flipList.contains(channel) { flipList = channels.filter { !isHidden($0) || $0 == channel } }
+        else if !flipList.contains(channel) { flipList = visibleEntries().contains(channel) ? visibleEntries() : [channel] }
+        surfStep = 0
         remember(channel)
+        tune(channel, candidates: versions(of: channel), from: 0, followFeed: false)
+    }
+
+    /// Opens a numbered event feed for surfing: Up / Down move through the
+    /// family, skipping feeds that aren't live.
+    func surf(_ feed: LiveTVChannel, in family: EventFamily) {
+        flipList = family.feeds.compactMap { channel(id: $0) }
+        surfStep = 1
+        tune(feed, candidates: surfCandidates(from: feed, step: 1), from: 0, followFeed: true)
+    }
+
+    private func surfCandidates(from feed: LiveTVChannel, step: Int) -> [LiveTVChannel] {
+        guard let start = flipList.firstIndex(of: feed) else { return [feed] }
+        return (0..<min(8, flipList.count)).map { flipList[(start + $0 * step + flipList.count * 8) % flipList.count] }
+    }
+
+    /// Watches a channel starting with a specific version (Choose Feed); the
+    /// other versions stay as backups.
+    func watch(_ channel: LiveTVChannel, preferring feed: LiveTVChannel) {
+        var list = versions(of: channel)
+        list.removeAll { $0 == feed }
+        list.insert(feed, at: 0)
+        if !flipList.contains(channel) { flipList = visibleEntries().contains(channel) ? visibleEntries() : [channel] }
+        surfStep = 0
+        remember(channel)
+        tune(channel, candidates: list, from: 0, followFeed: false)
+    }
+
+    /// "FHD · source (A) · US Sports" for the feed picker.
+    func feedSummary(_ feed: LiveTVChannel) -> String {
+        var parts: [String] = []
+        if let trait = traits[feed.id] {
+            parts.append(["SD", "HD", "FHD", "4K"][max(0, min(3, trait.quality))])
+            if trait.isWest { parts.append("West feed") }
+        }
+        if let provider = providerName(for: feed.serverID) { parts.append(provider) }
+        if let group = feed.group { parts.append(group) }
+        return parts.joined(separator: " · ")
+    }
+
+    /// The event a numbered feed carries, or that none is listed.
+    func feedEventLine(_ feed: LiveTVChannel) -> String {
+        guard let text = traits[feed.id]?.eventText, !ChannelCatalog.isPlaceholder(text) else {
+            return "No event listed"
+        }
+        let (title, start) = ChannelCatalog.parseEvent(text, now: Date())
+        guard let start else { return title }
+        return "\(title) · \(ChannelsView.clockFormatter.string(from: start))"
+    }
+
+    func providerName(for serverID: String) -> String? {
+        if serverID.hasPrefix("xt:") { return XtreamStore.shared.account(sourceID: serverID)?.displayName }
+        return JellyfinServerStore.shared.servers.first { $0.id == serverID }?.displayName
+    }
+
+    func watchEvent(_ event: LiveEvent) {
+        let display = eventChannel(event)
+        flipList = [display]
+        surfStep = 0
+        remember(display)
+        tune(display, candidates: versions(of: display), from: 0, followFeed: false)
+    }
+
+    /// An event shown as a channel (for the player, banner and tuning card).
+    func eventChannel(_ event: LiveEvent) -> LiveTVChannel {
+        let first = event.feeds.first.flatMap { channel(id: $0) }
+        return LiveTVChannel(
+            id: event.id, serverID: first?.serverID ?? "", itemID: first?.itemID ?? "", name: event.title,
+            number: nil, imageURL: first?.imageURL, isFavorite: false, group: event.league, shortName: event.title
+        )
+    }
+
+    private func tune(_ display: LiveTVChannel, candidates list: [LiveTVChannel], from startIndex: Int, followFeed: Bool) {
         bannerTask?.cancel()
+        watchdogTask?.cancel()
         banner = nil
         tuneGeneration &+= 1
         let generation = tuneGeneration
-        watching = channel
-        overlay = .tuning(channel)
+        watching = display
+        overlay = .tuning(display)
+        candidates = list
+        sawFirstFrame = false
         enqueueStreamWork { [weak self] in
             guard let self else { return }
             // Let a burst of channel flips settle on the last one.
             try? await Task.sleep(nanoseconds: 350_000_000)
             guard generation == self.tuneGeneration else { return }
             await self.closeAllStreams()
-            guard generation == self.tuneGeneration else { return }
-            guard let client = self.client(for: channel.serverID) else {
-                self.overlay = .failed(channel, "Sign in to this server again in Settings → Jellyfin.")
-                return
-            }
-            do {
-                // Not cancellable on purpose: once the server opens a stream we
-                // must learn its id so it can be closed.
-                let stream = try await client.openStream(channelItemID: channel.itemID)
-                self.openStreams.append((stream, channel.serverID))
-                guard generation == self.tuneGeneration, self.watching?.id == channel.id else {
-                    await self.closeAllStreams()
+            var index = startIndex
+            var lastError = "This channel couldn't be opened right now."
+            while index < list.count {
+                guard generation == self.tuneGeneration else { return }
+                let raw = list[index]
+                if raw.serverID.hasPrefix("xt:") {
+                    // Xtream streams are direct links: nothing to open or close
+                    // on a server, the player connects straight away.
+                    guard let xtream = self.xtreamClient(for: raw.serverID),
+                          let url = xtream.streamURL(streamID: raw.itemID, formats: self.xtreamFormats[raw.serverID] ?? []) else {
+                        lastError = "Sign in to this Xtream account again in Settings → Integrations."
+                        index += 1
+                        continue
+                    }
+                    guard generation == self.tuneGeneration else { return }
+                    let shown = followFeed ? raw : display
+                    self.watching = shown
+                    self.candidateIndex = index
+                    self.overlay = nil
+                    let now = self.current(on: shown.id)
+                    let meta = self.meta(for: shown, feed: raw, now: now)
+                    self.playingMetaID = meta.id
+                    self.present?(shown, url, meta, now?.title ?? "")
+                    if index > startIndex {
+                        self.flash(followFeed ? "Skipped feeds that aren't live" : "Switched to a backup feed (\(index + 1) of \(list.count))")
+                    }
+                    self.showBanner(for: shown)
+                    self.armFirstFrameWatchdog(generation)
                     return
                 }
-                let now = self.current(on: channel.id)
-                self.overlay = nil
-                self.present?(channel, stream.url, self.meta(for: channel, now: now), now?.title ?? "")
-                self.showBanner(for: channel)
-                await client.reportPlaying(stream)
-            } catch {
-                guard generation == self.tuneGeneration, self.watching?.id == channel.id else { return }
-                self.overlay = .failed(channel, error.localizedDescription)
+                guard let client = self.client(for: raw.serverID) else {
+                    lastError = "Sign in to this server again in Settings → Jellyfin."
+                    index += 1
+                    continue
+                }
+                do {
+                    // Not cancellable on purpose: once the server opens a stream
+                    // we must learn its id so it can be closed.
+                    let stream = try await client.openStream(channelItemID: raw.itemID)
+                    self.openStreams.append((stream, raw.serverID))
+                    guard generation == self.tuneGeneration else {
+                        await self.closeAllStreams()
+                        return
+                    }
+                    let shown = followFeed ? raw : display
+                    self.watching = shown
+                    self.candidateIndex = index
+                    self.overlay = nil
+                    let now = self.current(on: shown.id)
+                    let meta = self.meta(for: shown, feed: raw, now: now)
+                    self.playingMetaID = meta.id
+                    self.present?(shown, stream.url, meta, now?.title ?? "")
+                    if index > startIndex {
+                        self.flash(followFeed ? "Skipped feeds that aren't live" : "Switched to a backup feed (\(index + 1) of \(list.count))")
+                    }
+                    self.showBanner(for: shown)
+                    self.armFirstFrameWatchdog(generation)
+                    await client.reportPlaying(stream)
+                    return
+                } catch {
+                    self.record(raw, worked: false)
+                    lastError = error.localizedDescription
+                    index += 1
+                }
             }
+            guard generation == self.tuneGeneration else { return }
+            let message = list.count > 1
+                ? (followFeed ? "None of the next feeds are live right now." : "None of this channel's \(list.count) versions could be opened right now. \(lastError)")
+                : lastError
+            self.overlay = .failed(display, message)
         }
+    }
+
+    /// No picture after a while counts as a failed version.
+    private func armFirstFrameWatchdog(_ generation: Int) {
+        watchdogTask?.cancel()
+        watchdogTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: Self.firstFrameTimeout * 1_000_000_000)
+            guard let self, !Task.isCancelled, generation == self.tuneGeneration, !self.sawFirstFrame else { return }
+            self.failOver()
+        }
+    }
+
+    private func playerStarted(metaID: String?) {
+        guard let metaID, metaID == playingMetaID else { return }
+        sawFirstFrame = true
+        watchdogTask?.cancel()
+        if candidateIndex < candidates.count { record(candidates[candidateIndex], worked: true) }
+    }
+
+    private func playerFailed(metaID: String?) {
+        guard let metaID, metaID == playingMetaID, isWatching, !sawFirstFrame else { return }
+        failOver()
+    }
+
+    /// Moves to the next version of what's playing, if there is one.
+    private func failOver() {
+        guard let display = watching else { return }
+        if candidateIndex < candidates.count { record(candidates[candidateIndex], worked: false) }
+        let nextIndex = candidateIndex + 1
+        guard nextIndex < candidates.count else { return }
+        leavePlayer?()
+        tune(display, candidates: candidates, from: nextIndex, followFeed: surfStep != 0)
     }
 
     /// Channel up / down from the player.
     func flip(by step: Int) {
-        let list = flipList.isEmpty ? channels : flipList
+        let list = flipList.isEmpty ? visibleEntries() : flipList
         guard let current = watching, let index = list.firstIndex(of: current), list.count > 1 else { return }
         let target = list[(index + step + list.count) % list.count]
         leavePlayer?()
-        watch(target)
+        if surfStep != 0 {
+            surfStep = step
+            tune(target, candidates: surfCandidates(from: target, step: step), from: 0, followFeed: true)
+        } else {
+            remember(target)
+            tune(target, candidates: versions(of: target), from: 0, followFeed: false)
+        }
     }
 
     /// Leaving the player or the tuning card.
     func stopWatching() {
         tuneGeneration &+= 1
         bannerTask?.cancel()
+        watchdogTask?.cancel()
         watching = nil
         overlay = nil
         banner = nil
+        playingMetaID = nil
         enqueueStreamWork { [weak self] in
             await self?.closeAllStreams()
         }
@@ -771,9 +1354,13 @@ final class LiveTVStore: ObservableObject {
     }
 
     func meta(for channel: LiveTVChannel, now: LiveTVProgram?) -> NuvioMeta {
+        meta(for: channel, feed: channel, now: now)
+    }
+
+    func meta(for channel: LiveTVChannel, feed: LiveTVChannel, now: LiveTVProgram?) -> NuvioMeta {
         let description = [now?.title, now?.episodeTitle, now?.overview].compactMap { $0 }.joined(separator: "\n")
         return NuvioMeta(
-            id: "live:jf:\(channel.serverID):\(channel.itemID)",
+            id: "live:jf:\(feed.serverID):\(feed.itemID)",
             name: channel.name,
             description: description.isEmpty ? nil : description,
             posterUrl: channel.imageURL?.absoluteString,
@@ -798,21 +1385,32 @@ final class LiveTVStore: ObservableObject {
     // MARK: Favorites
 
     func toggleFavorite(_ channel: LiveTVChannel) {
-        guard let index = channels.firstIndex(of: channel) else { return }
+        // An entry's favorite lives on its main version.
+        let target = entryInfo[channel.id].flatMap { $0.members.first }.flatMap { self.channel(id: $0) } ?? channel
+        guard let index = indexByID[target.id] else { return }
         let favorite = !channel.isFavorite
-        var updated = channels
-        updated[index].isFavorite = favorite
-        setChannels(updated)
+        channels[index].isFavorite = favorite
+        if !favorite, let info = entryInfo[channel.id] {
+            for member in info.members { if let i = indexByID[member] { channels[i].isFavorite = false } }
+        }
+        rebuildEntries()
+        flash(favorite ? "Added \(channel.name) to Favorites" : "Removed \(channel.name) from Favorites")
+        if target.serverID.hasPrefix("xt:") {
+            var local = Set(Self.loadList(Self.localFavoritesKey))
+            if favorite { local.insert(target.id) } else { local.remove(target.id) }
+            Self.save(Array(local), key: Self.localFavoritesKey)
+            return
+        }
         Task { [weak self] in
             do {
-                try await self?.client(for: channel.serverID)?.setFavorite(favorite, itemID: channel.itemID)
+                try await self?.client(for: target.serverID)?.setFavorite(favorite, itemID: target.itemID)
             } catch {
                 self?.flash(error.localizedDescription)
             }
         }
     }
 
-    private func flash(_ message: String) {
+    func flash(_ message: String) {
         toastTask?.cancel()
         toast = message
         toastTask = Task { [weak self] in
@@ -831,15 +1429,16 @@ final class LiveTVStore: ObservableObject {
         let names = [
             "US: NBC 4 New York (WNBC)", "US LOCALS: FOX 32 Chicago", "US LOCALS: ABC 7 Los Angeles",
             "US LOCALS: CBS 2 Chicago", "US: ESPN", "US: CNN", "US: HGTV", "US: Cartoon Network",
-            "US: HBO East", "US: Discovery Channel", "FAST: Pluto TV Movies", "FAST: Samsung TV Plus Comedy"
+            "US: HBO East", "US: Discovery Channel", "(US) (Prime) KAGS", "USA: WITI (FOX)"
         ]
         let demo = names.enumerated().map { index, name in
             LiveTVChannel(id: "demo|o\(index)", serverID: "demo", itemID: "o\(index)", name: name,
                           number: String(index + 2), imageURL: nil, isFavorite: false)
         }
-        loadedSignature = ProfileSettings.activeProfileScope + "|" + JellyfinServerStore.shared.servers.map(\.id).joined(separator: ",")
+        loadedSignature = currentSignature
         channelsLoadedAt = Date()
-        setChannels(Self.annotated(demo))
+        let annotated = Self.annotated(demo)
+        apply(channels: annotated, catalog: ChannelCatalog.build(annotated))
         programs = [:]
         serverPrograms = [:]
         guideState = Dictionary(uniqueKeysWithValues: demo.map { ($0.id, GuideState.loaded) })
@@ -847,50 +1446,101 @@ final class LiveTVStore: ObservableObject {
         loadOutsideGuide(force: true)
     }
 
-
-    /// Sample guide for the CI screenshot tour (`-NuvioScreenTour live-demo`),
-    /// so the layout can be checked without a real server.
-    func loadDemo() {
-        let names = ["US: News 24", "US: Sports Central", "US: Movie Classics", "UK: Kids Zone", "UK: Nature HD", "UK: Comedy Hits", "US LOCALS: KXYZ 7", "MUSIC | Music Live"]
-        let shows: [[(String, Int, String)]] = [
-            [("Evening News", 60, "news"), ("World Tonight", 30, "news"), ("Late Edition", 60, "news"), ("Overnight", 60, "news")],
-            [("NFL Football: Seattle at Denver", 190, "sports"), ("Postgame", 30, "sports")],
-            [("Casablanca", 105, "movie"), ("The Third Man", 95, "movie")],
-            [("Cartoon Block", 30, "kids"), ("Science Kids", 30, "kids"), ("Puzzle Time", 30, "kids"), ("Story Hour", 60, "kids"), ("Bedtime Tales", 60, "kids")],
-            [("Planet Oceans", 60, ""), ("Wild Mountains", 60, ""), ("Desert Life", 60, ""), ("Night Sky", 60, "")],
-            [("Stand-Up Tonight", 45, ""), ("Sketch Hour", 60, ""), ("Late Laughs", 60, ""), ("Reruns", 60, "")],
-            [("Local Weather", 15, "news"), ("City Council Live", 75, "news"), ("Community Spotlight", 30, ""), ("Late News", 30, "news"), ("Overnight", 60, "")],
-            [("Concert Series", 120, ""), ("Top 20 Countdown", 90, "")]
+    /// Sample lineup for the CI screenshot tour (`-NuvioScreenTour live-demo…`):
+    /// realistic IPTV-style names (variants, locals from two markets, FAST,
+    /// international, numbered event feeds) so the catalog, My Lineup and
+    /// Live Events can be checked without a real server.
+    func loadDemo(configureLineup: Bool = true) {
+        let now = Date()
+        var eastern = Calendar(identifier: .gregorian)
+        eastern.timeZone = TimeZone(identifier: "America/New_York") ?? .current
+        func stamp(_ offsetHours: Double) -> String {
+            let date = now.addingTimeInterval(offsetHours * 3600)
+            let c = eastern.dateComponents([.year, .month, .day, .hour, .minute], from: date)
+            return String(format: "(%04d %02d %02d %02d:%02d:00)", c.year ?? 2026, c.month ?? 1, c.day ?? 1, c.hour ?? 0, c.minute ?? 0)
+        }
+        var names: [(String, String)] = [
+            ("US NBC 11 (KNTV) San Francisco (S)", "US Locals & Regional"),
+            ("US NBC 11 (KNTV) San Francisco (A)", "US Locals & Regional"),
+            ("US abc 7 (KGO) San Francisco (H)", "US Locals & Regional"),
+            ("US Fox 2 (KTVU) San Francisco (S)", "US Locals & Regional"),
+            ("US FOX KTVU (A)", "United States"),
+            ("US CBS KPIX (A)", "United States"),
+            ("US PBS 9 (KQED) San Francisco (D)", "US Locals & Regional"),
+            ("US NBC 4 (WNBC) New York (H)", "US Locals & Regional"),
+            ("US abc 7 (WABC) New York (S)", "US Locals & Regional"),
+            ("US: ESPN", "United States"), ("US ESPN (S)", "United States"), ("US: ESPN FHD", "United States"),
+            ("US: CNN", "United States"), ("US CNN (A)", "United States"),
+            ("US: HGTV", "USA Premium"), ("US: Food Network", "USA Premium"),
+            ("US HBO East (A)", "US Movies"), ("US: Cartoon Network", "USA Premium"),
+            ("US NBC Sports Bay Area (S)", "US Sports"), ("US: MTV", "USA Premium"),
+            ("(PLUTO USA) Pluto TV Movies", "United States"), ("(US) (RK) The Bernie Mac Show", "US Roku & Free TV"),
+            ("(PLUTO UK) Antiques Road Trip", "United States"), ("MEX: Canal 5", "Mexico")
         ]
+        let events = [
+            ("Basketball: Lakers vs. Celtics", -0.5), ("Hockey: Sharks at Kings", 1.0), ("Football: Good Morning Football", -1.0),
+            ("ESPN+: Stanford vs. Cal", 2.5), ("Soccer: LAFC vs. Galaxy", 4.0), ("UFC Fight Night: Prelims", 6.0)
+        ]
+        for index in 1...18 {
+            if index <= events.count {
+                let event = events[index - 1]
+                names.append((String(format: "US (ESPN+ %03d) | %@ %@", index, event.0, stamp(event.1)), "ESPN Plus"))
+            } else {
+                names.append((String(format: "US (ESPN+ %03d) |  (2098 12 31 08:00:00)", index), "ESPN Plus"))
+            }
+        }
+        for index in 0..<16 { names.append((String(format: "ESPN PLUS %02d:", index), "ESPN Plus")) }
+        names.append(("NBA 01: Warriors vs Lakers \(stamp(0.25))", "NBA"))
+        for index in 2...6 { names.append(("NBA \(String(format: "%02d", index)): No Games Scheduled", "NBA")) }
+
+        let demo = names.enumerated().map { index, item in
+            LiveTVChannel(id: "demo|\(index)", serverID: "demo", itemID: "\(index)", name: item.0,
+                          number: String(index + 2), imageURL: nil, isFavorite: false, tags: [item.1])
+        }
+        let shows = ["Evening News", "Late Edition", "SportsCenter", "House Hunters", "Diners, Drive-Ins and Dives",
+                     "Casablanca", "Teen Titans Go!", "Warriors Pregame", "Ridiculousness", "The Office"]
         let start = Self.windowStart().addingTimeInterval(-20 * 60)
-        var demoChannels: [LiveTVChannel] = []
         var demoPrograms: [String: [LiveTVProgram]] = [:]
-        for (index, name) in names.enumerated() {
-            let channel = LiveTVChannel(id: "demo|\(index)", serverID: "demo", itemID: "\(index)", name: name, number: String(index + 2), imageURL: nil, isFavorite: index == 1)
-            demoChannels.append(channel)
+        for (index, channel) in demo.enumerated() where index < 22 {
             var cursor = start
-            demoPrograms[channel.id] = shows[index].enumerated().map { offset, show in
-                let end = cursor.addingTimeInterval(TimeInterval(show.1 * 60))
+            demoPrograms[channel.id] = (0..<5).map { offset in
+                let length = TimeInterval((offset % 2 == 0 ? 60 : 30) * 60)
+                let end = cursor.addingTimeInterval(length)
                 defer { cursor = end }
                 return LiveTVProgram(
-                    id: "demo|\(index)|\(offset)", channelID: channel.id, title: show.0,
-                    episodeTitle: offset == 1 ? "Episode \(offset + 3)" : nil,
-                    overview: "Sample listing used for the automated screenshot tour.",
-                    start: cursor, end: end,
-                    isMovie: show.2 == "movie", isSports: show.2 == "sports", isNews: show.2 == "news", isKids: show.2 == "kids",
-                    isLive: show.2 == "sports", isPremiere: offset == 0 && index % 3 == 0, imageURL: nil,
-                    fromOutsideGuide: index == 1
+                    id: "demo|\(index)|\(offset)", channelID: channel.id, title: shows[(index + offset) % shows.count],
+                    episodeTitle: nil, overview: "Sample listing used for the automated screenshot tour.",
+                    start: cursor, end: end, isMovie: false, isSports: index == 9 || index == 18, isNews: index == 12,
+                    isKids: index == 17, isLive: false, isPremiere: offset == 0, imageURL: nil, fromOutsideGuide: index % 3 == 0
                 )
             }
         }
-        loadedSignature = ProfileSettings.activeProfileScope + "|" + JellyfinServerStore.shared.servers.map(\.id).joined(separator: ",")
+        loadedSignature = currentSignature
         channelsLoadedAt = Date()
         guideLoadedAt = Date()
         guideWindowStart = Self.windowStart()
-        setChannels(Self.annotated(demoChannels))
+        let annotated = Self.annotated(demo)
+        let catalog = ChannelCatalog.build(annotated)
+        serverPrograms = demoPrograms
         programs = demoPrograms
-        guideState = Dictionary(uniqueKeysWithValues: demoChannels.map { ($0.id, GuideState.loaded) })
-        demoChannels.forEach { guideWindowByChannel[$0.id] = Self.windowStart() }
+        guideState = Dictionary(uniqueKeysWithValues: demo.map { ($0.id, GuideState.loaded) })
+        demo.forEach { guideWindowByChannel[$0.id] = Self.windowStart() }
+        if configureLineup {
+            var demoPrefs = LineupPrefs()
+            demoPrefs.markets = [MarketChoice(name: "San Francisco–Oakland–San Jose", template: nil,
+                                              callsigns: ["KNTV", "KGO", "KTVU", "KPIX", "KQED"])]
+            demoPrefs.configured = true
+            prefs = demoPrefs
+        } else {
+            prefs = LineupPrefs()
+        }
+        apply(channels: annotated, catalog: catalog)
+        if configureLineup {
+            prefs.suggested = Set(entryInfo.values.filter {
+                LineupEngine.suggests($0, prefs: prefs, hasGuide: entryHasGuide($0.id), name: $0.name)
+            }.map(\.id))
+            rebuildEntries()
+        }
         state = .loaded
     }
 }

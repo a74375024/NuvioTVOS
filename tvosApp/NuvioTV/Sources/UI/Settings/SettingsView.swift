@@ -4118,6 +4118,8 @@ private struct IntegrationSettingsView: View {
             SMBSettingsSection(accentColor: accentColor)
 
             JellyfinSettingsSection(accentColor: accentColor)
+
+            XtreamSettingsSection(accentColor: accentColor)
         }
         .onAppear {
             currentCacheSizeText = TorrentSettings.cacheSizeFormatted()
@@ -15418,3 +15420,217 @@ struct SettingsView_Previews: PreviewProvider {
     }
 }
 #endif
+
+
+// MARK: - Xtream (IPTV provider accounts for Live TV)
+
+private struct XtreamSettingsSection: View {
+    let accentColor: Color
+
+    @ObservedObject private var store = XtreamStore.shared
+    @State private var editing: XtreamAccount?
+    @State private var isAdding = false
+
+    var body: some View {
+        SettingsGroup(
+            title: L10n.string("xtream_group_title", fallback: "Xtream"),
+            subtitle: L10n.string("xtream_group_subtitle", fallback: "Live channels from an IPTV provider (Xtream Codes). They join the Live TV tab, tried before your Emby / Jellyfin versions of the same channel.")
+        ) {
+            SettingsActionRow(
+                title: L10n.string("xtream_add", fallback: "Add Account"),
+                subtitle: L10n.string("xtream_add_subtitle", fallback: "Server address, username and password from your provider"),
+                value: "",
+                accentColor: accentColor
+            ) {
+                isAdding = true
+            }
+            ForEach(store.accounts) { account in
+                XtreamAccountRow(
+                    account: account,
+                    accentColor: accentColor,
+                    onEdit: { editing = account },
+                    onDelete: { store.remove(account.id) }
+                )
+            }
+        }
+        .sheet(isPresented: $isAdding) {
+            XtreamAccountEditSheet(account: nil, accentColor: accentColor)
+                .modifier(ClearPresentationBackgroundIfAvailable())
+        }
+        .sheet(item: $editing) { account in
+            XtreamAccountEditSheet(account: account, accentColor: accentColor)
+                .modifier(ClearPresentationBackgroundIfAvailable())
+        }
+    }
+}
+
+private struct XtreamAccountRow: View {
+    let account: XtreamAccount
+    let accentColor: Color
+    let onEdit: () -> Void
+    let onDelete: () -> Void
+
+    @FocusState private var isFocused: Bool
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Button(action: onEdit) {
+                SettingsRowShell(isFocused: isFocused, accentColor: accentColor) {
+                    SettingsRowText(title: account.displayName, subtitle: subtitle)
+                    Spacer(minLength: 24)
+                    if let count = account.lastChannelCount {
+                        Text(L10n.format("xtream_channels", fallback: "%d channels", count))
+                            .font(.system(size: 17, weight: .semibold))
+                            .foregroundColor(.white.opacity(0.7))
+                    }
+                }
+            }
+            .buttonStyle(PosterCardButtonStyle())
+            .focused($isFocused)
+            .focusEffectDisabledIfAvailable()
+            SMBDeleteButton(action: onDelete)
+        }
+    }
+
+    private var subtitle: String {
+        var parts = ["\(account.username) · \(account.serverURLString)"]
+        if let expires = account.expires {
+            let formatter = DateFormatter()
+            formatter.dateStyle = .medium
+            parts.append(L10n.format("xtream_expires", fallback: "Expires %@", formatter.string(from: expires)))
+        }
+        if let connections = account.maxConnections {
+            parts.append(L10n.format("xtream_connections", fallback: "%d connection(s)", connections))
+        }
+        return parts.joined(separator: " — ")
+    }
+}
+
+/// Add or edit an Xtream account. Save checks the sign-in with the provider
+/// first, so a typo is caught before the sheet closes.
+private struct XtreamAccountEditSheet: View {
+    let account: XtreamAccount?
+    let accentColor: Color
+
+    @Environment(\.dismiss) private var dismiss
+    @AppStorage(SettingsKey.amoled) private var amoled = false
+    @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
+
+    @State private var displayName: String
+    @State private var serverURL: String
+    @State private var username: String
+    @State private var password: String
+    @State private var isSaving = false
+    @State private var message: String?
+
+    init(account: XtreamAccount?, accentColor: Color) {
+        self.account = account
+        self.accentColor = accentColor
+        _displayName = State(initialValue: account?.displayName ?? "")
+        _serverURL = State(initialValue: account?.serverURLString ?? "")
+        _username = State(initialValue: account?.username ?? "")
+        _password = State(initialValue: account.map { XtreamCredentialStore.password(forAccountID: $0.id) } ?? "")
+    }
+
+    var body: some View {
+        ZStack {
+            Color.nuvioBackground(amoled: amoled, body: bodyColor).ignoresSafeArea()
+            ScrollView {
+                VStack(alignment: .leading, spacing: 24) {
+                    Text(account == nil ? L10n.string("xtream_add", fallback: "Add Account") : L10n.string("xtream_edit", fallback: "Edit Account"))
+                        .font(.system(size: 36, weight: .bold))
+                        .foregroundColor(.white)
+
+                    SettingsGroup(
+                        title: L10n.string("smb_connection", fallback: "Connection"),
+                        subtitle: L10n.string("xtream_connection_subtitle", fallback: "As given by your provider. Include http:// and the port, e.g. http://provider.example:8080")
+                    ) {
+                        SettingsNativeTextFieldRow(
+                            title: L10n.string("smb_display_name", fallback: "Name"),
+                            subtitle: L10n.string("xtream_name_subtitle", fallback: "Shown in Settings and the feed picker"),
+                            placeholder: "My IPTV",
+                            text: $displayName
+                        )
+                        SettingsNativeTextFieldRow(
+                            title: L10n.string("xtream_server", fallback: "Server URL"),
+                            subtitle: "",
+                            placeholder: "http://provider.example:8080",
+                            text: $serverURL
+                        )
+                        SettingsNativeTextFieldRow(
+                            title: L10n.string("smb_username", fallback: "Username"),
+                            subtitle: "",
+                            placeholder: L10n.string("debrid_not_set", fallback: "Not set"),
+                            text: $username
+                        )
+                        SettingsNativeTextFieldRow(
+                            title: L10n.string("smb_password", fallback: "Password"),
+                            subtitle: L10n.string("tvos_settings_stored_locally_on_this_apple_tv", fallback: "Stored locally on this Apple TV"),
+                            placeholder: L10n.string("debrid_not_set", fallback: "Not set"),
+                            text: $password,
+                            isSecure: true
+                        )
+                        if let message {
+                            Text(message)
+                                .font(.system(size: 15, weight: .regular))
+                                .foregroundColor(.red.opacity(0.85))
+                        }
+                    }
+
+                    HStack {
+                        SMBDialogButton(title: L10n.string("action_cancel", fallback: "Cancel"), isPrimary: false) {
+                            dismiss()
+                        }
+                        Spacer()
+                        SMBDialogButton(
+                            title: isSaving ? L10n.string("smb_connecting", fallback: "Connecting…") : L10n.string("action_save", fallback: "Save"),
+                            isPrimary: true,
+                            enabled: canSave && !isSaving
+                        ) {
+                            save()
+                        }
+                    }
+                    .focusSection()
+                }
+                .padding(40)
+            }
+        }
+    }
+
+    private var canSave: Bool {
+        !serverURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !username.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !password.isEmpty
+    }
+
+    private func save() {
+        isSaving = true
+        message = nil
+        let id = account?.id ?? UUID().uuidString
+        let name = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        var draft = XtreamAccount(
+            id: id,
+            displayName: name.isEmpty ? (URL(string: serverURL)?.host ?? "Xtream") : name,
+            serverURLString: serverURL.trimmingCharacters(in: .whitespacesAndNewlines),
+            username: username.trimmingCharacters(in: .whitespacesAndNewlines),
+            expires: account?.expires,
+            maxConnections: account?.maxConnections,
+            lastChannelCount: account?.lastChannelCount
+        )
+        let secret = password
+        Task { @MainActor in
+            defer { isSaving = false }
+            do {
+                let info = try await XtreamClient(account: draft, password: secret).accountInfo()
+                draft.expires = info.expires
+                draft.maxConnections = info.maxConnections
+                XtreamCredentialStore.save(secret, forAccountID: id)
+                XtreamStore.shared.upsert(draft)
+                LiveTVStore.shared.loadIfNeeded(force: true)
+                dismiss()
+            } catch {
+                message = error.localizedDescription
+            }
+        }
+    }
+}

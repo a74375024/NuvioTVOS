@@ -176,9 +176,18 @@ final class XMLTVReader: NSObject, XMLParserDelegate {
         var byUser: [String: (programs: [OutsideGuide.RawProgram], note: String)] = [:]
         // A user channel matching several guide channels in one source takes
         // the one with the most listings.
+        // Low-power repeaters ("KGO-LD") only win when the main station
+        // isn't listed.
+        func isLowPower(_ id: String) -> Bool {
+            let text = ((keepNames[id] ?? "") + " " + id).uppercased()
+            return text.range(of: "-(LD|LP|CD|CA)\\b", options: .regularExpression) != nil
+        }
+        var bestScore: [String: Int] = [:]
         for (xmltvID, users) in keep ?? [:] {
             guard let programs = found[xmltvID], !programs.isEmpty else { continue }
-            for user in users where programs.count > (byUser[user.id]?.programs.count ?? 0) {
+            let score = programs.count + (isLowPower(xmltvID) ? 0 : 100_000)
+            for user in users where score > (bestScore[user.id] ?? -1) {
+                bestScore[user.id] = score
                 byUser[user.id] = (programs, "\(keepNames[xmltvID] ?? xmltvID) (\(user.how))")
             }
         }

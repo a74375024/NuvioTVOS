@@ -1,19 +1,16 @@
 import SwiftUI
 
-/// Live TV search: channels by name / number / group as you type, plus
-/// programs on now or later (from the loaded guide and the server's search).
+/// Live TV search: channels by name / number / call sign as you type, live
+/// events, plus programs on now or later (loaded guide and the server's search).
 struct LiveTVSearchView: View {
     var initialQuery = ""
     let onWatch: (LiveTVChannel, [LiveTVChannel]) -> Void
+    var onWatchEvent: (LiveEvent) -> Void = { _ in }
 
     @ObservedObject private var store = LiveTVStore.shared
     @State private var query = ""
     @State private var programResults: [LiveTVProgram] = []
     @State private var searchingPrograms = false
-
-    private var channelResults: [LiveTVChannel] {
-        store.searchChannels(query)
-    }
 
     var body: some View {
         NavigationStack {
@@ -26,15 +23,27 @@ struct LiveTVSearchView: View {
                             }
                         }
                     } else {
-                        Text(L10n.string("live_search_hint", fallback: "Search by channel name, number, group or show title."))
+                        Text(L10n.string("live_search_hint", fallback: "Search by channel name, number, call sign, team or show."))
                             .foregroundColor(.secondary)
                     }
                 } else {
-                    let channels = channelResults
+                    let channels = store.searchChannels(query)
+                    let events = store.searchEvents(query)
                     if !channels.isEmpty {
                         Section(L10n.format("live_search_channels", fallback: "Channels (%d)", channels.count)) {
                             ForEach(channels) { channel in
                                 channelRow(channel, lineup: channels)
+                            }
+                        }
+                    }
+                    if !events.isEmpty {
+                        Section(L10n.format("live_search_events", fallback: "Live Events (%d)", events.count)) {
+                            ForEach(events.prefix(40)) { event in
+                                Button {
+                                    onWatchEvent(event)
+                                } label: {
+                                    LiveEventRowLabel(event: event)
+                                }
                             }
                         }
                     }
@@ -53,7 +62,7 @@ struct LiveTVSearchView: View {
                     }
                 }
             }
-            .searchable(text: $query, prompt: L10n.string("live_search_prompt", fallback: "Channels or shows"))
+            .searchable(text: $query, prompt: L10n.string("live_search_prompt", fallback: "Channels, teams or shows"))
             .navigationTitle(L10n.string("live_search_title", fallback: "Search Live TV"))
         }
         // Full-screen and opaque, so the guide doesn't show through.
@@ -84,17 +93,30 @@ struct LiveTVSearchView: View {
                     .font(.system(size: 24, weight: .heavy).monospacedDigit())
                     .frame(width: 90, alignment: .leading)
                 VStack(alignment: .leading, spacing: 4) {
-                    Text(channel.displayName).font(.system(size: 26, weight: .semibold))
+                    Text(channel.name).font(.system(size: 26, weight: .semibold))
                     Text(subtitle(for: channel))
                         .font(.system(size: 20))
                         .foregroundColor(.secondary)
                         .lineLimit(1)
                 }
                 Spacer()
+                if store.isInLineup(channel) {
+                    Image(systemName: "checkmark.circle.fill").foregroundColor(.secondary)
+                }
                 if channel.isFavorite { Image(systemName: "star.fill").foregroundColor(.yellow) }
             }
         }
         .contextMenu {
+            Button {
+                store.setInLineup(channel, !store.isInLineup(channel))
+            } label: {
+                Label(
+                    store.isInLineup(channel)
+                        ? L10n.string("live_lineup_remove", fallback: "Remove from My Lineup")
+                        : L10n.string("live_lineup_add", fallback: "Add to My Lineup"),
+                    systemImage: store.isInLineup(channel) ? "minus.circle" : "plus.circle"
+                )
+            }
             Button {
                 store.toggleFavorite(channel)
             } label: {
@@ -111,14 +133,17 @@ struct LiveTVSearchView: View {
 
     private func subtitle(for channel: LiveTVChannel) -> String {
         var parts: [String] = []
-        if let group = channel.group { parts.append(group) }
+        if store.isInLineup(channel) { parts.append(L10n.string("live_view_lineup", fallback: "My Lineup")) }
+        else if let group = channel.group { parts.append(group) }
+        let versions = store.versions(of: channel).count
+        if versions > 1 { parts.append(L10n.format("live_versions", fallback: "%d feeds", versions)) }
         if let now = store.current(on: channel.id) { parts.append(L10n.format("live_now_playing", fallback: "Now: %@", now.title)) }
         return parts.joined(separator: " · ")
     }
 
     @ViewBuilder
     private func programRow(_ program: LiveTVProgram) -> some View {
-        if let channel = store.channel(id: program.channelID) {
+        if let channel = store.entry(id: program.channelID) {
             Button {
                 onWatch(channel, [channel])
             } label: {
@@ -135,7 +160,7 @@ struct LiveTVSearchView: View {
                             }
                             Text(program.title).font(.system(size: 26, weight: .semibold)).lineLimit(1)
                         }
-                        Text("\(store.number(of: channel)) · \(channel.displayName) · \(Self.timeRange(program))")
+                        Text("\(store.number(of: channel)) · \(channel.name) · \(Self.timeRange(program))")
                             .font(.system(size: 20))
                             .foregroundColor(.secondary)
                             .lineLimit(1)
@@ -159,10 +184,11 @@ struct LiveTVSearchView: View {
     }()
 }
 
-/// Picker for the provider's channel groups, with hide / show for "All".
-struct LiveTVGroupsView: View {
-    let selected: String?
-    let onPick: (String?) -> Void
+/// Picks what the guide lists: My Lineup, All Channels, Favorites, Recent,
+/// or one of the provider's groups (hold Select to hide a group from All).
+struct LiveTVViewPicker: View {
+    let current: LiveView
+    let onPick: (LiveView) -> Void
 
     @ObservedObject private var store = LiveTVStore.shared
 
@@ -170,32 +196,25 @@ struct LiveTVGroupsView: View {
         NavigationStack {
             List {
                 Section {
-                    Button {
-                        onPick(nil)
-                    } label: {
-                        HStack {
-                            Text(L10n.string("live_all_channels", fallback: "All channels"))
-                            Spacer()
-                            if selected == nil { Image(systemName: "checkmark") }
-                        }
-                    }
-                } footer: {
-                    Text(L10n.string("live_groups_hint", fallback: "Hold Select on a group to hide it from All. Hidden groups can still be opened here or found with Search."))
+                    option(.lineup, count: store.lineupEntries.count, symbol: "sparkles.tv")
+                    option(.all, count: store.entries.count, symbol: "square.grid.3x3")
+                    option(.favorites, count: store.entries.filter(\.isFavorite).count, symbol: "star")
+                    option(.recent, count: store.recentChannels.count, symbol: "clock")
                 }
-                Section(L10n.format("live_groups_count", fallback: "Groups (%d)", store.groups.count)) {
+                Section {
                     ForEach(store.groups) { group in
                         let hidden = store.hiddenGroups.contains(group.name)
                         Button {
-                            onPick(group.name)
+                            onPick(.group(group.name))
                         } label: {
                             HStack(spacing: 16) {
-                                if hidden {
-                                    Image(systemName: "eye.slash").foregroundColor(.secondary)
-                                }
+                                Image(systemName: hidden ? "eye.slash" : "folder")
+                                    .foregroundColor(.secondary)
+                                    .frame(width: 34)
                                 Text(group.name).foregroundColor(hidden ? .secondary : .primary)
                                 Spacer()
                                 Text("\(group.count)").foregroundColor(.secondary).monospacedDigit()
-                                if selected == group.name { Image(systemName: "checkmark") }
+                                if current == .group(group.name) { Image(systemName: "checkmark") }
                             }
                         }
                         .contextMenu {
@@ -204,16 +223,34 @@ struct LiveTVGroupsView: View {
                             } label: {
                                 Label(
                                     hidden
-                                        ? L10n.string("live_group_show", fallback: "Show in All")
-                                        : L10n.string("live_group_hide", fallback: "Hide from All"),
+                                        ? L10n.string("live_group_show", fallback: "Show in All Channels")
+                                        : L10n.string("live_group_hide", fallback: "Hide from All Channels"),
                                     systemImage: hidden ? "eye" : "eye.slash"
                                 )
                             }
                         }
                     }
+                } header: {
+                    Text(L10n.format("live_groups_count", fallback: "Provider groups (%d)", store.groups.count))
+                } footer: {
+                    Text(L10n.string("live_groups_hint", fallback: "Hold Select on a group to hide it from All Channels. Hidden groups can still be opened here or found with Search."))
                 }
             }
-            .navigationTitle(L10n.string("live_groups", fallback: "Groups"))
+            .navigationTitle(L10n.string("live_view_title", fallback: "Show"))
+        }
+    }
+
+    private func option(_ view: LiveView, count: Int, symbol: String) -> some View {
+        Button {
+            onPick(view)
+        } label: {
+            HStack(spacing: 16) {
+                Image(systemName: symbol).foregroundColor(.secondary).frame(width: 34)
+                Text(view.title)
+                Spacer()
+                Text("\(count)").foregroundColor(.secondary).monospacedDigit()
+                if current == view { Image(systemName: "checkmark") }
+            }
         }
     }
 }
