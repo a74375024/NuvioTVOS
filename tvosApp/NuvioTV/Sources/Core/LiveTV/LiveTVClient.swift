@@ -10,6 +10,15 @@ struct LiveTVChannel: Identifiable, Hashable {
     let number: String?
     let imageURL: URL?
     var isFavorite: Bool
+    /// Categories from the server (Emby tags / M3U group-title), when it has any.
+    var tags: [String] = []
+    var isRadio = false
+    /// Provider group ("US", "UK Sports"…), from tags or the name's prefix.
+    var group: String?
+    /// Name without the group prefix ("US: NBC 4" → "NBC 4").
+    var shortName: String = ""
+
+    var displayName: String { shortName.isEmpty ? name : shortName }
 
     static func == (lhs: LiveTVChannel, rhs: LiveTVChannel) -> Bool { lhs.id == rhs.id }
     func hash(into hasher: inout Hasher) { hasher.combine(id) }
@@ -72,7 +81,7 @@ struct LiveTVClient {
             "EnableImageTypes": "Primary",
             "ImageTypeLimit": "1",
             "EnableUserData": "true",
-            "Fields": "ChannelInfo"
+            "Fields": "ChannelInfo,Tags,Genres"
         ])
         struct Payload: Decodable {
             struct Item: Decodable {
@@ -84,6 +93,9 @@ struct LiveTVClient {
                 let ChannelNumber: String?
                 let ImageTags: Tags?
                 let UserData: UserData?
+                let Tags: LenientNames?
+                let TagItems: LenientNames?
+                let ChannelType: String?
             }
             let Items: [Item]?
         }
@@ -96,7 +108,10 @@ struct LiveTVClient {
                 name: item.Name?.trimmingCharacters(in: .whitespacesAndNewlines).liveNonEmpty ?? "Channel",
                 number: (item.Number ?? item.ChannelNumber)?.trimmingCharacters(in: .whitespaces).liveNonEmpty,
                 imageURL: item.ImageTags?.Primary.flatMap { imageURL(itemID: item.Id, tag: $0) },
-                isFavorite: item.UserData?.IsFavorite ?? false
+                isFavorite: item.UserData?.IsFavorite ?? false,
+                tags: ((item.Tags?.values ?? []) + (item.TagItems?.values ?? []))
+                    .compactMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).liveNonEmpty },
+                isRadio: item.ChannelType?.lowercased() == "radio"
             )
         }
     }
@@ -119,6 +134,42 @@ struct LiveTVClient {
             "ImageTypeLimit": "1",
             "Fields": "Overview"
         ])
+        return try decodePrograms(data)
+    }
+
+    /// Server-side search for upcoming programs by title. Emby and Jellyfin
+    /// differ in which search parameters they honor, so both routes are tried
+    /// and the results filtered to titles that really match.
+    func searchPrograms(_ term: String) async -> [LiveTVProgram] {
+        let iso = ISO8601DateFormatter()
+        iso.formatOptions = [.withInternetDateTime]
+        let now = Date()
+        let routes: [(String, [String: String])] = [
+            ("LiveTv/Programs", [
+                "UserId": userID, "SearchTerm": term, "HasAired": "false",
+                "MaxStartDate": iso.string(from: now.addingTimeInterval(24 * 3600)),
+                "Limit": "60", "SortBy": "StartDate", "EnableTotalRecordCount": "false",
+                "EnableImageTypes": "Primary,Thumb", "ImageTypeLimit": "1", "Fields": "Overview"
+            ]),
+            ("Users/\(userID)/Items", [
+                "SearchTerm": term, "IncludeItemTypes": "Program,LiveTvProgram", "Recursive": "true",
+                "Limit": "60", "EnableTotalRecordCount": "false",
+                "EnableImageTypes": "Primary,Thumb", "ImageTypeLimit": "1", "Fields": "Overview,ChannelInfo"
+            ])
+        ]
+        let needle = term.lowercased()
+        var found: [String: LiveTVProgram] = [:]
+        for (path, query) in routes {
+            guard let data = try? await request(path, query: query),
+                  let list = try? decodePrograms(data) else { continue }
+            for program in list where program.end > now && program.title.lowercased().contains(needle) {
+                found[program.id] = program
+            }
+        }
+        return found.values.sorted { $0.start < $1.start }
+    }
+
+    private func decodePrograms(_ data: Data) throws -> [LiveTVProgram] {
         struct Payload: Decodable {
             struct Item: Decodable {
                 struct Tags: Decodable { let Primary: String?; let Thumb: String? }
@@ -352,6 +403,30 @@ struct LiveTVClient {
         let iso = ISO8601DateFormatter()
         iso.formatOptions = [.withInternetDateTime]
         return iso.date(from: value)
+    }
+}
+
+/// A list of names that may arrive as strings or as `{ "Name": … }` objects
+/// (servers differ); anything else is skipped instead of failing the decode.
+struct LenientNames: Decodable {
+    let values: [String]
+
+    private struct Named: Decodable { let Name: String? }
+
+    init(from decoder: Decoder) throws {
+        var found: [String] = []
+        if var container = try? decoder.unkeyedContainer() {
+            while !container.isAtEnd {
+                if let text = try? container.decode(String.self) {
+                    found.append(text)
+                } else if let named = try? container.decode(Named.self) {
+                    if let name = named.Name { found.append(name) }
+                } else {
+                    break
+                }
+            }
+        }
+        values = found
     }
 }
 

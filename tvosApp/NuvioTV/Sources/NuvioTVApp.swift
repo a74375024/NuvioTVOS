@@ -1199,7 +1199,7 @@ struct ContentView: View {
             try? await Task.sleep(nanoseconds: 1_500_000_000)
             switch ScreenTour.destination {
             case .tab(let tab):
-                if ScreenTour.requested == "live-demo" { LiveTVStore.shared.loadDemo() }
+                if ScreenTour.requested?.hasPrefix("live-demo") == true { LiveTVStore.shared.loadDemo() }
                 selectedTab = tab
             case .details(let id, let type):
                 openDetailsRoot(id: id, type: type)

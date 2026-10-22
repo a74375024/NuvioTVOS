@@ -42,6 +42,8 @@ shots=(
   "05-show-page-shuffle|details:tt0386676:series|20"
   "06-live-tv-empty|live|12"
   "07-live-tv-guide|live-demo|12"
+  "07b-live-tv-search|live-demo-search|14"
+  "07c-live-tv-groups|live-demo-groups|12"
   "08-settings|settings|12"
 )
 

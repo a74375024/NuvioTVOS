@@ -11,27 +11,32 @@ private enum LiveGuideMetrics {
     static let windowMinutes = 180
 }
 
-private enum LiveFilter: String, CaseIterable, Identifiable {
-    case all, favorites, sports, news, movies, kids
+/// Which channels the guide lists.
+enum LiveScope: Equatable {
+    case all
+    case favorites
+    case recent
+    case group(String)
+}
+
+/// Optional genre filter, from the guide's program flags.
+enum LiveGenre: String, CaseIterable, Identifiable {
+    case sports, news, movies, kids
     var id: String { rawValue }
     var title: String {
         switch self {
-        case .all: return L10n.string("live_filter_all", fallback: "All")
-        case .favorites: return L10n.string("live_filter_favorites", fallback: "Favorites")
         case .sports: return L10n.string("live_filter_sports", fallback: "Sports")
         case .news: return L10n.string("live_filter_news", fallback: "News")
         case .movies: return L10n.string("live_filter_movies", fallback: "Movies")
         case .kids: return L10n.string("live_filter_kids", fallback: "Kids")
         }
     }
-    var symbol: String {
+    func matches(_ program: LiveTVProgram) -> Bool {
         switch self {
-        case .all: return "square.grid.2x2"
-        case .favorites: return "star.fill"
-        case .sports: return "sportscourt"
-        case .news: return "newspaper"
-        case .movies: return "film"
-        case .kids: return "teddybear"
+        case .sports: return program.isSports
+        case .news: return program.isNews
+        case .movies: return program.isMovie
+        case .kids: return program.isKids
         }
     }
 }
@@ -47,7 +52,11 @@ struct LiveTVGuideView: View {
     @FocusState private var focusedCell: String?
     @State private var focusedChannel: LiveTVChannel?
     @State private var focusedProgram: LiveTVProgram?
-    @State private var filter: LiveFilter = .all
+    @State private var scope: LiveScope = .all
+    @State private var genre: LiveGenre?
+    @State private var showSearch = false
+    @State private var showGroups = false
+    @State private var showGenres = false
     @State private var now = Date()
 
     private let ticker = Timer.publish(every: 30, on: .main, in: .common).autoconnect()
@@ -84,11 +93,52 @@ struct LiveTVGuideView: View {
         .onAppear {
             now = Date()
             store.loadIfNeeded()
+            // CI screenshot tour only.
+            if ScreenTour.requested == "live-demo-search" {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1) { showSearch = true }
+            } else if ScreenTour.requested == "live-demo-groups" {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1) { showGroups = true }
+            }
         }
         .onReceive(ticker) { date in
             now = date
             store.refreshGuideIfNeeded()
         }
+        .onChange(of: genre) { _, newGenre in
+            // Genre filtering needs guide data for the whole list, not just
+            // the rows on screen.
+            guard newGenre != nil else { return }
+            store.requestGuide(scopedChannels.prefix(1500).map(\.id))
+        }
+        .onChange(of: scope) { _, _ in
+            if genre != nil { store.requestGuide(scopedChannels.prefix(1500).map(\.id)) }
+        }
+        .fullScreenCover(isPresented: $showSearch) {
+            LiveTVSearchView(initialQuery: ScreenTour.requested == "live-demo-search" ? "sports" : "") { channel, lineup in
+                showSearch = false
+                store.watch(channel, lineup: lineup)
+            }
+        }
+        .sheet(isPresented: $showGroups) {
+            LiveTVGroupsView(selected: scopeGroup) { group in
+                scope = group.map(LiveScope.group) ?? .all
+                showGroups = false
+            }
+        }
+        .confirmationDialog(
+            L10n.string("live_genre_title", fallback: "Show channels airing"),
+            isPresented: $showGenres
+        ) {
+            Button(L10n.string("live_genre_any", fallback: "Anything")) { genre = nil }
+            ForEach(LiveGenre.allCases) { option in
+                Button(option.title) { genre = option }
+            }
+        }
+    }
+
+    private var scopeGroup: String? {
+        if case .group(let name) = scope { return name }
+        return nil
     }
 
     // MARK: Status
@@ -128,20 +178,30 @@ struct LiveTVGuideView: View {
 
     private var windowStart: Date { LiveTVStore.windowStart(for: now) }
 
+    private var emptyMessage: String {
+        if genre != nil { return L10n.string("live_filter_empty", fallback: "Nothing on that matches this filter right now.") }
+        switch scope {
+        case .favorites: return L10n.string("live_favorites_empty", fallback: "No favorites yet. Hold Select on a channel and choose Add to Favorites.")
+        case .recent: return L10n.string("live_recent_empty", fallback: "Channels you watch will show up here.")
+        default: return L10n.string("live_filter_empty", fallback: "Nothing on that matches this filter right now.")
+        }
+    }
+
+    /// Channels in the chosen scope, before the genre filter.
+    private var scopedChannels: [LiveTVChannel] {
+        switch scope {
+        case .all: return store.channels.filter { !store.isHidden($0) }
+        case .favorites: return store.channels.filter(\.isFavorite)
+        case .recent: return store.recentChannels
+        case .group(let name): return store.channels.filter { store.groupName(of: $0) == name }
+        }
+    }
+
     private var visibleChannels: [LiveTVChannel] {
-        guard filter != .all else { return store.channels }
-        return store.channels.filter { channel in
-            if filter == .favorites { return channel.isFavorite }
-            let list = store.programs[channel.id] ?? []
-            return list.contains { program in
-                switch filter {
-                case .sports: return program.isSports
-                case .news: return program.isNews
-                case .movies: return program.isMovie
-                case .kids: return program.isKids
-                case .all, .favorites: return true
-                }
-            }
+        let scoped = scopedChannels
+        guard let genre else { return scoped }
+        return scoped.filter { channel in
+            (store.programs[channel.id] ?? []).contains(where: genre.matches)
         }
     }
 
@@ -157,7 +217,7 @@ struct LiveTVGuideView: View {
                 ScrollView(.vertical, showsIndicators: false) {
                     LazyVStack(alignment: .leading, spacing: LiveGuideMetrics.rowSpacing) {
                         if channels.isEmpty {
-                            Text(L10n.string("live_filter_empty", fallback: "Nothing on that matches this filter right now."))
+                            Text(emptyMessage)
                                 .font(.system(size: 24))
                                 .foregroundColor(.white.opacity(0.6))
                                 .padding(.vertical, 40)
@@ -327,12 +387,27 @@ struct LiveTVGuideView: View {
 
     private var filterBar: some View {
         HStack(spacing: 14) {
-            ForEach(LiveFilter.allCases) { option in
-                SourceModeChip(title: option.title, isSelected: filter == option) {
-                    filter = option
+            SourceModeChip(title: L10n.string("live_search", fallback: "Search"), isSelected: false) {
+                showSearch = true
+            }
+            SourceModeChip(title: L10n.string("live_filter_all", fallback: "All"), isSelected: scope == .all) {
+                scope = .all
+            }
+            SourceModeChip(title: L10n.string("live_filter_favorites", fallback: "Favorites"), isSelected: scope == .favorites) {
+                scope = .favorites
+            }
+            SourceModeChip(title: L10n.string("live_filter_recent", fallback: "Recent"), isSelected: scope == .recent) {
+                scope = .recent
+            }
+            if store.groups.count > 1 {
+                SourceModeChip(title: (scopeGroup ?? L10n.string("live_groups", fallback: "Groups")) + " ▾", isSelected: scopeGroup != nil) {
+                    showGroups = true
                 }
             }
-            Spacer()
+            SourceModeChip(title: (genre?.title ?? L10n.string("live_genre", fallback: "Genre")) + " ▾", isSelected: genre != nil) {
+                showGenres = true
+            }
+            Spacer(minLength: 0)
             if !multiview.channels.isEmpty {
                 SourceModeChip(
                     title: L10n.format("live_open_multiview", fallback: "Multiview (%d)", multiview.channels.count),
@@ -437,6 +512,7 @@ struct LiveTVGuideView: View {
             .frame(width: gridWidth, height: LiveGuideMetrics.rowHeight, alignment: .leading)
             .clipped()
         }
+        .onAppear { store.requestGuide([channel.id]) }
     }
 
     private func channelCell(_ channel: LiveTVChannel, isRowFocused: Bool) -> some View {
@@ -449,7 +525,7 @@ struct LiveTVGuideView: View {
                 .minimumScaleFactor(0.6)
             logo(channel, size: 44)
                 .frame(width: 72)
-            Text(channel.name)
+            Text(channel.displayName)
                 .font(.system(size: 20, weight: .bold))
                 .foregroundColor(isRowFocused ? .black : .white)
                 .lineLimit(2)
@@ -476,7 +552,7 @@ struct LiveTVGuideView: View {
         let isNow = program.isOn(at: now)
         let cellWidth = max(4, width - LiveGuideMetrics.cellGap)
         return Button {
-            store.watch(channel)
+            store.watch(channel, lineup: visibleChannels)
         } label: {
             VStack(alignment: .leading, spacing: 4) {
                 if cellWidth >= 110 {
@@ -520,16 +596,27 @@ struct LiveTVGuideView: View {
         .padding(.trailing, LiveGuideMetrics.cellGap)
     }
 
+    private func noGuideText(for channel: LiveTVChannel) -> String {
+        switch store.guideState[channel.id] {
+        case .loading, nil: return L10n.string("live_guide_loading", fallback: "Live · Loading guide…")
+        case .failed: return L10n.string("live_guide_failed", fallback: "Live · Guide didn't load")
+        case .loaded: return L10n.string("live_guide_none", fallback: "Live · No guide info from your server")
+        }
+    }
+
     private func noGuideCell(_ channel: LiveTVChannel, width: CGFloat) -> some View {
         let key = "\(channel.id)#none"
         let isFocused = focusedCell == key
         return Button {
-            store.watch(channel)
+            store.watch(channel, lineup: visibleChannels)
         } label: {
             HStack(spacing: 10) {
                 Circle().fill(Color(red: 1, green: 0.32, blue: 0.32)).frame(width: 9, height: 9)
-                Text(L10n.string("live_no_guide_cell", fallback: "Live · No guide information"))
+                Text(noGuideText(for: channel))
                     .font(.system(size: 20, weight: .semibold))
+                if store.guideState[channel.id] == .loading {
+                    ProgressView().scaleEffect(0.6)
+                }
                 Spacer()
             }
             .foregroundColor(isFocused ? .black : .white.opacity(0.75))
@@ -569,6 +656,18 @@ struct LiveTVGuideView: View {
             } label: {
                 Label(L10n.format("live_open_multiview", fallback: "Multiview (%d)", multiview.channels.count), systemImage: "rectangle.split.2x2.fill")
             }
+        }
+        Button {
+            let group = store.groupName(of: channel)
+            store.setGroup(group, hidden: !store.hiddenGroups.contains(group))
+        } label: {
+            let group = store.groupName(of: channel)
+            Label(
+                store.hiddenGroups.contains(group)
+                    ? L10n.format("live_show_group", fallback: "Show “%@” in All", group)
+                    : L10n.format("live_hide_group", fallback: "Hide “%@” from All", group),
+                systemImage: store.hiddenGroups.contains(group) ? "eye" : "eye.slash"
+            )
         }
         Button {
             store.toggleFavorite(channel)
