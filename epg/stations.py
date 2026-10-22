@@ -8,6 +8,8 @@ import json
 import os
 import re
 import sys
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import zlib
@@ -21,11 +23,11 @@ NETWORKS = [
     ("NBC", ["List of NBC television affiliates (by U.S. state)", "List of NBC television affiliates"]),
     ("FOX", ["List of Fox television affiliates (by U.S. state)", "List of Fox television affiliates"]),
     ("CW", ["List of The CW television affiliates (by U.S. state)", "List of The CW affiliates"]),
-    ("MYNETWORKTV", ["List of MyNetworkTV affiliates"]),
+    ("MYNETWORKTV", ["List of MyNetworkTV affiliates (by U.S. state)", "List of MyNetworkTV affiliates", "List of MyNetworkTV stations"]),
     ("PBS", ["List of PBS member stations"]),
     ("TELEMUNDO", ["List of Telemundo affiliates (by U.S. state)", "List of Telemundo affiliates"]),
     ("UNIVISION", ["List of Univision affiliates", "List of Univision television affiliates"]),
-    ("ION", ["List of Ion Television affiliates"]),
+    ("ION", ["List of Ion Television affiliates", "List of Ion Television affiliates (by U.S. state)", "List of Ion Television stations"]),
 ]
 
 CALL = re.compile(r"\[\[\s*((?:[KW][A-Z]{2,3})(?:-(?:TV|DT|LD|CD|LP))?)\s*(?:\|[^\]]*)?\]\]")
@@ -33,6 +35,18 @@ LINK = re.compile(r"\[\[([^\]|#]+)(?:\|([^\]]+))?\]\]")
 
 
 def wikitext(title):
+    # Wikipedia rate-limits bursts; space requests out and retry a 429.
+    for attempt in range(4):
+        time.sleep(1.5 * (attempt + 1))
+        try:
+            return fetch_wikitext(title)
+        except urllib.error.HTTPError as error:
+            if error.code != 429:
+                raise
+    return fetch_wikitext(title)
+
+
+def fetch_wikitext(title):
     query = urllib.parse.urlencode({"action": "parse", "page": title, "prop": "wikitext",
                                     "format": "json", "redirects": 1})
     request = urllib.request.Request(f"{API}?{query}", headers={"User-Agent": "NuvioTV-guide-builder/1.0 (personal use)"})

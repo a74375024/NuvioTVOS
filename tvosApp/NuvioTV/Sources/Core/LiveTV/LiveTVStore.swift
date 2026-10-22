@@ -361,7 +361,7 @@ final class LiveTVStore: ObservableObject {
         outsideTask = Task { [weak self] in
             let loaded = await OutsideGuide.load(shardIDs: shardIDs, force: force)
             let matches = await Task.detached(priority: .utility) {
-                OutsideGuide.match(snapshot, guide: loaded.channels)
+                OutsideGuide.match(snapshot, guide: loaded.channels, stations: loaded.stations)
             }.value
             guard let self, !Task.isCancelled else { return }
             self.outsideMatches = matches.mapValues { loaded.channels[$0] }

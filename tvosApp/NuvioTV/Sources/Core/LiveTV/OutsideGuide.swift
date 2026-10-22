@@ -58,8 +58,17 @@ enum OutsideGuide {
         let programs: [RawProgram]
     }
 
+    /// A US / Canadian broadcast station from the station directory.
+    struct Station {
+        let callsign: String
+        let network: String
+        let cityTokens: [String]
+        let channelNumber: String
+    }
+
     struct Loaded {
         var channels: [Channel] = []
+        var stations: [Station] = []
         var generated: Date?
         var problems: [String] = []
     }
@@ -80,6 +89,10 @@ enum OutsideGuide {
                 } catch {
                     result.problems.append("\(shard.title): \(error.localizedDescription)")
                 }
+            }
+            if shardIDs.contains("us-locals") || shardIDs.contains("ca"),
+               let data = try? await shardData("stations", force: force) {
+                result.stations = (try? parseStations(data)) ?? []
             }
             return result
         }.value
@@ -143,7 +156,48 @@ enum OutsideGuide {
         return (channels, generated)
     }
 
+    private static func parseStations(_ compressed: Data) throws -> [Station] {
+        let data = try (compressed as NSData).decompressed(using: .zlib) as Data
+        guard let rows = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return [] }
+        return rows.compactMap { row in
+            guard let sign = row["c"] as? String, let network = row["net"] as? String else { return nil }
+            let city = (row["city"] as? String ?? "").lowercased()
+            let tokens = city.split(whereSeparator: { !($0.isLetter || $0.isNumber) }).map(String.init)
+                .filter { $0 != "city" && $0 != "the" }
+            guard !tokens.isEmpty else { return nil }
+            return Station(callsign: sign, network: network, cityTokens: tokens, channelNumber: row["ch"] as? String ?? "")
+        }
+    }
+
     // MARK: Matching
+
+    /// Network words as they show up in IPTV channel names.
+    private static let networkWords: [String: String] = [
+        "abc": "ABC", "cbs": "CBS", "nbc": "NBC", "fox": "FOX", "cw": "CW",
+        "mynetworktv": "MYNETWORKTV", "mytv": "MYNETWORKTV", "pbs": "PBS",
+        "telemundo": "TELEMUNDO", "univision": "UNIVISION", "ion": "ION"
+    ]
+
+    /// "NBC 5 Chicago" → WMAQ: a network word plus the station's city in the
+    /// name (the channel number breaks ties).
+    static func stationCallsign(for name: String, stations: [String: [Station]]) -> String? {
+        let lowered = name.lowercased()
+            .replacingOccurrences(of: "^\\s*[^:|]{1,24}[:|]\\s*", with: "", options: .regularExpression)
+        let tokens = lowered.split(whereSeparator: { !($0.isLetter || $0.isNumber) }).map(String.init)
+        // "NBC Sports Chicago" / "CBS News Chicago" are their own channels.
+        guard !tokens.contains(where: { ["sports", "news", "network", "plus"].contains($0) }),
+              let network = tokens.lazy.compactMap({ networkWords[$0] }).first,
+              let candidates = stations[network] else { return nil }
+        let words = Set(tokens)
+        let numbers = Set(tokens.filter { $0.allSatisfy(\.isNumber) })
+        var best: (sign: String, score: Int)?
+        for station in candidates where station.cityTokens.allSatisfy(words.contains) {
+            var score = station.cityTokens.count * 10
+            if !station.channelNumber.isEmpty, numbers.contains(station.channelNumber) { score += 5 }
+            if best == nil || score > best!.score { best = (station.callsign, score) }
+        }
+        return best?.sign
+    }
 
     private static let callPattern = try? NSRegularExpression(
         pattern: "(?<![A-Z0-9])([KW][A-Z]{2,3})(?:[- ]?(DT|TV|LD|LP|CD|CA|HD)(\\d)?)?(?![A-Z])"
@@ -194,7 +248,8 @@ enum OutsideGuide {
     }
 
     /// Server channel id → index into `guide`, for every channel that matches.
-    static func match(_ channels: [LiveTVChannel], guide: [Channel]) -> [String: Int] {
+    static func match(_ channels: [LiveTVChannel], guide: [Channel], stations: [Station] = []) -> [String: Int] {
+        let stationsByNetwork = Dictionary(grouping: stations, by: \.network)
         var bySign: [String: [Int]] = [:]
         var byName: [String: [Int]] = [:]
         for (index, channel) in guide.enumerated() {
@@ -214,6 +269,10 @@ enum OutsideGuide {
             var found: Int?
             for sign in callsigns(in: channel.name, strongContext: isLocal) {
                 if let hit = best(bySign[sign]) { found = hit; break }
+            }
+            if found == nil, !stationsByNetwork.isEmpty,
+               let sign = stationCallsign(for: channel.name, stations: stationsByNetwork) {
+                found = best(bySign[sign])
             }
             if found == nil {
                 for text in [channel.displayName, channel.name] {
