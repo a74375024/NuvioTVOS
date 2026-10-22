@@ -15382,17 +15382,22 @@ private extension View {
 
 /// Makes a sheet's system plate transparent so liquid-glass content can frost
 /// over the presenter (Settings). No-op on older OS versions.
+///
+/// Also clears the Settings entry lock: sheets inherit the presenter's
+/// environment, and if the lock is on while a sheet is up every
+/// `.entryLockable()` row inside it (the text fields) is disabled, leaving
+/// only the dialog buttons focusable — focus gets stuck on Cancel.
 private struct ClearPresentationBackgroundIfAvailable: ViewModifier {
     @ViewBuilder
     func body(content: Content) -> some View {
         #if os(iOS)
         if #available(iOS 16.4, *) {
-            content.presentationBackground(.clear)
+            content.presentationBackground(.clear).settingsEntryAnchor()
         } else {
-            content
+            content.settingsEntryAnchor()
         }
         #else
-        content
+        content.settingsEntryAnchor()
         #endif
     }
 }
@@ -15595,6 +15600,7 @@ private struct XtreamAccountEditSheet: View {
                 .padding(40)
             }
         }
+        .settingsEntryAnchor()
     }
 
     private var canSave: Bool {
