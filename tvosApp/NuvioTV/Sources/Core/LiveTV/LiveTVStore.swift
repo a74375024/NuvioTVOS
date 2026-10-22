@@ -109,6 +109,7 @@ final class LiveTVStore: ObservableObject {
     /// Outside listings for each server channel that has any.
     private var outsideMatches: [String: [OutsideGuide.RawProgram]] = [:]
     private var outsideBuiltAt: Date?
+    private var outsideNotes: [String: String] = [:]
     private var outsideTask: Task<Void, Never>?
     private var guideWindowByChannel: [String: Date] = [:]
     private var pendingGuide: [String] = []
@@ -364,6 +365,7 @@ final class LiveTVStore: ObservableObject {
         let saved = OutsideGuide.loadSaved(signature: signature)
         if let saved, Set(saved.shards) == shardIDs {
             outsideMatches = saved.programs
+            outsideNotes = saved.notes ?? [:]
             outsideBuiltAt = saved.built
             outsideStatus = .ready(matched: saved.programs.count, total: snapshot.count, updated: saved.built)
             rebuildOutsidePrograms()
@@ -389,10 +391,12 @@ final class LiveTVStore: ObservableObject {
             }
             let now = Date()
             OutsideGuide.save(
-                OutsideGuide.Saved(built: now, shards: Array(shardIDs), channelCount: snapshot.count, programs: built.programs),
+                OutsideGuide.Saved(built: now, shards: Array(shardIDs), channelCount: snapshot.count,
+                                   programs: built.programs, notes: built.notes),
                 signature: signature
             )
             self.outsideMatches = built.programs
+            self.outsideNotes = built.notes
             self.outsideBuiltAt = now
             self.outsideStatus = .ready(matched: built.programs.count, total: snapshot.count, updated: now)
             self.rebuildOutsidePrograms()
@@ -438,6 +442,71 @@ final class LiveTVStore: ObservableObject {
             if !clashes { result.append(program) }
         }
         return result.sorted { $0.start < $1.start }
+    }
+
+    // MARK: Channel report
+
+    /// Fetches the server guide for every channel (for the report), waiting
+    /// up to `timeout` for it to finish. `progress` gets "checked / total".
+    func checkAllGuides(timeout: TimeInterval = 240, progress: @escaping (Int, Int) -> Void) async {
+        requestGuide(channels.map(\.id))
+        let started = Date()
+        while Date().timeIntervalSince(started) < timeout {
+            let done = channels.reduce(0) { $0 + (guideState[$1.id] == .loaded || guideState[$1.id] == .failed ? 1 : 0) }
+            progress(done, channels.count)
+            if pendingGuide.isEmpty, activeGuideFetches == 0 { break }
+            try? await Task.sleep(nanoseconds: 700_000_000)
+        }
+    }
+
+    /// One row per channel: what it is, what the server's guide has, and
+    /// how outside listings matched (or didn't). No stream links or tokens.
+    func channelReportCSV() -> String {
+        func cell(_ value: String?) -> String {
+            let text = (value ?? "").replacingOccurrences(of: "\"", with: "\"\"")
+            return "\"\(text)\""
+        }
+        let now = Date()
+        let start = Self.windowStart()
+        let end = start.addingTimeInterval(Self.guideHours * 3600)
+        var stationsByNetwork: [String: [OutsideGuide.Station]] = [:]
+        if let data = try? Data(contentsOf: FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("OutsideGuide/stations.json")),
+           let stations = try? JSONDecoder().decode([OutsideGuide.Station].self, from: data) {
+            stationsByNetwork = Dictionary(grouping: stations, by: \.network)
+        }
+        var lines = [[
+            "number", "name", "group", "tags", "hidden_group", "favorite",
+            "callsign_in_name", "station_lookup", "match_key",
+            "server_guide", "server_programs_next_3h", "outside_listing", "outside_programs_next_3h",
+            "now_title", "now_source"
+        ].joined(separator: ",")]
+        for channel in channels {
+            let isLocal = (channel.group ?? "").lowercased().contains("local")
+            let signs = OutsideGuide.callsigns(in: channel.name, strongContext: isLocal)
+            let station = signs.isEmpty ? OutsideGuide.stationCallsign(for: channel.name, stations: stationsByNetwork) : nil
+            let serverList = serverPrograms[channel.id] ?? []
+            let serverCount = serverList.filter { $0.end > start && $0.start < end }.count
+            let outsideCount = (outsideListing(for: channel.id) ?? []).filter { $0.end > start && $0.start < end }.count
+            let serverState: String
+            switch guideState[channel.id] {
+            case .loaded: serverState = serverList.isEmpty ? "none" : "yes"
+            case .failed: serverState = "failed"
+            case .loading: serverState = "loading"
+            case nil: serverState = "not checked"
+            }
+            let current = self.current(on: channel.id, at: now)
+            lines.append([
+                cell(number(of: channel)), cell(channel.name), cell(channel.group ?? ""),
+                cell(channel.tags.joined(separator: " | ")), cell(isHidden(channel) ? "yes" : ""),
+                cell(channel.isFavorite ? "yes" : ""), cell(signs.joined(separator: " ")), cell(station ?? ""),
+                cell(OutsideGuide.normalize(channel.displayName)), cell(serverState), cell(String(serverCount)),
+                cell(outsideNotes[channel.id] ?? (outsideMatches[channel.id] == nil ? "no match" : "matched")),
+                cell(String(outsideCount)), cell(current?.title ?? ""),
+                cell(current.map { $0.fromOutsideGuide ? "outside" : "server" } ?? "")
+            ].joined(separator: ","))
+        }
+        return lines.joined(separator: "\n") + "\n"
     }
 
     // MARK: Guide helpers

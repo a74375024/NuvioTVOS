@@ -95,6 +95,8 @@ enum OutsideGuide {
         var shards: [String]
         var channelCount: Int
         var programs: [String: [RawProgram]]
+        /// How each channel was matched ("US locals: WNBC-DT, by call sign WNBC").
+        var notes: [String: String]?
     }
 
     // MARK: Cache
@@ -137,7 +139,7 @@ enum OutsideGuide {
         for channels: [LiveTVChannel],
         shards: Set<String>,
         progress: @escaping @Sendable (String) -> Void
-    ) async -> (programs: [String: [RawProgram]], problems: [String]) {
+    ) async -> (programs: [String: [RawProgram]], problems: [String], notes: [String: String]) {
         let targets = await Task.detached(priority: .background) { () -> Targets in
             progress("Getting the station directory…")
             let stations = shards.contains("us-locals") || shards.contains("ca")
@@ -146,6 +148,7 @@ enum OutsideGuide {
         }.value
 
         var merged: [String: [RawProgram]] = [:]
+        var notes: [String: String] = [:]
         var problems: [String] = []
         let now = Int(Date().timeIntervalSince1970 / 60)
         let window = (low: now - 180, high: now + Int(keepHours * 60))
@@ -155,14 +158,16 @@ enum OutsideGuide {
             progress("Updating listings: \(source.name) (\(index + 1) of \(chosen.count))…")
             do {
                 let found = try await XMLTVReader.read(source: source, targets: targets, window: window)
-                for (channelID, programs) in found {
-                    merged[channelID] = mergePrograms(merged[channelID] ?? [], programs)
+                for (channelID, entry) in found {
+                    merged[channelID] = mergePrograms(merged[channelID] ?? [], entry.programs)
+                    let note = "\(source.name): \(entry.note)"
+                    notes[channelID] = notes[channelID].map { "\($0); \(note)" } ?? note
                 }
             } catch {
                 problems.append("\(source.name): \(error.localizedDescription)")
             }
         }
-        return (merged, problems)
+        return (merged, problems, notes)
     }
 
     /// Adds `extra` programs that don't overlap `base` by more than 5 minutes.
@@ -233,15 +238,15 @@ enum OutsideGuide {
 
         /// The user's channels a guide channel stands for. Call signs win over
         /// names, since a call sign can't be ambiguous.
-        func matches(names: [String], xmltvID: String, locals: Bool) -> [String] {
-            var found: [String] = []
+        func matches(names: [String], xmltvID: String, locals: Bool) -> [(id: String, how: String)] {
+            var found: [(id: String, how: String)] = []
             for sign in OutsideGuide.callsigns(in: (names + [xmltvID]).joined(separator: " | "), strongContext: locals) {
-                found += bySign[sign] ?? []
+                found += (bySign[sign] ?? []).map { ($0, "by call sign \(sign)") }
             }
             if !found.isEmpty { return found }
             for name in names {
                 let key = OutsideGuide.normalize(name)
-                if key.count >= 2 { found += byName[key] ?? [] }
+                if key.count >= 2 { found += (byName[key] ?? []).map { ($0, "by name") } }
             }
             return found
         }

@@ -222,6 +222,7 @@ struct LiveTVGroupsView: View {
 /// matched to channels the server has no (or a thin) guide for.
 struct LiveTVGuideSourcesView: View {
     @ObservedObject private var store = LiveTVStore.shared
+    @State private var showReport = false
     @State private var enabled = OutsideGuide.isEnabled
     @State private var shards = OutsideGuide.enabledShards
 
@@ -269,6 +270,9 @@ struct LiveTVGuideSourcesView: View {
                         Button(L10n.string("live_outside_refresh", fallback: "Refresh listings now")) {
                             store.loadOutsideGuide(force: true)
                         }
+                        Button(L10n.string("live_report_open", fallback: "Export channel report…")) {
+                            showReport = true
+                        }
                     } footer: {
                         Text(L10n.string("live_outside_footer", fallback: "Your Apple TV downloads free public guides (epgshare01, i.mjh.nz) about once a day while Nuvio is open, keeps only your channels, merges duplicates across sources and saves the result. Channels are matched by call sign (like WNBC), by network and city (\"NBC 5 Chicago\"), or by name. Your server's own guide is used whenever it covers more."))
                             .font(.system(size: 20))
@@ -276,6 +280,9 @@ struct LiveTVGuideSourcesView: View {
                 }
             }
             .navigationTitle(L10n.string("live_guide_sources", fallback: "Guide Listings"))
+        }
+        .fullScreenCover(isPresented: $showReport) {
+            LiveTVExportView()
         }
     }
 
@@ -298,5 +305,117 @@ struct LiveTVGuideSourcesView: View {
             }
             return text
         }
+    }
+}
+
+/// Exports the channel report as a CSV over the local network (QR code +
+/// address), for diagnosing guide matching on another device.
+@MainActor
+final class LiveTVExportModel: ObservableObject {
+    @Published var message = ""
+    @Published var url: URL?
+    @Published var qrImage: UIImage?
+    @Published var working = false
+    private let server = PlaybackDiagnosticExportServer()
+
+    func start() {
+        guard !working else { return }
+        working = true
+        url = nil
+        qrImage = nil
+        message = L10n.string("live_report_checking", fallback: "Checking your server's guide for every channel…")
+        Task {
+            await LiveTVStore.shared.checkAllGuides { [weak self] done, total in
+                self?.message = L10n.format("live_report_progress", fallback: "Checking guides: %d of %d channels…", done, total)
+            }
+            let csv = LiveTVStore.shared.channelReportCSV()
+            message = L10n.string("live_report_starting", fallback: "Starting the download link…")
+            server.start(
+                report: Data(csv.utf8),
+                contentType: "text/csv; charset=utf-8",
+                filename: "nuvio-live-tv-channels.csv",
+                maximumBytes: 16 * 1024 * 1024,
+                lifetime: 600
+            ) { [weak self] state in
+                Task { @MainActor in
+                    guard let self else { return }
+                    switch state {
+                    case .ready(let url):
+                        self.url = url
+                        self.qrImage = QRCode.image(from: url.absoluteString)
+                        self.message = L10n.string("live_report_ready", fallback: "Open this address on a phone or computer on the same Wi-Fi to download the report. The link stops working after 10 minutes.")
+                        self.working = false
+                    case .failed:
+                        self.message = L10n.string("live_report_failed", fallback: "Couldn't start the download link. Make sure the Apple TV is on Wi-Fi or Ethernet and allowed to use the local network.")
+                        self.working = false
+                    case .stopped:
+                        self.url = nil
+                        self.qrImage = nil
+                        self.working = false
+                    case .starting:
+                        break
+                    }
+                }
+            }
+        }
+    }
+
+    func stop() {
+        server.stop()
+        url = nil
+        qrImage = nil
+    }
+}
+
+struct LiveTVExportView: View {
+    @StateObject private var model = LiveTVExportModel()
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 28) {
+            Text(L10n.string("live_report_title", fallback: "Channel Report"))
+                .font(.largeTitle.bold())
+            Text(L10n.string("live_report_detail", fallback: "A spreadsheet (CSV) of every Live TV channel: number, name, group, the call sign or station detected, whether your server has guide data, which outside listing matched and how, and what's on now. Stream links, passwords and tokens are not included."))
+                .font(.system(size: 23))
+                .foregroundStyle(.secondary)
+            if !model.message.isEmpty {
+                HStack(spacing: 14) {
+                    if model.working { ProgressView() }
+                    Text(model.message).font(.system(size: 24))
+                }
+            }
+            if let url = model.url {
+                HStack(spacing: 36) {
+                    if let image = model.qrImage {
+                        Image(uiImage: image)
+                            .interpolation(.none).resizable().scaledToFit()
+                            .frame(width: 260, height: 260).padding(12).background(.white)
+                    }
+                    VStack(alignment: .leading, spacing: 16) {
+                        Text(url.absoluteString).font(.system(size: 22, design: .monospaced))
+                        Button(L10n.string("live_report_stop", fallback: "Stop Sharing")) { model.stop() }
+                    }
+                }
+            }
+            HStack(spacing: 24) {
+                if model.url == nil {
+                    Button(model.working
+                           ? L10n.string("live_report_working", fallback: "Preparing…")
+                           : L10n.string("live_report_create", fallback: "Create Report")) {
+                        model.start()
+                    }
+                    .disabled(model.working)
+                }
+                Button(L10n.string("live_report_done", fallback: "Done")) {
+                    model.stop()
+                    dismiss()
+                }
+            }
+            Spacer()
+        }
+        .padding(80)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(Color.black.ignoresSafeArea())
+        .onDisappear { model.stop() }
     }
 }

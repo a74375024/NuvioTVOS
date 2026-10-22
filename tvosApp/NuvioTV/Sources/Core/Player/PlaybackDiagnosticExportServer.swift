@@ -12,19 +12,26 @@ final class PlaybackDiagnosticExportServer: @unchecked Sendable {
     private var expiry: DispatchWorkItem?
     private var callback: (@Sendable (State) -> Void)?
 
-    func start(report: Data, changed: @escaping @Sendable (State) -> Void) {
+    func start(
+        report: Data,
+        contentType: String = "application/json",
+        filename: String = "nuvio-diagnostics.json",
+        maximumBytes: Int = PlaybackDiagnosticTimeline.maximumBytes,
+        lifetime: TimeInterval = 300,
+        changed: @escaping @Sendable (State) -> Void
+    ) {
         queue.async {
             self.stopOnQueue()
             self.callback = changed
             changed(.starting)
-            guard report.count <= PlaybackDiagnosticTimeline.maximumBytes,
+            guard report.count <= maximumBytes,
                   let host = Self.localIPv4Address() else {
                 changed(.failed)
                 return
             }
             let current = UUID()
             self.generation = current
-            let path = "/\(UUID().uuidString)/report.json"
+            let path = "/\(UUID().uuidString)/\(filename)"
             do {
                 let parameters = NWParameters.tcp
                 parameters.requiredLocalEndpoint = .hostPort(host: NWEndpoint.Host(host), port: .any)
@@ -56,8 +63,9 @@ final class PlaybackDiagnosticExportServer: @unchecked Sendable {
                     let id = UUID()
                     server.connections[id] = connection
                     connection.start(queue: server.queue)
-                    server.receive(connection, id: id, path: path, report: report, buffered: Data())
-                    server.queue.asyncAfter(deadline: .now() + 10) { [weak server] in server?.finish(id) }
+                    server.receive(connection, id: id, path: path, report: report, buffered: Data(),
+                                   contentType: contentType, filename: filename)
+                    server.queue.asyncAfter(deadline: .now() + 30) { [weak server] in server?.finish(id) }
                 }
                 let expiry = DispatchWorkItem { [weak server = self] in
                     guard let server, server.generation == current else { return }
@@ -65,7 +73,7 @@ final class PlaybackDiagnosticExportServer: @unchecked Sendable {
                     changed(.stopped)
                 }
                 self.expiry = expiry
-                self.queue.asyncAfter(deadline: .now() + 300, execute: expiry)
+                self.queue.asyncAfter(deadline: .now() + lifetime, execute: expiry)
                 listener.start(queue: self.queue)
             } catch {
                 self.stopOnQueue()
@@ -97,7 +105,8 @@ final class PlaybackDiagnosticExportServer: @unchecked Sendable {
         connections.removeValue(forKey: id)?.cancel()
     }
 
-    private func receive(_ connection: NWConnection, id: UUID, path: String, report: Data, buffered: Data) {
+    private func receive(_ connection: NWConnection, id: UUID, path: String, report: Data, buffered: Data,
+                         contentType: String, filename: String) {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 2048) { [weak self] data, _, complete, error in
             guard let self, self.connections[id] != nil else { return }
             var request = buffered
@@ -105,13 +114,14 @@ final class PlaybackDiagnosticExportServer: @unchecked Sendable {
             guard request.count <= 8192, error == nil else { self.finish(id); return }
             guard request.range(of: Data("\r\n\r\n".utf8)) != nil else {
                 if complete { self.finish(id) }
-                else { self.receive(connection, id: id, path: path, report: report, buffered: request) }
+                else { self.receive(connection, id: id, path: path, report: report, buffered: request,
+                                    contentType: contentType, filename: filename) }
                 return
             }
             let allowed = Self.accepts(request, path: path)
             let body = allowed ? report : Data()
             let status = allowed ? "200 OK" : "404 Not Found"
-            let headers = "HTTP/1.1 \(status)\r\nContent-Type: application/json\r\nContent-Length: \(body.count)\r\nContent-Disposition: attachment; filename=\"nuvio-diagnostics.json\"\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n"
+            let headers = "HTTP/1.1 \(status)\r\nContent-Type: \(contentType)\r\nContent-Length: \(body.count)\r\nContent-Disposition: attachment; filename=\"\(filename)\"\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n"
             var response = Data(headers.utf8)
             response.append(body)
             connection.send(content: response, completion: .contentProcessed { [weak self] _ in self?.finish(id) })

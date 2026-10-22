@@ -120,7 +120,8 @@ final class XMLTVReader: NSObject, XMLParserDelegate {
 
     private var channelNames: [String: [String]] = [:]
     private var currentChannel: String?
-    private var keep: [String: [String]]?          // xmltv id → user channel ids
+    private var keep: [String: [(id: String, how: String)]]?   // xmltv id → user channels
+    private var keepNames: [String: String] = [:]
     private var found: [String: [OutsideGuide.RawProgram]] = [:]   // xmltv id → programmes
 
     private var programmeChannel: String?
@@ -146,7 +147,7 @@ final class XMLTVReader: NSObject, XMLParserDelegate {
         source: OutsideGuide.Source,
         targets: OutsideGuide.Targets,
         window: (low: Int, high: Int)
-    ) async throws -> [String: [OutsideGuide.RawProgram]] {
+    ) async throws -> [String: (programs: [OutsideGuide.RawProgram], note: String)] {
         let compressed = try await GuideFiles.download(source.url)
         return try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .background).async {
@@ -171,14 +172,14 @@ final class XMLTVReader: NSObject, XMLParserDelegate {
         }
     }
 
-    private func result() -> [String: [OutsideGuide.RawProgram]] {
-        var byUser: [String: [OutsideGuide.RawProgram]] = [:]
+    private func result() -> [String: (programs: [OutsideGuide.RawProgram], note: String)] {
+        var byUser: [String: (programs: [OutsideGuide.RawProgram], note: String)] = [:]
         // A user channel matching several guide channels in one source takes
         // the one with the most listings.
-        for (xmltvID, userIDs) in keep ?? [:] {
+        for (xmltvID, users) in keep ?? [:] {
             guard let programs = found[xmltvID], !programs.isEmpty else { continue }
-            for userID in userIDs where programs.count > (byUser[userID]?.count ?? 0) {
-                byUser[userID] = programs
+            for user in users where programs.count > (byUser[user.id]?.programs.count ?? 0) {
+                byUser[user.id] = (programs, "\(keepNames[xmltvID] ?? xmltvID) (\(user.how))")
             }
         }
         return byUser
@@ -187,10 +188,13 @@ final class XMLTVReader: NSObject, XMLParserDelegate {
     // Channels come first in XMLTV; the keep list is settled at the first programme.
     private func settleKeepList() {
         guard keep == nil else { return }
-        var list: [String: [String]] = [:]
+        var list: [String: [(id: String, how: String)]] = [:]
         for (id, names) in channelNames {
             let matches = targets.matches(names: names, xmltvID: id, locals: locals)
-            if !matches.isEmpty { list[id] = matches }
+            if !matches.isEmpty {
+                list[id] = matches
+                keepNames[id] = names.first ?? id
+            }
         }
         keep = list
         channelNames = [:]
