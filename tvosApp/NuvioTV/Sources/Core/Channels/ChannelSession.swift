@@ -74,6 +74,7 @@ final class ChannelSessionStore: ObservableObject {
     private var prefetched: (item: ChannelItem, stream: PreparedNextStream, at: Date)?
     private var currentItem: ChannelItem?
 
+    nonisolated static let catalogSourceURL = "https://v3-cinemeta.strem.io/manifest.json"
     private static let poolLifetime: TimeInterval = 12 * 60 * 60
     private static let maxAttempts = 4
     private static let resolveTimeout: UInt64 = 25
@@ -86,7 +87,8 @@ final class ChannelSessionStore: ObservableObject {
         let todays = ChannelLineup.available()
         channels = todays
         let ids = todays.map(\.id)
-        let fresh = poolsBuiltAt.map { Date().timeIntervalSince($0) < Self.poolLifetime } ?? false
+        let hasAnyPool = pools.values.contains { !$0.isEmpty }
+        let fresh = hasAnyPool && (poolsBuiltAt.map { Date().timeIntervalSince($0) < Self.poolLifetime } ?? false)
         if fresh, ids == poolsBuiltForChannels {
             fillMissingPreviews()
             return
@@ -126,8 +128,12 @@ final class ChannelSessionStore: ObservableObject {
                 group.addTask { [repository] in
                     var items: [NuvioMeta] = []
                     for (catalog, skip) in [("top", 0), ("top", 100), ("imdbRating", 0)] {
+                        // Cinemeta's public catalogs are read directly as a title
+                        // source, even when Cinemeta is turned off in Settings
+                        // (then a nil add-on id routes to the user's other add-ons,
+                        // which don't have these genre catalogs).
                         let page = try? await repository.browseCatalog(
-                            addonId: nil,
+                            addonId: ChannelSessionStore.catalogSourceURL,
                             contentType: query.type,
                             catalogId: catalog,
                             skip: skip,
