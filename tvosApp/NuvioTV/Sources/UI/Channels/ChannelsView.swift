@@ -1,231 +1,495 @@
 import SwiftUI
+import AetherEngine
 
-private enum ChannelGuideMetrics {
-    static let pageInset: CGFloat = 49
-    static let rowHeight: CGFloat = 150
-    static let thumbWidth: CGFloat = 230
+private enum GuideMetrics {
+    static let sideInset: CGFloat = 60
+    static let channelColumn: CGFloat = 300
+    static let rowHeight: CGFloat = 112
+    static let rowSpacing: CGFloat = 10
+    static let cellGap: CGFloat = 8
+    static let minCellWidth: CGFloat = 150
+    static let heroHeight: CGFloat = 420
+    static let previewWidth: CGFloat = 640
 }
 
-/// The Channels guide: each ready-made channel with what it starts with.
+// MARK: - Live preview
+
+/// Plays a muted preview of the focused program after a short pause on it,
+/// like a cable box's picture-in-guide. The stream it finds is reused when
+/// the program is chosen, so tuning in is quick.
+@MainActor
+final class ChannelPreviewController: ObservableObject {
+    @Published private(set) var tile: MultiviewTile?
+    @Published private(set) var itemID: String?
+    @Published private(set) var isLoading = false
+    private var task: Task<Void, Never>?
+
+    func focus(_ item: ChannelItem?) {
+        guard item?.id != itemID else { return }
+        stop()
+        itemID = item?.id
+        guard let item else { return }
+        task = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 1_200_000_000)
+            guard let self, !Task.isCancelled, self.itemID == item.id,
+                  !ChannelSessionStore.shared.isActive else { return }
+            self.isLoading = true
+            let stream = await ChannelSessionStore.shared.preparedStream(for: item)
+            guard !Task.isCancelled, self.itemID == item.id,
+                  !ChannelSessionStore.shared.isActive, let stream else {
+                self.isLoading = false
+                return
+            }
+            let tile = MultiviewTile(channel: MultiviewChannel(
+                id: item.id,
+                title: item.title,
+                subtitle: item.detailLine,
+                url: stream.url,
+                httpHeaders: stream.httpHeaders,
+                artworkURL: nil
+            ))
+            tile.setAudible(false)
+            tile.start(tag: "guide-preview", role: .primary)
+            self.tile = tile
+            self.isLoading = false
+        }
+    }
+
+    func stop() {
+        task?.cancel()
+        task = nil
+        tile?.stop()
+        tile = nil
+        isLoading = false
+        itemID = nil
+    }
+}
+
+// MARK: - Guide
+
+/// Cable-style Channels guide: preview pane on top, a numbered channel grid
+/// with a time ruler below. Programs are sized by running time; everything
+/// starts from the beginning when chosen.
 struct ChannelsView: View {
     @ObservedObject private var store = ChannelSessionStore.shared
+    @StateObject private var preview = ChannelPreviewController()
     @AppStorage(SettingsKey.amoled) private var amoled = false
     @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
-    @FocusState private var focusedChannel: String?
+    @FocusState private var focusedCell: String?
+    @State private var focusedItem: ChannelItem?
+    @State private var focusedChannelID: String?
+    @State private var guideStart = Date()
 
     var body: some View {
-        ZStack(alignment: .top) {
-            Color.nuvioBackground(amoled: amoled, body: bodyColor).ignoresSafeArea()
+        GeometryReader { proxy in
+            let gridWidth = max(600, proxy.size.width - GuideMetrics.sideInset * 2 - GuideMetrics.channelColumn)
+            let pointsPerMinute = gridWidth / CGFloat(ChannelSessionStore.guideWindowMinutes)
+            ZStack(alignment: .top) {
+                Color.nuvioBackground(amoled: amoled, body: bodyColor).ignoresSafeArea()
+                heroBackdrop
 
-            ScrollView(.vertical, showsIndicators: false) {
-                VStack(alignment: .leading, spacing: 18) {
-                    header
-                    ForEach(store.channels) { channel in
-                        ChannelGuideRow(
-                            channel: channel,
-                            preview: store.previews[channel.id],
-                            isUnavailable: store.unavailable.contains(channel.id),
-                            isLoading: store.isLoadingLineup,
-                            isFocused: focusedChannel == channel.id
-                        ) {
-                            store.tune(channel.id)
+                VStack(alignment: .leading, spacing: 0) {
+                    hero
+                        .frame(height: GuideMetrics.heroHeight)
+                    timeRuler(gridWidth: gridWidth, pointsPerMinute: pointsPerMinute)
+                        .padding(.bottom, 10)
+                    ScrollView(.vertical, showsIndicators: false) {
+                        LazyVStack(alignment: .leading, spacing: GuideMetrics.rowSpacing) {
+                            ForEach(store.channels) { channel in
+                                guideRow(channel, gridWidth: gridWidth, pointsPerMinute: pointsPerMinute)
+                            }
                         }
-                        .focused($focusedChannel, equals: channel.id)
+                        .padding(.bottom, 60)
                     }
-                    footnote
+                    .focusSection()
                 }
-                .padding(.horizontal, ChannelGuideMetrics.pageInset)
-                .padding(.top, 20)
-                .padding(.bottom, 80)
+                .padding(.horizontal, GuideMetrics.sideInset)
             }
         }
-        .onAppear { store.loadLineupIfNeeded() }
+        .onAppear {
+            guideStart = Date()
+            store.loadLineupIfNeeded()
+        }
+        .onDisappear { preview.stop() }
+        .onChange(of: store.isActive) { _, active in
+            if active { preview.stop() } else { guideStart = Date() }
+        }
+        .onChange(of: focusedCell) { _, cell in
+            if cell == nil { preview.stop() }
+        }
     }
 
-    private var header: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(alignment: .firstTextBaseline, spacing: 20) {
-                Text(L10n.string("channels_title", fallback: "Channels"))
-                    .font(.system(size: 46, weight: .bold))
+    // MARK: Hero / preview pane
+
+    private var heroItem: ChannelItem? {
+        focusedItem ?? store.channels.lazy.compactMap { store.lineups[$0.id]?.first }.first
+    }
+
+    private var heroChannel: ChannelDefinition? {
+        let id = focusedChannelID ?? heroItem?.channelID
+        return store.channels.first { $0.id == id }
+    }
+
+    @ViewBuilder
+    private var heroBackdrop: some View {
+        if let url = heroItem?.backdropURL {
+            CachedPosterArtwork(urlString: url, width: 1920, height: 1080, maximumWidth: 1920) { Color.clear }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .clipped()
+                .opacity(0.22)
+                .mask(LinearGradient(colors: [.black, .black.opacity(0.4), .clear], startPoint: .top, endPoint: .center))
+                .ignoresSafeArea()
+                .allowsHitTesting(false)
+                .animation(.easeInOut(duration: 0.4), value: heroItem?.id)
+        }
+    }
+
+    private var hero: some View {
+        HStack(alignment: .top, spacing: 50) {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 14) {
+                    Text(L10n.string("channels_title", fallback: "Channels"))
+                        .font(.system(size: 26, weight: .bold))
+                        .foregroundColor(.white.opacity(0.55))
+                    if store.isLoadingLineup {
+                        ProgressView().tint(.white).scaleEffect(0.7)
+                    }
+                }
+
+                if let channel = heroChannel {
+                    HStack(spacing: 12) {
+                        Text(String(store.number(of: channel.id)))
+                            .font(.system(size: 24, weight: .heavy).monospacedDigit())
+                            .foregroundColor(.black)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 3)
+                            .background(RoundedRectangle(cornerRadius: 6).fill(Color.white))
+                        Image(systemName: channel.symbol)
+                            .font(.system(size: 24, weight: .semibold))
+                        Text(channel.name)
+                            .font(.system(size: 26, weight: .semibold))
+                    }
                     .foregroundColor(.white)
-                if store.isLoadingLineup {
-                    ProgressView().tint(.white)
-                    Text(L10n.string("channels_loading", fallback: "Building today's lineup…"))
-                        .font(.system(size: 22))
+                }
+
+                if let item = heroItem {
+                    Text(item.title)
+                        .font(.system(size: 54, weight: .bold))
+                        .foregroundColor(.white)
+                        .lineLimit(1)
+                    Text(item.detailLine)
+                        .font(.system(size: 28, weight: .semibold))
+                        .foregroundColor(.white.opacity(0.85))
+                        .lineLimit(1)
+                    Text(timingLine(for: item))
+                        .font(.system(size: 22, weight: .medium))
                         .foregroundColor(.white.opacity(0.6))
+                    if let overview = item.overview {
+                        Text(overview)
+                            .font(.system(size: 22))
+                            .foregroundColor(.white.opacity(0.7))
+                            .lineLimit(3)
+                            .frame(maxWidth: 900, alignment: .leading)
+                    }
+                } else {
+                    Text(L10n.string("channels_loading", fallback: "Building today's lineup…"))
+                        .font(.system(size: 40, weight: .bold))
+                        .foregroundColor(.white)
+                }
+                Spacer(minLength: 0)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            VStack(alignment: .trailing, spacing: 10) {
+                Text(Self.clockFormatter.string(from: Date()))
+                    .font(.system(size: 26, weight: .semibold).monospacedDigit())
+                    .foregroundColor(.white.opacity(0.7))
+                previewWindow
+            }
+        }
+        .padding(.top, 30)
+    }
+
+    private var previewWindow: some View {
+        let height = GuideMetrics.previewWidth * 9 / 16
+        return ZStack {
+            Color.black
+            if let item = heroItem {
+                CachedPosterArtwork(
+                    urlString: item.artworkURL,
+                    width: GuideMetrics.previewWidth,
+                    height: height,
+                    maximumWidth: GuideMetrics.previewWidth
+                ) { Color.black }
+            }
+            if let tile = preview.tile, preview.itemID == heroItem?.id, let engine = tile.engine {
+                MultiviewEngineSurface(engine: engine)
+                    .transition(.opacity)
+            }
+            VStack {
+                HStack {
+                    if preview.tile != nil && preview.itemID == heroItem?.id {
+                        Label(L10n.string("channels_preview", fallback: "PREVIEW"), systemImage: "speaker.slash.fill")
+                            .font(.system(size: 15, weight: .heavy))
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 5)
+                            .background(Capsule().fill(Color.black.opacity(0.6)))
+                    } else if preview.isLoading {
+                        ProgressView().tint(.white).scaleEffect(0.8)
+                    }
+                    Spacer()
                 }
                 Spacer()
-                Text(Self.timeFormatter.string(from: Date()))
-                    .font(.system(size: 26, weight: .semibold))
-                    .foregroundColor(.white.opacity(0.6))
             }
-            Text(L10n.string(
-                "channels_subtitle",
-                fallback: "Pick a channel and it plays nonstop. Every tune-in starts fresh."
-            ))
-            .font(.system(size: 24))
-            .foregroundColor(.white.opacity(0.6))
+            .padding(14)
         }
-        .padding(.bottom, 12)
+        .frame(width: GuideMetrics.previewWidth, height: height)
+        .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).strokeBorder(Color.white.opacity(0.15), lineWidth: 1))
+        .shadow(color: .black.opacity(0.5), radius: 24, y: 10)
+        .animation(.easeInOut(duration: 0.3), value: preview.tile != nil)
     }
 
-    private var footnote: some View {
-        Text(L10n.string(
-            "channels_footnote",
-            fallback: "Programs come from popular and top-rated titles. Streams use your add-ons; titles without a stream are skipped. Watching here doesn't change your Continue Watching."
-        ))
-        .font(.system(size: 20))
-        .foregroundColor(.white.opacity(0.45))
-        .padding(.top, 20)
+    private func timingLine(for item: ChannelItem) -> String {
+        guard let offset = startOffset(of: item) else { return "\(item.durationMinutes) min" }
+        let start = guideStart.addingTimeInterval(TimeInterval(offset * 60))
+        let end = start.addingTimeInterval(TimeInterval(item.durationMinutes * 60))
+        let range = "\(Self.clockFormatter.string(from: start))–\(Self.clockFormatter.string(from: end))"
+        let lead = offset == 0
+            ? L10n.string("channels_starts_now", fallback: "Starts when you tune in")
+            : L10n.string("channels_later", fallback: "Later on")
+        return "\(lead) · \(range) · \(item.durationMinutes) min"
     }
 
-    private static let timeFormatter: DateFormatter = {
+    private func startOffset(of item: ChannelItem) -> Int? {
+        guard let lineup = store.lineups[item.channelID],
+              let index = lineup.firstIndex(of: item) else { return nil }
+        return lineup.prefix(index).reduce(0) { $0 + $1.durationMinutes }
+    }
+
+    // MARK: Time ruler
+
+    private func timeRuler(gridWidth: CGFloat, pointsPerMinute: CGFloat) -> some View {
+        let calendar = Calendar.current
+        let minuteNow = calendar.component(.minute, from: guideStart)
+        let firstMark = minuteNow < 30 ? 30 - minuteNow : 60 - minuteNow
+        let marks = stride(from: firstMark, to: ChannelSessionStore.guideWindowMinutes, by: 30).map { $0 }
+        return HStack(spacing: 0) {
+            Text(Self.dayFormatter.string(from: guideStart).uppercased())
+                .font(.system(size: 18, weight: .heavy))
+                .tracking(0.8)
+                .foregroundColor(.white.opacity(0.5))
+                .frame(width: GuideMetrics.channelColumn, alignment: .leading)
+            ZStack(alignment: .leading) {
+                Rectangle().fill(Color.white.opacity(0.12)).frame(height: 1).offset(y: 18)
+                Text(L10n.string("channels_now", fallback: "NOW"))
+                    .font(.system(size: 18, weight: .heavy))
+                    .foregroundColor(Color(red: 1.0, green: 0.36, blue: 0.36))
+                ForEach(marks, id: \.self) { minutes in
+                    Text(Self.clockFormatter.string(from: guideStart.addingTimeInterval(TimeInterval(minutes * 60))))
+                        .font(.system(size: 18, weight: .semibold).monospacedDigit())
+                        .foregroundColor(.white.opacity(0.6))
+                        .offset(x: CGFloat(minutes) * pointsPerMinute)
+                }
+            }
+            .frame(width: gridWidth, height: 40, alignment: .leading)
+            .clipped()
+        }
+    }
+
+    // MARK: Rows
+
+    private func guideRow(_ channel: ChannelDefinition, gridWidth: CGFloat, pointsPerMinute: CGFloat) -> some View {
+        let lineup = store.lineups[channel.id] ?? []
+        let isUnavailable = store.unavailable.contains(channel.id)
+        let isRowFocused = focusedChannelID == channel.id && focusedCell != nil
+        return HStack(spacing: 0) {
+            channelCell(channel, isRowFocused: isRowFocused)
+                .frame(width: GuideMetrics.channelColumn, height: GuideMetrics.rowHeight)
+
+            HStack(spacing: GuideMetrics.cellGap) {
+                if lineup.isEmpty {
+                    placeholderCell(
+                        isUnavailable
+                            ? L10n.string("channels_unavailable", fallback: "Unavailable right now")
+                            : L10n.string("channels_picking", fallback: "Picking programs…"),
+                        showsProgress: !isUnavailable
+                    )
+                    .frame(width: gridWidth)
+                } else {
+                    ForEach(laidOut(lineup, gridWidth: gridWidth, pointsPerMinute: pointsPerMinute), id: \.item.id) { cell in
+                        programCell(cell.item, channel: channel, width: cell.width, isFirst: cell.isFirst)
+                    }
+                }
+            }
+            .frame(width: gridWidth, height: GuideMetrics.rowHeight, alignment: .leading)
+            .clipped()
+        }
+    }
+
+    private struct LaidOutCell {
+        let item: ChannelItem
+        let width: CGFloat
+        let isFirst: Bool
+    }
+
+    /// Sizes programs by running time and keeps only what fits the window.
+    private func laidOut(_ lineup: [ChannelItem], gridWidth: CGFloat, pointsPerMinute: CGFloat) -> [LaidOutCell] {
+        var cells: [LaidOutCell] = []
+        var x: CGFloat = 0
+        for (index, item) in lineup.enumerated() {
+            guard x < gridWidth - 40 else { break }
+            let natural = CGFloat(item.durationMinutes) * pointsPerMinute - GuideMetrics.cellGap
+            let width = min(max(natural, GuideMetrics.minCellWidth), gridWidth - x)
+            cells.append(LaidOutCell(item: item, width: width, isFirst: index == 0))
+            x += width + GuideMetrics.cellGap
+        }
+        return cells
+    }
+
+    private func channelCell(_ channel: ChannelDefinition, isRowFocused: Bool) -> some View {
+        HStack(spacing: 14) {
+            Text(String(store.number(of: channel.id)))
+                .font(.system(size: 22, weight: .heavy).monospacedDigit())
+                .foregroundColor(isRowFocused ? .black : .white.opacity(0.7))
+                .frame(width: 56)
+            Image(systemName: channel.symbol)
+                .font(.system(size: 24, weight: .semibold))
+                .foregroundColor(isRowFocused ? .black : .white)
+                .frame(width: 30)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(channel.name)
+                    .font(.system(size: 22, weight: .bold))
+                    .foregroundColor(isRowFocused ? .black : .white)
+                    .lineLimit(1)
+                if channel.season != nil {
+                    Text(L10n.string("channels_seasonal", fallback: "SEASONAL"))
+                        .font(.system(size: 13, weight: .heavy))
+                        .tracking(0.6)
+                        .foregroundColor(Color(red: 1.0, green: 0.55, blue: 0.15))
+                }
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 12)
+        .frame(maxHeight: .infinity)
+        .background(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(isRowFocused ? Color.white : Color.white.opacity(0.07))
+        )
+        .padding(.trailing, GuideMetrics.cellGap)
+        .animation(.easeOut(duration: 0.12), value: isRowFocused)
+    }
+
+    private func programCell(_ item: ChannelItem, channel: ChannelDefinition, width: CGFloat, isFirst: Bool) -> some View {
+        let isFocused = focusedCell == item.id
+        return Button {
+            preview.stop()
+            store.tune(channel.id, startingAt: item.id)
+        } label: {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 8) {
+                    if isFirst {
+                        Circle()
+                            .fill(Color(red: 1.0, green: 0.36, blue: 0.36))
+                            .frame(width: 9, height: 9)
+                    }
+                    Text(item.title)
+                        .font(.system(size: 22, weight: .bold))
+                        .lineLimit(1)
+                }
+                Text(item.episode != nil ? item.detailLine : "\(item.detailLine) · \(item.durationMinutes) min")
+                    .font(.system(size: 18, weight: .medium))
+                    .opacity(0.7)
+                    .lineLimit(1)
+            }
+            .foregroundColor(isFocused ? .black : .white)
+            .padding(.horizontal, 16)
+            .frame(width: width, height: GuideMetrics.rowHeight, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .fill(isFocused ? Color.white : Color.white.opacity(isFirst ? 0.13 : 0.07))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .strokeBorder(isFocused ? AppFocusOutline.color : .clear, lineWidth: isFocused ? 3 : 0)
+            )
+            .scaleEffect(isFocused ? 1.03 : 1)
+            .animation(.easeOut(duration: 0.12), value: isFocused)
+        }
+        .buttonStyle(PosterCardButtonStyle())
+        .focused($focusedCell, equals: item.id)
+        .focusEffectDisabledIfAvailable()
+        .onChange(of: focusedCell == item.id) { _, focused in
+            guard focused else { return }
+            focusedItem = item
+            focusedChannelID = channel.id
+            preview.focus(item)
+        }
+    }
+
+    private func placeholderCell(_ text: String, showsProgress: Bool) -> some View {
+        HStack(spacing: 12) {
+            if showsProgress { ProgressView().tint(.white).scaleEffect(0.7) }
+            Text(text)
+                .font(.system(size: 20, weight: .medium))
+                .foregroundColor(.white.opacity(0.5))
+            Spacer()
+        }
+        .padding(.horizontal, 16)
+        .frame(height: GuideMetrics.rowHeight)
+        .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(Color.white.opacity(0.04)))
+    }
+
+    static let clockFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.timeStyle = .short
         formatter.dateStyle = .none
         return formatter
     }()
+
+    private static let dayFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.setLocalizedDateFormatFromTemplate("EEE MMM d")
+        return formatter
+    }()
 }
 
-private struct ChannelGuideRow: View {
-    let channel: ChannelDefinition
-    let preview: ChannelItem?
-    let isUnavailable: Bool
-    let isLoading: Bool
-    let isFocused: Bool
-    let action: () -> Void
+// MARK: - Tuning card and info banner
 
-    var body: some View {
-        Button(action: action) {
-            HStack(spacing: 28) {
-                ZStack {
-                    Circle().fill(Color.white.opacity(isFocused ? 0.95 : 0.12))
-                    Image(systemName: channel.symbol)
-                        .font(.system(size: 34, weight: .semibold))
-                        .foregroundColor(isFocused ? .black : .white)
-                }
-                .frame(width: 84, height: 84)
-
-                VStack(alignment: .leading, spacing: 6) {
-                    HStack(spacing: 12) {
-                        Text(channel.name)
-                            .font(.system(size: 32, weight: .bold))
-                            .foregroundColor(.white)
-                        if channel.season != nil {
-                            Text(L10n.string("channels_seasonal", fallback: "SEASONAL"))
-                                .font(.system(size: 15, weight: .heavy))
-                                .tracking(0.8)
-                                .foregroundColor(.black)
-                                .padding(.horizontal, 9)
-                                .padding(.vertical, 3)
-                                .background(Capsule().fill(Color(red: 1.0, green: 0.62, blue: 0.2)))
-                        }
-                    }
-                    Text(channel.tagline)
-                        .font(.system(size: 22))
-                        .foregroundColor(.white.opacity(0.6))
-                        .lineLimit(1)
-                }
-                .frame(width: 560, alignment: .leading)
-
-                Spacer(minLength: 20)
-
-                startsWith
-            }
-            .padding(.horizontal, 26)
-            .frame(height: ChannelGuideMetrics.rowHeight)
-            .background(
-                RoundedRectangle(cornerRadius: 22, style: .continuous)
-                    .fill(Color.white.opacity(isFocused ? 0.16 : 0.06))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 22, style: .continuous)
-                    .strokeBorder(isFocused ? AppFocusOutline.color : .clear, lineWidth: isFocused ? AppFocusOutline.width : 0)
-            )
-            .scaleEffect(isFocused ? 1.015 : 1)
-            .animation(.easeOut(duration: 0.15), value: isFocused)
-        }
-        .buttonStyle(PosterCardButtonStyle())
-        .focusEffectDisabledIfAvailable()
-        .disabled(isUnavailable)
-        .opacity(isUnavailable ? 0.45 : 1)
-    }
-
-    @ViewBuilder
-    private var startsWith: some View {
-        HStack(spacing: 18) {
-            VStack(alignment: .trailing, spacing: 4) {
-                Text(L10n.string("channels_starts_with", fallback: "STARTS WITH"))
-                    .font(.system(size: 15, weight: .heavy))
-                    .tracking(0.8)
-                    .foregroundColor(.white.opacity(0.45))
-                if let preview {
-                    Text(preview.title)
-                        .font(.system(size: 24, weight: .semibold))
-                        .foregroundColor(.white)
-                        .lineLimit(1)
-                    Text(preview.detailLine)
-                        .font(.system(size: 20))
-                        .foregroundColor(.white.opacity(0.6))
-                        .lineLimit(1)
-                } else if isUnavailable {
-                    Text(L10n.string("channels_unavailable", fallback: "Unavailable right now"))
-                        .font(.system(size: 22))
-                        .foregroundColor(.white.opacity(0.6))
-                } else {
-                    Text(isLoading
-                         ? L10n.string("channels_picking", fallback: "Picking…")
-                         : L10n.string("channels_surprise", fallback: "A surprise"))
-                        .font(.system(size: 22))
-                        .foregroundColor(.white.opacity(0.6))
-                }
-            }
-            .frame(width: 420, alignment: .trailing)
-
-            CachedPosterArtwork(
-                urlString: preview?.artworkURL,
-                width: ChannelGuideMetrics.thumbWidth,
-                height: ChannelGuideMetrics.thumbWidth * 9 / 16,
-                maximumWidth: ChannelGuideMetrics.thumbWidth
-            ) {
-                ZStack {
-                    Rectangle().fill(Color.white.opacity(0.07))
-                    Image(systemName: channel.symbol)
-                        .font(.system(size: 30))
-                        .foregroundColor(.white.opacity(0.25))
-                }
-            }
-            .frame(width: ChannelGuideMetrics.thumbWidth, height: ChannelGuideMetrics.thumbWidth * 9 / 16)
-            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-        }
-    }
-}
-
-/// Full-screen card shown while tuning in and between programs. Mount once
-/// above everything at the app root.
+/// Mounted once above everything at the app root: the full-screen card shown
+/// while tuning in or between programs, and the cable-style info banner
+/// shown over playback when a program starts.
 struct ChannelTransitionOverlay: View {
     @ObservedObject private var store = ChannelSessionStore.shared
     @FocusState private var buttonFocused: Bool
 
     var body: some View {
-        if let overlay = store.overlay {
-            content(for: overlay)
-                .transition(.opacity)
-                .onAppear { DispatchQueue.main.async { buttonFocused = true } }
+        ZStack {
+            if let overlay = store.overlay {
+                content(for: overlay)
+                    .transition(.opacity)
+                    .onAppear { DispatchQueue.main.async { buttonFocused = true } }
+            } else if let banner = store.banner {
+                ChannelInfoBanner(banner: banner, number: store.number(of: banner.channelID))
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                    .allowsHitTesting(false)
+            }
         }
+        .animation(.easeInOut(duration: 0.3), value: store.overlay)
+        .animation(.easeInOut(duration: 0.35), value: store.banner)
     }
 
     @ViewBuilder
     private func content(for overlay: ChannelSessionStore.Overlay) -> some View {
         let parts = Self.parts(of: overlay)
         let item = parts.item
-        let kind = parts.kind
-        let message = parts.message
         let channel = ChannelLineup.channel(id: parts.channelID)
         ZStack {
             Color.black.ignoresSafeArea()
 
-            if let artwork = item?.artworkURL {
+            if let artwork = item?.backdropURL {
                 CachedPosterArtwork(urlString: artwork, width: 1920, height: 1080, maximumWidth: 1920) {
                     Color.black
                 }
@@ -240,17 +504,23 @@ struct ChannelTransitionOverlay: View {
 
             VStack(alignment: .leading, spacing: 18) {
                 Spacer()
-                HStack(spacing: 14) {
-                    if let channel {
+                if let channel {
+                    HStack(spacing: 14) {
+                        Text(String(store.number(of: channel.id)))
+                            .font(.system(size: 28, weight: .heavy).monospacedDigit())
+                            .foregroundColor(.black)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 4)
+                            .background(RoundedRectangle(cornerRadius: 8).fill(Color.white))
                         Image(systemName: channel.symbol)
                             .font(.system(size: 30, weight: .semibold))
                         Text(channel.name)
                             .font(.system(size: 30, weight: .bold))
                     }
+                    .foregroundColor(.white.opacity(0.9))
                 }
-                .foregroundColor(.white.opacity(0.85))
 
-                Text(kind)
+                Text(parts.kind)
                     .font(.system(size: 22, weight: .heavy))
                     .tracking(1.2)
                     .foregroundColor(.white.opacity(0.55))
@@ -265,7 +535,7 @@ struct ChannelTransitionOverlay: View {
                         .foregroundColor(.white.opacity(0.75))
                 }
 
-                if let message {
+                if let message = parts.message {
                     Text(message)
                         .font(.system(size: 28, weight: .medium))
                         .foregroundColor(.white.opacity(0.8))
@@ -311,6 +581,89 @@ struct ChannelTransitionOverlay: View {
             return (channelID, item, L10n.string("channels_up_next", fallback: "UP NEXT"), nil)
         case .failed(let channelID, let message):
             return (channelID, nil, L10n.string("channels_off_air", fallback: "OFF THE AIR"), message)
+        }
+    }
+}
+
+/// The info bar cable boxes show when you land on a channel.
+private struct ChannelInfoBanner: View {
+    let banner: ChannelSessionStore.Banner
+    let number: Int
+
+    var body: some View {
+        let channel = ChannelLineup.channel(id: banner.channelID)
+        VStack {
+            Spacer()
+            HStack(alignment: .center, spacing: 28) {
+                VStack(spacing: 6) {
+                    Text(String(number))
+                        .font(.system(size: 34, weight: .heavy).monospacedDigit())
+                    if let channel {
+                        Image(systemName: channel.symbol)
+                            .font(.system(size: 26, weight: .semibold))
+                    }
+                }
+                .foregroundColor(.white)
+                .frame(width: 110)
+
+                Rectangle().fill(Color.white.opacity(0.2)).frame(width: 1, height: 90)
+
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(channel?.name.uppercased() ?? "")
+                        .font(.system(size: 17, weight: .heavy))
+                        .tracking(1)
+                        .foregroundColor(.white.opacity(0.55))
+                    Text(banner.item.title)
+                        .font(.system(size: 36, weight: .bold))
+                        .foregroundColor(.white)
+                        .lineLimit(1)
+                    Text("\(banner.item.detailLine) · \(banner.item.durationMinutes) min")
+                        .font(.system(size: 22, weight: .medium))
+                        .foregroundColor(.white.opacity(0.75))
+                        .lineLimit(1)
+                }
+
+                Spacer(minLength: 20)
+
+                if let next = banner.next {
+                    VStack(alignment: .trailing, spacing: 6) {
+                        Text(L10n.string("channels_next", fallback: "NEXT"))
+                            .font(.system(size: 17, weight: .heavy))
+                            .tracking(1)
+                            .foregroundColor(.white.opacity(0.55))
+                        Text(next.title)
+                            .font(.system(size: 26, weight: .semibold))
+                            .foregroundColor(.white)
+                            .lineLimit(1)
+                        Text(next.detailLine)
+                            .font(.system(size: 20))
+                            .foregroundColor(.white.opacity(0.65))
+                            .lineLimit(1)
+                    }
+                    .frame(maxWidth: 520, alignment: .trailing)
+                }
+
+                VStack(spacing: 4) {
+                    Image(systemName: "chevron.up")
+                    Text(L10n.string("channels_ch", fallback: "CH"))
+                        .font(.system(size: 15, weight: .heavy))
+                    Image(systemName: "chevron.down")
+                }
+                .font(.system(size: 20, weight: .bold))
+                .foregroundColor(.white.opacity(0.6))
+            }
+            .padding(.horizontal, 36)
+            .padding(.vertical, 26)
+            .background(
+                RoundedRectangle(cornerRadius: 26, style: .continuous)
+                    .fill(.ultraThinMaterial)
+            )
+            .background(
+                RoundedRectangle(cornerRadius: 26, style: .continuous)
+                    .fill(Color.black.opacity(0.45))
+            )
+            .padding(.horizontal, 80)
+            .padding(.bottom, 60)
         }
     }
 }

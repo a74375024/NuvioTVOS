@@ -579,7 +579,7 @@ private struct MultiviewAddSlotView: View {
 
 /// Binds a tile's engine to its own layer host. (The app's `AetherPlayerSurface`
 /// wraps the full-screen controller and shadows the engine's view of that name.)
-private struct MultiviewEngineSurface: UIViewRepresentable {
+struct MultiviewEngineSurface: UIViewRepresentable {
     let engine: AetherEngine
 
     func makeUIView(context: Context) -> AetherPlayerView {

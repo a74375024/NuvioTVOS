@@ -344,6 +344,11 @@ extension PlayerView {
                     return
                 }
                 guard !viewModel.showControls else { return }
+                // Channels: Up / Down flip channels, like a cable remote.
+                if viewModel.isChannelPlayback, direction == .up || direction == .down {
+                    ChannelSessionStore.shared.flip(by: direction == .up ? 1 : -1)
+                    return
+                }
                 switch direction {
                 case .left, .right:
                     // Swipes on the remote touchpad trigger onMoveCommand (.left / .right).
