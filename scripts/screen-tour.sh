@@ -40,7 +40,9 @@ shots=(
   "03-channels-trailer|channels|45"
   "04-calendar|calendar|20"
   "05-show-page-shuffle|details:tt0386676:series|20"
-  "06-settings|settings|12"
+  "06-live-tv-empty|live|12"
+  "07-live-tv-guide|live-demo|12"
+  "08-settings|settings|12"
 )
 
 for entry in "${shots[@]}"; do

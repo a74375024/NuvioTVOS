@@ -271,14 +271,14 @@ private enum DetailsReturnDestination {
 }
 
 enum TVTab: Hashable, Identifiable, CaseIterable {
-    case profile, home, party, search, library, channels, calendar, settings
+    case profile, home, party, search, library, channels, live, calendar, settings
     case collection(CollectionHomeID)
 
     static var allCases: [Self] {
         if WatchPartyConfiguration.isEnabled {
-            return [.profile, .home, .party, .search, .library, .channels, .calendar, .settings]
+            return [.profile, .home, .party, .search, .library, .channels, .live, .calendar, .settings]
         } else {
-            return [.profile, .home, .search, .library, .channels, .calendar, .settings]
+            return [.profile, .home, .search, .library, .channels, .live, .calendar, .settings]
         }
     }
     var id: String { rawValue }
@@ -290,6 +290,7 @@ enum TVTab: Hashable, Identifiable, CaseIterable {
         case .library: return "Library"
         case .calendar: return "Calendar"
         case .channels: return "Channels"
+        case .live: return "LiveTV"
         case .settings: return "Settings"
         case .party: return "Watch Party"
         case .collection(let id): return "Collection:\(id.key)"
@@ -303,6 +304,7 @@ enum TVTab: Hashable, Identifiable, CaseIterable {
         case .library: return L10n.string("nav_library", fallback: "Library")
         case .calendar: return L10n.string("nav_calendar", fallback: "Calendar")
         case .channels: return L10n.string("nav_channels", fallback: "Channels")
+        case .live: return L10n.string("nav_live_tv", fallback: "Live TV")
         case .settings: return L10n.string("nav_settings", fallback: "Settings")
         case .party: return "Watch Party"
         case .collection: return L10n.string("tmdb_collections_title", fallback: "Collections")
@@ -316,6 +318,7 @@ enum TVTab: Hashable, Identifiable, CaseIterable {
         case .library: return "rectangle.stack"
         case .calendar: return "calendar"
         case .channels: return "tv"
+        case .live: return "antenna.radiowaves.left.and.right"
         case .settings: return "gearshape"
         case .party: return "person.2.fill"
         case .collection: return "rectangle.stack.fill"
@@ -515,6 +518,7 @@ struct ContentView: View {
                 appContainer
                     // Channels' tuning / Up Next card sits above the player.
                     .overlay { ChannelTransitionOverlay() }
+                    .overlay { LiveTVOverlay() }
                     // Live Multiview grid; opened from the live player controls.
                     .modifier(MultiviewPresenter())
                     .transition(.opacity)
@@ -1195,6 +1199,7 @@ struct ContentView: View {
             try? await Task.sleep(nanoseconds: 1_500_000_000)
             switch ScreenTour.destination {
             case .tab(let tab):
+                if ScreenTour.requested == "live-demo" { LiveTVStore.shared.loadDemo() }
                 selectedTab = tab
             case .details(let id, let type):
                 openDetailsRoot(id: id, type: type)
@@ -2003,6 +2008,26 @@ struct ContentView: View {
             )
         }
         channels.leavePlayer = {
+            withAnimation(.easeInOut(duration: 0.2)) {
+                activeScreen = .main
+            }
+        }
+
+        let live = LiveTVStore.shared
+        live.present = { _, url, meta, programTitle in
+            playbackEpisodes = []
+            playbackCurrentEpisode = nil
+            presentBuiltInPlayer(
+                url: url,
+                meta: meta,
+                subtitle: programTitle,
+                httpHeaders: [:],
+                externalSubtitles: [],
+                resumeFrom: nil,
+                origin: .main
+            )
+        }
+        live.leavePlayer = {
             withAnimation(.easeInOut(duration: 0.2)) {
                 activeScreen = .main
             }
@@ -3233,6 +3258,14 @@ struct ContentView: View {
     }
 
     private func dismissPlayer(meta: NuvioMeta, subtitle: String) {
+        if LiveTVStore.shared.isWatching {
+            // Leaving a live channel returns to the Live TV guide.
+            LiveTVStore.shared.stopWatching()
+            withAnimation(.easeInOut(duration: 0.24)) {
+                activeScreen = .main
+            }
+            return
+        }
         if ChannelSessionStore.shared.isActive {
             // Leaving a channel returns to the Channels guide.
             ChannelSessionStore.shared.stop()
@@ -3619,6 +3652,7 @@ final class ProfileTabAvatarRenderer: ObservableObject {
 
 private struct TVMainTabView: View {
     @Binding var selectedTab: TVTab
+    @ObservedObject private var jellyfinServers = JellyfinServerStore.shared
     let activeProfile: Profile?
     @ObservedObject var searchViewModel: SearchViewModel
     @ObservedObject var netflixSearchViewModel: NetflixSearchViewModel
@@ -3823,6 +3857,16 @@ private struct TVMainTabView: View {
             .id(activeProfile?.id ?? "none")
     }
 
+    /// Live TV appears once an Emby / Jellyfin server is added in Settings.
+    private var showsLiveTab: Bool {
+        !jellyfinServers.servers.isEmpty || ScreenTour.isActive
+    }
+
+    private var liveTabContent: some View {
+        LiveTVGuideView()
+            .id(activeProfile?.id ?? "none")
+    }
+
     private var calendarTabContent: some View {
         ReleaseCalendarView(
             libraryItems: libraryViewModel.items,
@@ -3907,6 +3951,11 @@ private struct TVMainTabView: View {
             channelsTabContent
                 .tabItem { Label(TVTab.channels.title, systemImage: TVTab.channels.symbol) }
                 .tag(TVTab.channels)
+            if showsLiveTab {
+                liveTabContent
+                    .tabItem { Label(TVTab.live.title, systemImage: TVTab.live.symbol) }
+                    .tag(TVTab.live)
+            }
             calendarTabContent
                 .tabItem { Label(TVTab.calendar.title, systemImage: TVTab.calendar.symbol) }
                 .tag(TVTab.calendar)
@@ -3949,6 +3998,11 @@ private struct TVMainTabView: View {
             }
             Tab(TVTab.channels.title, systemImage: TVTab.channels.symbol, value: TVTab.channels) {
                 channelsTabContent
+            }
+            if showsLiveTab {
+                Tab(TVTab.live.title, systemImage: TVTab.live.symbol, value: TVTab.live) {
+                    liveTabContent
+                }
             }
             Tab(TVTab.calendar.title, systemImage: TVTab.calendar.symbol, value: TVTab.calendar) {
                 calendarTabContent

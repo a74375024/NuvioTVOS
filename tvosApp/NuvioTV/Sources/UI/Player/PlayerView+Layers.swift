@@ -349,6 +349,11 @@ extension PlayerView {
                     ChannelSessionStore.shared.flip(by: direction == .up ? 1 : -1)
                     return
                 }
+                // Live TV: Up / Down change channel too.
+                if LiveTVStore.shared.isWatching, viewModel.isLiveStream, direction == .up || direction == .down {
+                    LiveTVStore.shared.flip(by: direction == .up ? 1 : -1)
+                    return
+                }
                 switch direction {
                 case .left, .right:
                     // Swipes on the remote touchpad trigger onMoveCommand (.left / .right).
