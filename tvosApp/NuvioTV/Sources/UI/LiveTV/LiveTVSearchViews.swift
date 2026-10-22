@@ -56,6 +56,8 @@ struct LiveTVSearchView: View {
             .searchable(text: $query, prompt: L10n.string("live_search_prompt", fallback: "Channels or shows"))
             .navigationTitle(L10n.string("live_search_title", fallback: "Search Live TV"))
         }
+        // Full-screen and opaque, so the guide doesn't show through.
+        .background(Color.black.ignoresSafeArea())
         .onAppear { if query.isEmpty, !initialQuery.isEmpty { query = initialQuery } }
         .task(id: query) {
             let text = query.trimmingCharacters(in: .whitespacesAndNewlines)
