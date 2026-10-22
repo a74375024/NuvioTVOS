@@ -1,5 +1,4 @@
 import SwiftUI
-import AetherEngine
 
 private enum GuideMetrics {
     static let sideInset: CGFloat = 60
@@ -12,59 +11,6 @@ private enum GuideMetrics {
     static let previewWidth: CGFloat = 640
 }
 
-// MARK: - Live preview
-
-/// Plays a muted preview of the focused program after a short pause on it,
-/// like a cable box's picture-in-guide. The stream it finds is reused when
-/// the program is chosen, so tuning in is quick.
-@MainActor
-final class ChannelPreviewController: ObservableObject {
-    @Published private(set) var tile: MultiviewTile?
-    @Published private(set) var itemID: String?
-    @Published private(set) var isLoading = false
-    private var task: Task<Void, Never>?
-
-    func focus(_ item: ChannelItem?) {
-        guard item?.id != itemID else { return }
-        stop()
-        itemID = item?.id
-        guard let item else { return }
-        task = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 1_200_000_000)
-            guard let self, !Task.isCancelled, self.itemID == item.id,
-                  !ChannelSessionStore.shared.isActive else { return }
-            self.isLoading = true
-            let stream = await ChannelSessionStore.shared.preparedStream(for: item)
-            guard !Task.isCancelled, self.itemID == item.id,
-                  !ChannelSessionStore.shared.isActive, let stream else {
-                self.isLoading = false
-                return
-            }
-            let tile = MultiviewTile(channel: MultiviewChannel(
-                id: item.id,
-                title: item.title,
-                subtitle: item.detailLine,
-                url: stream.url,
-                httpHeaders: stream.httpHeaders,
-                artworkURL: nil
-            ))
-            tile.setAudible(false)
-            tile.start(tag: "guide-preview", role: .primary)
-            self.tile = tile
-            self.isLoading = false
-        }
-    }
-
-    func stop() {
-        task?.cancel()
-        task = nil
-        tile?.stop()
-        tile = nil
-        isLoading = false
-        itemID = nil
-    }
-}
-
 // MARK: - Guide
 
 /// Cable-style Channels guide: preview pane on top, a numbered channel grid
@@ -72,8 +18,13 @@ final class ChannelPreviewController: ObservableObject {
 /// starts from the beginning when chosen.
 struct ChannelsView: View {
     @ObservedObject private var store = ChannelSessionStore.shared
-    @StateObject private var preview = ChannelPreviewController()
     @AppStorage(SettingsKey.amoled) private var amoled = false
+    // Same trailer preview the posters use, with the same settings.
+    @AppStorage(SettingsKey.trailersEnabled) private var trailersEnabled = true
+    @AppStorage(SettingsKey.trailerDelay) private var trailerDelay = 7
+    @State private var trailerActiveID: String?
+    @State private var trailerReadyID: String?
+    @State private var trailerFinishedID: String?
     @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
     @FocusState private var focusedCell: String?
     @State private var focusedItem: ChannelItem?
@@ -110,12 +61,19 @@ struct ChannelsView: View {
             guideStart = Date()
             store.loadLineupIfNeeded()
         }
-        .onDisappear { preview.stop() }
         .onChange(of: store.isActive) { _, active in
-            if active { preview.stop() } else { guideStart = Date() }
+            if !active { guideStart = Date() }
         }
-        .onChange(of: focusedCell) { _, cell in
-            if cell == nil { preview.stop() }
+        .task(id: focusedItem?.id) {
+            // Like the posters: wait a moment on a program before its trailer
+            // plays (capped so browsing the guide stays snappy).
+            trailerActiveID = nil
+            trailerReadyID = nil
+            guard trailersEnabled, let id = focusedItem?.id else { return }
+            let delay = Double(min(2, max(0, trailerDelay)))
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            guard !Task.isCancelled else { return }
+            trailerActiveID = id
         }
     }
 
@@ -210,33 +168,54 @@ struct ChannelsView: View {
         .padding(.top, 30)
     }
 
+    /// Mounted only while browsing: never behind a playing channel.
+    private var showsTrailer: Bool {
+        guard trailersEnabled, focusedCell != nil, !store.isActive, store.overlay == nil,
+              let item = heroItem else { return false }
+        return trailerFinishedID != item.id
+    }
+
     private var previewWindow: some View {
         let height = GuideMetrics.previewWidth * 9 / 16
+        let item = heroItem
+        let isPlaying = item != nil && trailerReadyID == item?.id && trailerActiveID == item?.id
         return ZStack {
             Color.black
-            if let item = heroItem {
+            if let item {
                 CachedPosterArtwork(
-                    urlString: item.artworkURL,
+                    urlString: item.backdropURL,
                     width: GuideMetrics.previewWidth,
                     height: height,
                     maximumWidth: GuideMetrics.previewWidth
                 ) { Color.black }
+                .opacity(isPlaying ? 0 : 1)
             }
-            if let tile = preview.tile, preview.itemID == heroItem?.id, let engine = tile.engine {
-                MultiviewEngineSurface(engine: engine)
-                    .transition(.opacity)
+            if showsTrailer, let item {
+                TrailerPreviewPlayer(
+                    meta: item.meta,
+                    isActive: trailerActiveID == item.id,
+                    onPlaybackReady: {
+                        guard trailerActiveID == item.id else { return }
+                        trailerReadyID = item.id
+                    },
+                    onPlaybackFinished: {
+                        trailerFinishedID = item.id
+                        trailerReadyID = nil
+                    }
+                )
+                .id(item.id)
+                .transition(.opacity)
             }
             VStack {
                 HStack {
-                    if preview.tile != nil && preview.itemID == heroItem?.id {
-                        Label(L10n.string("channels_preview", fallback: "PREVIEW"), systemImage: "speaker.slash.fill")
+                    if isPlaying {
+                        Text(L10n.string("channels_trailer", fallback: "TRAILER"))
                             .font(.system(size: 15, weight: .heavy))
+                            .tracking(0.8)
                             .foregroundColor(.white)
                             .padding(.horizontal, 10)
                             .padding(.vertical, 5)
                             .background(Capsule().fill(Color.black.opacity(0.6)))
-                    } else if preview.isLoading {
-                        ProgressView().tint(.white).scaleEffect(0.8)
                     }
                     Spacer()
                 }
@@ -248,7 +227,7 @@ struct ChannelsView: View {
         .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).strokeBorder(Color.white.opacity(0.15), lineWidth: 1))
         .shadow(color: .black.opacity(0.5), radius: 24, y: 10)
-        .animation(.easeInOut(duration: 0.3), value: preview.tile != nil)
+        .animation(.easeInOut(duration: 0.32), value: isPlaying)
     }
 
     private func timingLine(for item: ChannelItem) -> String {
@@ -385,7 +364,6 @@ struct ChannelsView: View {
     private func programCell(_ item: ChannelItem, channel: ChannelDefinition, width: CGFloat, isFirst: Bool) -> some View {
         let isFocused = focusedCell == item.id
         return Button {
-            preview.stop()
             store.tune(channel.id, startingAt: item.id)
         } label: {
             VStack(alignment: .leading, spacing: 4) {
@@ -425,7 +403,6 @@ struct ChannelsView: View {
             guard focused else { return }
             focusedItem = item
             focusedChannelID = channel.id
-            preview.focus(item)
         }
     }
 
