@@ -204,11 +204,11 @@ final class ModalFocusProbe: XCTestCase {
             if reached.insert(key).inserted, isField(f) { reachedFields += 1 }
         }
         record()
-        for _ in 0..<4 { press(.up); record() }
-        for _ in 0..<7 { press(.down); record() }
-        for _ in 0..<2 { press(.left); record() }
-        for _ in 0..<2 { press(.right); record() }
-        for _ in 0..<4 { press(.up); record() }
+        for _ in 0..<3 { press(.up); record() }
+        for _ in 0..<5 { press(.down); record() }
+        press(.left); record()
+        press(.right); record()
+        for _ in 0..<3 { press(.up); record() }
         note("  focusable on screen: \(focusables.count), distinct focus positions reached: \(reached.count), fields visible: \(fields.count), fields reached: \(reachedFields)")
         if focusables.count > 1 && reached.count <= 1 {
             problem("\(name): focus stuck on \(describe(initial))")
@@ -277,13 +277,21 @@ final class ModalFocusProbe: XCTestCase {
         // tree until scrolled to).
         for _ in 0..<3 where !isSidebar(focused) { press(.left) }
         for _ in 0..<10 { press(.up) }
+        // Sidebar pills have no accessibility label of their own; match the
+        // focused pill to the element carrying the category's title.
         var found = false
+        var category = app.buttons.matching(NSPredicate(format: "label BEGINSWITH[c] %@", name)).firstMatch
         for _ in 0..<14 {
-            if focused.label.lowercased().hasPrefix(name.lowercased()) { found = true; break }
+            let title = app.descendants(matching: .any).matching(NSPredicate(format: "label BEGINSWITH[c] %@", name)).firstMatch
+            let current = focused
+            if title.exists, current.exists, current.frame.insetBy(dx: -4, dy: -4).contains(CGPoint(x: title.frame.midX, y: title.frame.midY)) {
+                found = true
+                category = title
+                break
+            }
             press(.down)
         }
-        let category = app.buttons.matching(NSPredicate(format: "label BEGINSWITH[c] %@", name)).firstMatch
-        guard found, category.exists else {
+        guard found else {
             problem("no settings category \(name) (sidebar focus: \(describe(focused)))")
             return nil
         }

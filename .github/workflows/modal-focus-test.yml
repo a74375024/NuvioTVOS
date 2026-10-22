@@ -17,7 +17,11 @@ concurrency:
 jobs:
   probe:
     runs-on: xcode-27
-    timeout-minutes: 170
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        test: [test1XtreamFillForm, test2SweepIntegrations, test3SweepAccount, test4SweepAppearance, test5SweepLayout, test6SweepPlayback, test7SweepAdvanced, test8SweepAbout]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -53,7 +57,7 @@ jobs:
             -destination "platform=tvOS Simulator,id=$udid" \
             -derivedDataPath "$RUNNER_TEMP/dd" \
             -resultBundlePath "$RUNNER_TEMP/probe.xcresult" \
-            -only-testing:NuvioTVUITests/ModalFocusProbe \
+            -only-testing:NuvioTVUITests/ModalFocusProbe/${{ matrix.test }} \
             CODE_SIGNING_ALLOWED=NO ONLY_ACTIVE_ARCH=YES 2>&1 | tee xcodebuild.log | grep -E "PROBE|error:|Test Case|\*\* TEST"
           status=${PIPESTATUS[0]}
           errors=$(grep -E "error:|Testing failed|TEST FAILED|TEST SUCCEEDED|Failing tests|Early unexpected exit|not signed|code sign" xcodebuild.log | sort -u | head -30)
@@ -82,6 +86,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: modal-focus
+          name: modal-focus-${{ matrix.test }}
           path: ${{ runner.temp }}/probe
           if-no-files-found: warn
