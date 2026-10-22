@@ -14955,6 +14955,9 @@ private struct SettingsNativeTextFieldRow: View {
     var isSecure: Bool = false
     var fieldWidth: CGFloat = 300
     var onCommit: () -> Void = {}
+    /// Take focus when the row first appears (e.g. the first field of a form
+    /// sheet, so it doesn't open on Cancel). Focus only — no keyboard.
+    var focusOnAppear: Bool = false
 
     @FocusState private var isFocused: Bool
 
@@ -14999,6 +15002,10 @@ private struct SettingsNativeTextFieldRow: View {
             .modifier(GlassCapsule(focused: isFocused))
         }
         .entryLockable()
+        .onAppear {
+            guard focusOnAppear else { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { isFocused = true }
+        }
     }
 
     private var displayText: String {
@@ -15522,7 +15529,6 @@ private struct XtreamAccountEditSheet: View {
     @State private var password: String
     @State private var isSaving = false
     @State private var message: String?
-    @Namespace private var focusScope
 
     init(account: XtreamAccount?, accentColor: Color) {
         self.account = account
@@ -15550,10 +15556,10 @@ private struct XtreamAccountEditSheet: View {
                             title: L10n.string("smb_display_name", fallback: "Name"),
                             subtitle: L10n.string("xtream_name_subtitle", fallback: "Shown in Settings and the feed picker"),
                             placeholder: "My IPTV",
-                            text: $displayName
+                            text: $displayName,
+                            // Open on the first field rather than Cancel.
+                            focusOnAppear: true
                         )
-                        // Open on the first field rather than Cancel.
-                        .prefersDefaultFocus(true, in: focusScope)
                         SettingsNativeTextFieldRow(
                             title: L10n.string("xtream_server", fallback: "Server URL"),
                             subtitle: "",
@@ -15603,7 +15609,6 @@ private struct XtreamAccountEditSheet: View {
                 .padding(40)
             }
         }
-        .focusScope(focusScope)
     }
 
     private var canSave: Bool {

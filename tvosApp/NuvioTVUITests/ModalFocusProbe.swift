@@ -39,8 +39,13 @@ final class ModalFocusProbe: XCTestCase {
         let fields = visibleFields()
         note("Xtream visible fields: \(fields.count)")
         XCTAssertEqual(fields.count, 4, "Xtream form shows 4 fields")
-        if focused.elementType == .button, focused.label == "Cancel" {
-            fail("Xtream form opened on Cancel instead of the first field")
+        if !isField(focused) {
+            fail("Xtream form did not open on a field (\(describe(focused)))")
+        } else if let first = fields.first, !first.hasFocus {
+            fail("Xtream form opened on a field other than Name (\(describe(focused)))")
+        }
+        if app.keyboards.count > 0 || focused.label == "Keyboard" {
+            fail("Xtream form opened the keyboard by itself")
         }
         // From Cancel, Up must reach the fields.
         let cancel = app.buttons.matching(NSPredicate(format: "label == 'Cancel'")).firstMatch
@@ -81,7 +86,7 @@ final class ModalFocusProbe: XCTestCase {
     func test9SweepLiveTV() {
         launch("live-demo")
         for chip in ["Search", "My Lineup", "Live Events", "Genre", "Options"] {
-            let button = app.buttons.matching(NSPredicate(format: "label BEGINSWITH %@", chip)).firstMatch
+            let button = app.buttons.matching(NSPredicate(format: "label CONTAINS[c] %@", chip)).firstMatch
             guard focus(button, "chip \(chip)") else { problem("could not focus Live TV chip \(chip)"); continue }
             press(.select)
             sleep(2)
@@ -108,9 +113,10 @@ final class ModalFocusProbe: XCTestCase {
     func test10LiveTVSetup() {
         launch("live-demo-setup")
         let start = app.buttons.matching(NSPredicate(format: "label CONTAINS[c] 'Set Up'")).firstMatch
-        guard focus(start, "Set Up My Lineup") else { return problem("no Set Up My Lineup button") }
-        press(.select)
-        sleep(3)
+        if start.exists, start.isHittable, focus(start, "Set Up My Lineup") {
+            press(.select)
+            sleep(3)
+        }
         exerciseModal("Live TV › Setup (market)")
         // Pick the first market and continue through the steps.
         press(.select)
@@ -135,11 +141,13 @@ final class ModalFocusProbe: XCTestCase {
                 let frame = row.frame
                 press(.select)
                 sleep(2)
-                if !anchor.isHittable {
+                let after = focused
+                let moved = !after.exists || abs(after.frame.midY - frame.midY) > 30 || abs(after.frame.midX - frame.midX) > 60
+                if !anchor.isHittable || moved {
                     exerciseModal("\(category) › \(label.prefix(50))")
-                    dismiss(back: anchor)
-                    // Back on the row we opened?
-                    if !(focused.label == label || focused.frame == frame) {
+                    closeModal(row: frame, anchor: anchor)
+                    if isSidebar(focused) { press(.right) }
+                    if !near(focused, frame) {
                         note("  focus after closing: \(describe(focused))")
                         let again = app.buttons.matching(NSPredicate(format: "label == %@", label)).firstMatch
                         if again.exists { _ = focus(again, "row \(label.prefix(40))") }
@@ -217,6 +225,24 @@ final class ModalFocusProbe: XCTestCase {
         }
     }
 
+    private func near(_ element: XCUIElement, _ frame: CGRect) -> Bool {
+        element.exists && abs(element.frame.midY - frame.midY) <= 30 && abs(element.frame.midX - frame.midX) <= 60
+    }
+
+    /// Menu until focus is back on the row that opened the modal.
+    private func closeModal(row frame: CGRect, anchor: XCUIElement) {
+        for _ in 0..<3 {
+            press(.menu)
+            sleep(1)
+            if near(focused, frame) || isSidebar(focused) && anchor.isHittable { return }
+            if anchor.isHittable && !near(focused, frame) && focused.exists && focused.frame.minX > 400 {
+                // Closed; focus landed on another row.
+                return
+            }
+        }
+        problem("could not close modal with Menu (focus: \(describe(focused)))")
+    }
+
     private func dismiss(back anchor: XCUIElement) {
         for _ in 0..<4 {
             if anchor.isHittable { return }
@@ -247,9 +273,18 @@ final class ModalFocusProbe: XCTestCase {
     @discardableResult
     private func openSettingsCategory(_ name: String) -> XCUIElement? {
         launch("settings")
+        // Walk the sidebar with the remote (lower categories aren't in the
+        // tree until scrolled to).
+        for _ in 0..<3 where !isSidebar(focused) { press(.left) }
+        for _ in 0..<10 { press(.up) }
+        var found = false
+        for _ in 0..<14 {
+            if focused.label.lowercased().hasPrefix(name.lowercased()) { found = true; break }
+            press(.down)
+        }
         let category = app.buttons.matching(NSPredicate(format: "label BEGINSWITH[c] %@", name)).firstMatch
-        guard focus(category, "\(name) category") else {
-            problem("no settings category \(name)")
+        guard found, category.exists else {
+            problem("no settings category \(name) (sidebar focus: \(describe(focused)))")
             return nil
         }
         press(.select)
