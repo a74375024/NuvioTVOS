@@ -626,6 +626,10 @@ struct ContentView: View {
             configureChannels()
             guard !resolvedInitialScreen else { return }
             resolvedInitialScreen = true
+            if ScreenTour.isActive {
+                authManager.skipLogin()
+                scheduleScreenTour()
+            }
             // Skip the login gate if a session was restored or the user has
             // previously chosen to continue without an account.
             if !authManager.shouldShowLoginGate {
@@ -1176,6 +1180,30 @@ struct ContentView: View {
     ///
     /// Empty or failed loads get a bounded escape. Populated content waits for
     /// Home's native focus acknowledgement, even after the deadline.
+    /// CI screenshot tour: enter as the first unlocked profile, then open the
+    /// requested tab or show page. Only runs with `-NuvioScreenTour`.
+    private func scheduleScreenTour() {
+        Task { @MainActor in
+            for _ in 0..<40 {
+                if activeScreen == .main { break }
+                if activeScreen == .profileSelection,
+                   let profile = profileViewModel.profiles.first(where: { !$0.isPinProtected }) {
+                    profileViewModel.requestSwitch(to: profile)
+                }
+                try? await Task.sleep(nanoseconds: 500_000_000)
+            }
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            switch ScreenTour.destination {
+            case .tab(let tab):
+                selectedTab = tab
+            case .details(let id, let type):
+                openDetailsRoot(id: id, type: type)
+            case nil:
+                break
+            }
+        }
+    }
+
     private func beginProfileGate() {
         profileGateTask?.cancel()
         profileGateLiftTask?.cancel()

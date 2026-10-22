@@ -1,0 +1,36 @@
+name: Approve Preview Build
+
+# Turns a preview (pre-release) into the full latest release, so sideloading
+# tools that track "latest" pick it up. Defaults to the newest preview.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Preview tag to approve (blank = newest preview)
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Promote
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          repo="$GITHUB_REPOSITORY"
+          if [ -z "$TAG" ]; then
+            TAG=$(gh release list -R "$repo" --limit 50 --json tagName,isPrerelease \
+              -q '[.[] | select(.isPrerelease and (.tagName | startswith("enh-")))][0].tagName')
+          fi
+          [ -n "$TAG" ] && [ "$TAG" != "null" ] || { echo "::error::No preview build to approve."; exit 1; }
+          title=$(gh release view "$TAG" -R "$repo" --json name -q .name | sed 's/ (preview)$//')
+          gh release view "$TAG" -R "$repo" --json body -q .body \
+            | grep -v '^> \*\*Preview.\*\*' > notes.md
+          gh release edit "$TAG" -R "$repo" --prerelease=false --latest --title "$title" --notes-file notes.md
+          echo "Approved $TAG → $title"

@@ -2,8 +2,16 @@ name: Build Enhancements IPA
 
 # Builds an unsigned tvOS .ipa from this fork so it can be sideloaded
 # (Feather, Sideloadly, etc. re-sign it on install).
+# Pushes publish a *preview* (pre-release with screenshots) that sideloaders
+# watching "latest" ignore. Promote it with promote-preview.yml, or dispatch
+# this workflow with release=true to publish straight to latest.
 on:
   workflow_dispatch:
+    inputs:
+      release:
+        description: Publish as the full (latest) release instead of a preview
+        type: boolean
+        default: false
   push:
     branches: [multiview]
 
@@ -18,7 +26,7 @@ jobs:
   build:
     # Same GitHub-hosted Xcode 27 image the upstream test workflow uses.
     runs-on: xcode-27
-    timeout-minutes: 90
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
         with:
@@ -48,6 +56,12 @@ jobs:
             echo "::error title=Build errors::${encoded}"
           fi
           exit $status
+
+      - name: Screen tour (simulator screenshots)
+        id: tour
+        continue-on-error: true
+        shell: bash
+        run: bash scripts/screen-tour.sh
 
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
@@ -94,8 +108,17 @@ jobs:
           } > release-notes.md
           cat release-notes.md
 
+          name="Nuvio ${version} + Enhancements · build ${{ github.run_number }}"
+          if [ "${{ inputs.release }}" = "true" ]; then
+            echo "full=true" >> "$GITHUB_OUTPUT"
+          else
+            name="${name} (preview)"
+            echo "full=false" >> "$GITHUB_OUTPUT"
+            { echo; echo "> **Preview.** Not marked latest yet, so auto-installs skip it until it is approved."; } >> release-notes.md
+          fi
+          ls screens/*.png >/dev/null 2>&1 || echo "> Screenshots unavailable for this build." >> release-notes.md
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "name=Nuvio ${version} + Enhancements · build ${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
@@ -103,10 +126,14 @@ jobs:
           tag_name: ${{ steps.notes.outputs.tag }}
           name: ${{ steps.notes.outputs.name }}
           body_path: release-notes.md
-          prerelease: false
-          make_latest: true
+          prerelease: ${{ steps.notes.outputs.full != 'true' }}
+          make_latest: ${{ steps.notes.outputs.full == 'true' }}
           target_commitish: ${{ github.sha }}
-          files: build-ipa/NuvioTV-unsigned.ipa
+          fail_on_unmatched_files: false
+          files: |
+            build-ipa/NuvioTV-unsigned.ipa
+            screens/*.png
+            screens/screens.zip
 
       - name: Tidy up old releases
         env:

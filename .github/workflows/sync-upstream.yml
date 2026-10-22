@@ -60,4 +60,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         # A push made with the workflow token doesn't trigger other workflows,
         # so kick the build off explicitly.
-        run: gh workflow run build-multiview-ipa.yml --ref multiview -R "$GITHUB_REPOSITORY"
+        # Goes straight to latest unless a preview is still waiting for
+        # approval (then the merged build is a preview too).
+        run: |
+          pending=$(gh release list -R "$GITHUB_REPOSITORY" --limit 1 --json isPrerelease -q '.[0].isPrerelease')
+          if [ "$pending" = "true" ]; then release=false; else release=true; fi
+          gh workflow run build-multiview-ipa.yml --ref multiview -R "$GITHUB_REPOSITORY" -f release=$release
