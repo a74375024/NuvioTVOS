@@ -63,6 +63,6 @@ jobs:
         # Goes straight to latest unless a preview is still waiting for
         # approval (then the merged build is a preview too).
         run: |
-          pending=$(gh release list -R "$GITHUB_REPOSITORY" --limit 1 --json isPrerelease -q '.[0].isPrerelease')
+          pending=$(gh release list -R "$GITHUB_REPOSITORY" --limit 20 --json tagName,isPrerelease -q '[.[] | select(.tagName | startswith("enh-"))][0].isPrerelease')
           if [ "$pending" = "true" ]; then release=false; else release=true; fi
           gh workflow run build-multiview-ipa.yml --ref multiview -R "$GITHUB_REPOSITORY" -f release=$release

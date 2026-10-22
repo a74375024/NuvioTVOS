@@ -14,7 +14,7 @@ on:
         default: false
   push:
     branches: [multiview]
-    paths-ignore: ['.github/approved-build']
+    paths-ignore: ['.github/approved-build', 'epg/**', '.github/workflows/epg-guide.yml']
 
 permissions:
   contents: write

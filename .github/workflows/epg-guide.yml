@@ -1,0 +1,58 @@
+name: Build Live TV Guide Data
+
+# Merges free XMLTV guides (epg/sources.json) into compact shards the Live TV
+# tab downloads from the "epg-data" release. The schedule only runs once
+# multiview is the default branch; pushes to epg/ also rebuild it.
+on:
+  schedule:
+    - cron: "41 */8 * * *"
+  workflow_dispatch:
+  push:
+    branches: [multiview]
+    paths: ['epg/**', '.github/workflows/epg-guide.yml']
+
+permissions:
+  contents: write
+
+concurrency:
+  group: epg-guide
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build guide shards
+        run: python3 epg/build_guide.py
+
+      - name: Summarize
+        if: always()
+        shell: bash
+        run: |
+          [ -f out/summary.json ] || exit 0
+          line=$(python3 - <<'PY'
+          import json
+          s = json.load(open("out/summary.json"))
+          parts = [f"{k}: {v['channels']} ch, {v['bytes']//1024} KB" for k, v in s["shards"].items()]
+          bad = [f"{r['source']} failed ({r.get('error','')[:80]})" for r in s["sources"] if not r["ok"]]
+          srcs = [f"{r['source']} {r.get('channels',0)} ch/{r.get('new',0)} new/{r.get('gaps_filled',0)} filled" for r in s["sources"] if r["ok"]]
+          print(" | ".join(parts) + " || " + "; ".join(srcs) + (" || " + "; ".join(bad) if bad else ""))
+          PY
+          )
+          echo "::notice title=Guide data::${line}"
+
+      - name: Publish to the epg-data release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          repo="$GITHUB_REPOSITORY"
+          if ! gh release view epg-data -R "$repo" >/dev/null 2>&1; then
+            gh release create epg-data -R "$repo" --prerelease --latest=false \
+              --target "$GITHUB_SHA" --title "Live TV guide data (automatic)" \
+              --notes "Merged free TV listings used by the Live TV tab. Rebuilt automatically; not an app build."
+          fi
+          gh release upload epg-data out/*.json.z out/summary.json -R "$repo" --clobber
