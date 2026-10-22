@@ -263,6 +263,18 @@ struct LiveTVGuideView: View {
                         .font(.system(size: 26, weight: .bold))
                         .foregroundColor(.white.opacity(0.55))
                     if store.isLoadingGuide { ProgressView().tint(.white).scaleEffect(0.7) }
+                    if case .updating(let line) = store.outsideStatus {
+                        Text(line)
+                            .font(.system(size: 18, weight: .medium))
+                            .foregroundColor(.white.opacity(0.45))
+                            .lineLimit(1)
+                    } else if case .ready(let matched, let total, _) = store.outsideStatus, ScreenTour.isActive {
+                        Text("Outside listings: \(matched) of \(total) channels")
+                            .font(.system(size: 18, weight: .medium))
+                            .foregroundColor(.white.opacity(0.45))
+                    } else if case .failed(let message) = store.outsideStatus, ScreenTour.isActive {
+                        Text(message).font(.system(size: 16)).foregroundColor(.red.opacity(0.8)).lineLimit(2)
+                    }
                 }
                 if let channel = heroChannel {
                     HStack(spacing: 12) {

@@ -268,7 +268,7 @@ struct LiveTVGuideSourcesView: View {
                             store.loadOutsideGuide(force: true)
                         }
                     } footer: {
-                        Text(L10n.string("live_outside_footer", fallback: "Listings come from free public guides (epgshare01, i.mjh.nz), merged and de-duplicated a few times a day, and are matched to your channels by call sign (like WNBC) or name. Your server's own guide is used whenever it covers more."))
+                        Text(L10n.string("live_outside_footer", fallback: "Your Apple TV downloads free public guides (epgshare01, i.mjh.nz) about once a day while Nuvio is open, keeps only your channels, merges duplicates across sources and saves the result. Channels are matched by call sign (like WNBC), by network and city (\"NBC 5 Chicago\"), or by name. Your server's own guide is used whenever it covers more."))
                             .font(.system(size: 20))
                     }
                 }
@@ -283,6 +283,8 @@ struct LiveTVGuideSourcesView: View {
             return L10n.string("live_outside_off", fallback: "Only your server's guide is used.")
         case .loading:
             return L10n.string("live_outside_loading", fallback: "Loading outside listings…")
+        case .updating(let line):
+            return line + " " + L10n.string("live_outside_updating_note", fallback: "(runs in the background and pauses while you watch)")
         case .failed(let message):
             return L10n.format("live_outside_failed", fallback: "Couldn't load outside listings: %@", message)
         case .ready(let matched, let total, let updated):

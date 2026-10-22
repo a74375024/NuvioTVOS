@@ -36,6 +36,8 @@ final class LiveTVStore: ObservableObject {
     enum OutsideStatus: Equatable {
         case off
         case loading
+        /// Rebuilding in the background; any saved listings stay in use.
+        case updating(String)
         case ready(matched: Int, total: Int, updated: Date?)
         case failed(String)
     }
@@ -104,8 +106,9 @@ final class LiveTVStore: ObservableObject {
     private var indexByID: [String: Int] = [:]
     /// What the server's guide returned, before outside listings are merged in.
     private var serverPrograms: [String: [LiveTVProgram]] = [:]
-    /// Outside-listing channel matched to each server channel.
-    private var outsideMatches: [String: OutsideGuide.Channel] = [:]
+    /// Outside listings for each server channel that has any.
+    private var outsideMatches: [String: [OutsideGuide.RawProgram]] = [:]
+    private var outsideBuiltAt: Date?
     private var outsideTask: Task<Void, Never>?
     private var guideWindowByChannel: [String: Date] = [:]
     private var pendingGuide: [String] = []
@@ -345,8 +348,8 @@ final class LiveTVStore: ObservableObject {
 
     // MARK: Outside listings
 
-    /// Downloads (or reads cached) free outside listings and matches them to
-    /// this server's channels; channels the server has no guide for get them.
+    /// Uses saved outside listings right away, then (if they're old, or
+    /// `force`) rebuilds them in the background on this Apple TV.
     func loadOutsideGuide(force: Bool = false) {
         outsideTask?.cancel()
         guard OutsideGuide.isEnabled, !channels.isEmpty else {
@@ -356,20 +359,42 @@ final class LiveTVStore: ObservableObject {
             return
         }
         let shardIDs = OutsideGuide.enabledShards
+        let signature = loadedSignature ?? "default"
         let snapshot = channels
-        outsideStatus = .loading
+        let saved = OutsideGuide.loadSaved(signature: signature)
+        if let saved, Set(saved.shards) == shardIDs {
+            outsideMatches = saved.programs
+            outsideBuiltAt = saved.built
+            outsideStatus = .ready(matched: saved.programs.count, total: snapshot.count, updated: saved.built)
+            rebuildOutsidePrograms()
+        }
+        guard force || OutsideGuide.needsRebuild(saved, shards: shardIDs, channelCount: snapshot.count) else { return }
+        outsideStatus = .updating("Getting ready…")
         outsideTask = Task { [weak self] in
-            let loaded = await OutsideGuide.load(shardIDs: shardIDs, force: force)
-            let matches = await Task.detached(priority: .utility) {
-                OutsideGuide.match(snapshot, guide: loaded.channels, stations: loaded.stations)
-            }.value
-            guard let self, !Task.isCancelled else { return }
-            self.outsideMatches = matches.mapValues { loaded.channels[$0] }
-            if loaded.channels.isEmpty, !loaded.problems.isEmpty {
-                self.outsideStatus = .failed(loaded.problems.joined(separator: "\n"))
-            } else {
-                self.outsideStatus = .ready(matched: matches.count, total: snapshot.count, updated: loaded.generated)
+            // Give the app a moment to settle before starting background work.
+            try? await Task.sleep(nanoseconds: force ? 0 : 8_000_000_000)
+            guard !Task.isCancelled else { return }
+            let built = await OutsideGuide.build(for: snapshot, shards: shardIDs) { line in
+                Task { @MainActor in
+                    guard let self, case .updating = self.outsideStatus else { return }
+                    self.outsideStatus = .updating(line)
+                }
             }
+            guard let self, !Task.isCancelled else { return }
+            if built.programs.isEmpty, !built.problems.isEmpty {
+                self.outsideStatus = self.outsideMatches.isEmpty
+                    ? .failed(built.problems.joined(separator: "\n"))
+                    : .ready(matched: self.outsideMatches.count, total: snapshot.count, updated: self.outsideBuiltAt)
+                return
+            }
+            let now = Date()
+            OutsideGuide.save(
+                OutsideGuide.Saved(built: now, shards: Array(shardIDs), channelCount: snapshot.count, programs: built.programs),
+                signature: signature
+            )
+            self.outsideMatches = built.programs
+            self.outsideBuiltAt = now
+            self.outsideStatus = .ready(matched: built.programs.count, total: snapshot.count, updated: now)
             self.rebuildOutsidePrograms()
         }
     }
@@ -729,6 +754,30 @@ final class LiveTVStore: ObservableObject {
     }
 
     // MARK: Screenshot tour
+
+    /// Sample lineup with real channel names, filled only by outside listings
+    /// built on this device (`-NuvioScreenTour live-demo-outside`): an
+    /// end-to-end check of download, unzip, parse and matching in CI.
+    func loadOutsideDemo() {
+        let names = [
+            "US: NBC 4 New York (WNBC)", "US LOCALS: FOX 32 Chicago", "US LOCALS: ABC 7 Los Angeles",
+            "US LOCALS: CBS 2 Chicago", "US: ESPN", "US: CNN", "US: HGTV", "US: Cartoon Network",
+            "US: HBO East", "US: Discovery Channel", "FAST: Pluto TV Movies", "FAST: Samsung TV Plus Comedy"
+        ]
+        let demo = names.enumerated().map { index, name in
+            LiveTVChannel(id: "demo|o\(index)", serverID: "demo", itemID: "o\(index)", name: name,
+                          number: String(index + 2), imageURL: nil, isFavorite: false)
+        }
+        loadedSignature = ProfileSettings.activeProfileScope + "|" + JellyfinServerStore.shared.servers.map(\.id).joined(separator: ",")
+        channelsLoadedAt = Date()
+        setChannels(Self.annotated(demo))
+        programs = [:]
+        serverPrograms = [:]
+        guideState = Dictionary(uniqueKeysWithValues: demo.map { ($0.id, GuideState.loaded) })
+        state = .loaded
+        loadOutsideGuide(force: true)
+    }
+
 
     /// Sample guide for the CI screenshot tour (`-NuvioScreenTour live-demo`),
     /// so the layout can be checked without a real server.

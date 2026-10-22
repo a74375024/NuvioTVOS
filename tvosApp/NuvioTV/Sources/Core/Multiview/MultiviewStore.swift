@@ -35,7 +35,9 @@ final class MultiviewStore: ObservableObject {
     static let maxTiles = 4
 
     @Published private(set) var channels: [MultiviewChannel] = []
-    @Published var isPresented = false
+    @Published var isPresented = false {
+        didSet { OutsideGuidePause.shared.set("multiview", isPresented) }
+    }
     /// Remembered across visits so adding a channel keeps the chosen layout.
     @Published var layout: MultiviewLayout = .grid
     /// The channel in the large spotlight tile; nil means the first tile.

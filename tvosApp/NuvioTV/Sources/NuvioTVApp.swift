@@ -567,6 +567,8 @@ struct ContentView: View {
             }
         }
         .onChange(of: activeScreen) { oldScreen, newScreen in
+            // Outside-guide building steps aside while anything plays.
+            OutsideGuidePause.shared.set("player", newScreen.isPlayer)
             TVHomeDebugTrace.log("app.activeScreen changed from \(oldScreen) to \(newScreen)")
             if oldScreen != newScreen, !newScreen.isPlayer, partyLaunchTask != nil {
                 partyLaunchID = UUID(); partyLaunchTask?.cancel(); partyLaunchTask = nil
@@ -1199,7 +1201,11 @@ struct ContentView: View {
             try? await Task.sleep(nanoseconds: 1_500_000_000)
             switch ScreenTour.destination {
             case .tab(let tab):
-                if ScreenTour.requested?.hasPrefix("live-demo") == true { LiveTVStore.shared.loadDemo() }
+                if ScreenTour.requested == "live-demo-outside" {
+                    LiveTVStore.shared.loadOutsideDemo()
+                } else if ScreenTour.requested?.hasPrefix("live-demo") == true {
+                    LiveTVStore.shared.loadDemo()
+                }
                 selectedTab = tab
             case .details(let id, let type):
                 openDetailsRoot(id: id, type: type)

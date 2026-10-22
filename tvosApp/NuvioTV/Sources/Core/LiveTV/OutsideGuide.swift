@@ -1,10 +1,14 @@
 import Foundation
 
-/// Free TV listings gathered outside the user's server (see epg/ in the repo:
-/// a GitHub Actions job merges several free XMLTV guides into compact shards
-/// and publishes them to the "epg-data" release). Used to fill in channels the
-/// server has no guide for, matched by call sign or channel name.
+/// Free TV listings from outside the user's server, gathered on the Apple TV
+/// itself. While the app is open, a background-priority job downloads free
+/// XMLTV guides, streams through them keeping only the channels in the
+/// user's lineup, merges the same channel across sources (filling gaps from
+/// lower-priority ones) and caches the small result. It pauses during
+/// playback and runs at most about once a day.
 enum OutsideGuide {
+    // MARK: Sources
+
     struct Shard: Identifiable, Hashable {
         let id: String
         let title: String
@@ -12,16 +16,41 @@ enum OutsideGuide {
         let defaultOn: Bool
     }
 
+    struct Source {
+        let name: String
+        let shard: String
+        let url: String
+        /// A locals file: bare four-letter call signs count as call signs.
+        var locals = false
+    }
+
     static let shards: [Shard] = [
-        Shard(id: "us-locals", title: "US local stations", detail: "ABC, CBS, NBC, FOX, PBS, CW and other locals, matched by call sign", defaultOn: true),
+        Shard(id: "us-locals", title: "US local stations", detail: "ABC, CBS, NBC, FOX, PBS, CW and other locals, matched by call sign or by network and city", defaultOn: true),
         Shard(id: "us", title: "US national & sports", detail: "Cable networks, premium and sports channels", defaultOn: true),
         Shard(id: "fast", title: "Free streaming channels", detail: "Pluto TV, Samsung TV Plus, Plex and Roku channels", defaultOn: true),
         Shard(id: "ca", title: "Canada", detail: "Canadian networks and locals", defaultOn: false),
         Shard(id: "uk", title: "United Kingdom", detail: "UK channels", defaultOn: false)
     ]
 
-    static let releaseBase = "https://github.com/a74375024/NuvioTVOS/releases/download/epg-data/"
-    private static let maxAge: TimeInterval = 6 * 3600
+    /// In priority order: when two sources list the same channel, the first
+    /// one's listings win and later ones only fill gaps.
+    static let sources: [Source] = [
+        Source(name: "US locals", shard: "us-locals", url: "https://epgshare01.online/epgshare01/epg_ripper_US_LOCALS1.xml.gz", locals: true),
+        Source(name: "US national", shard: "us", url: "https://epgshare01.online/epgshare01/epg_ripper_US2.xml.gz"),
+        Source(name: "US sports", shard: "us", url: "https://epgshare01.online/epgshare01/epg_ripper_US_SPORTS1.xml.gz"),
+        Source(name: "Pluto TV", shard: "fast", url: "https://i.mjh.nz/PlutoTV/us.xml.gz"),
+        Source(name: "Samsung TV Plus", shard: "fast", url: "https://i.mjh.nz/SamsungTVPlus/us.xml.gz"),
+        Source(name: "Plex", shard: "fast", url: "https://i.mjh.nz/Plex/us.xml.gz"),
+        Source(name: "Roku", shard: "fast", url: "https://i.mjh.nz/Roku/all.xml.gz"),
+        Source(name: "Canada", shard: "ca", url: "https://epgshare01.online/epgshare01/epg_ripper_CA2.xml.gz"),
+        Source(name: "UK", shard: "uk", url: "https://epgshare01.online/epgshare01/epg_ripper_UK1.xml.gz")
+    ]
+
+    /// Rebuild when the saved listings are older than this. The sources cover
+    /// several days ahead, so a day-old build still fills the guide.
+    static let refreshAge: TimeInterval = 20 * 3600
+    /// How far ahead listings are kept.
+    static let keepHours: TimeInterval = 48
 
     // MARK: Settings
 
@@ -43,133 +72,180 @@ enum OutsideGuide {
 
     // MARK: Data
 
-    struct RawProgram {
-        let startMinute: Int
-        let minutes: Int
-        let title: String
-        let subtitle: String?
-        let overview: String?
-        let flags: Int
-    }
-
-    struct Channel {
-        let names: [String]
-        let callsigns: [String]
-        let programs: [RawProgram]
+    struct RawProgram: Codable {
+        let s: Int        // start, minutes since 1970
+        let m: Int        // length in minutes
+        let t: String     // title
+        let st: String?   // subtitle / episode title
+        let d: String?    // description
+        let f: Int        // flags: 1 movie, 2 sports, 4 news, 8 kids, 16 live, 32 new
     }
 
     /// A US / Canadian broadcast station from the station directory.
-    struct Station {
+    struct Station: Codable {
         let callsign: String
         let network: String
         let cityTokens: [String]
         let channelNumber: String
     }
 
-    struct Loaded {
-        var channels: [Channel] = []
-        var stations: [Station] = []
-        var generated: Date?
-        var problems: [String] = []
+    /// The saved result: listings for the user's channels only.
+    struct Saved: Codable {
+        var built: Date
+        var shards: [String]
+        var channelCount: Int
+        var programs: [String: [RawProgram]]
     }
 
-    /// Loads the enabled shards (cached for a few hours; a stale cache is used
-    /// when the download fails). Heavy work runs off the main thread.
-    static func load(shardIDs: Set<String>, force: Bool) async -> Loaded {
-        await Task.detached(priority: .utility) {
-            var result = Loaded()
-            for shard in shards where shardIDs.contains(shard.id) {
-                do {
-                    let data = try await shardData(shard.id, force: force)
-                    let parsed = try parse(data)
-                    result.channels += parsed.channels
-                    if let generated = parsed.generated {
-                        result.generated = min(result.generated ?? generated, generated)
-                    }
-                } catch {
-                    result.problems.append("\(shard.title): \(error.localizedDescription)")
-                }
-            }
-            if shardIDs.contains("us-locals") || shardIDs.contains("ca"),
-               let data = try? await shardData("stations", force: force) {
-                result.stations = (try? parseStations(data)) ?? []
-            }
-            return result
-        }.value
-    }
+    // MARK: Cache
 
-    private static func cacheURL(_ shard: String) -> URL? {
+    private static func folder() -> URL? {
         guard let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first else { return nil }
         let folder = base.appendingPathComponent("OutsideGuide", isDirectory: true)
         try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-        return folder.appendingPathComponent("\(shard).json.z")
+        return folder
     }
 
-    private static func shardData(_ shard: String, force: Bool) async throws -> Data {
-        let cache = cacheURL(shard)
-        if !force, let cache,
-           let attributes = try? FileManager.default.attributesOfItem(atPath: cache.path),
-           let modified = attributes[.modificationDate] as? Date,
-           Date().timeIntervalSince(modified) < maxAge,
-           let data = try? Data(contentsOf: cache) {
-            return data
-        }
-        do {
-            guard let url = URL(string: releaseBase + "\(shard).json.z") else { throw URLError(.badURL) }
-            var request = URLRequest(url: url, timeoutInterval: 90)
-            request.cachePolicy = .reloadIgnoringLocalCacheData
-            let (data, response) = try await URLSession.shared.data(for: request)
-            guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode), !data.isEmpty else {
-                throw URLError(.badServerResponse)
+    private static func savedURL(signature: String) -> URL? {
+        let safe = String(signature.unicodeScalars.map { CharacterSet.alphanumerics.contains($0) ? Character($0) : "_" }.prefix(80))
+        return folder()?.appendingPathComponent("listings-\(safe).json")
+    }
+
+    static func loadSaved(signature: String) -> Saved? {
+        guard let url = savedURL(signature: signature), let data = try? Data(contentsOf: url) else { return nil }
+        return try? JSONDecoder().decode(Saved.self, from: data)
+    }
+
+    static func save(_ saved: Saved, signature: String) {
+        guard let url = savedURL(signature: signature), let data = try? JSONEncoder().encode(saved) else { return }
+        try? data.write(to: url, options: .atomic)
+    }
+
+    static func needsRebuild(_ saved: Saved?, shards: Set<String>, channelCount: Int) -> Bool {
+        guard let saved else { return true }
+        if Date().timeIntervalSince(saved.built) > refreshAge { return true }
+        if Set(saved.shards) != shards { return true }
+        // A much bigger lineup than last time: new channels need matching.
+        return channelCount > saved.channelCount + max(25, saved.channelCount / 10)
+    }
+
+    // MARK: Building
+
+    /// Builds listings for `channels` from the enabled sources. Runs on
+    /// background threads; `progress` reports a short status line.
+    static func build(
+        for channels: [LiveTVChannel],
+        shards: Set<String>,
+        progress: @escaping @Sendable (String) -> Void
+    ) async -> (programs: [String: [RawProgram]], problems: [String]) {
+        let targets = await Task.detached(priority: .background) { () -> Targets in
+            progress("Getting the station directory…")
+            let stations = shards.contains("us-locals") || shards.contains("ca")
+                ? await StationDirectory.load() : []
+            return Targets(channels: channels, stations: stations)
+        }.value
+
+        var merged: [String: [RawProgram]] = [:]
+        var problems: [String] = []
+        let now = Int(Date().timeIntervalSince1970 / 60)
+        let window = (low: now - 180, high: now + Int(keepHours * 60))
+        let chosen = sources.filter { shards.contains($0.shard) }
+        for (index, source) in chosen.enumerated() {
+            if Task.isCancelled { break }
+            progress("Updating listings: \(source.name) (\(index + 1) of \(chosen.count))…")
+            do {
+                let found = try await XMLTVReader.read(source: source, targets: targets, window: window)
+                for (channelID, programs) in found {
+                    merged[channelID] = mergePrograms(merged[channelID] ?? [], programs)
+                }
+            } catch {
+                problems.append("\(source.name): \(error.localizedDescription)")
             }
-            if let cache { try? data.write(to: cache, options: .atomic) }
-            return data
-        } catch {
-            if let cache, let data = try? Data(contentsOf: cache) { return data }
-            throw error
         }
+        return (merged, problems)
     }
 
-    private static func parse(_ compressed: Data) throws -> (channels: [Channel], generated: Date?) {
-        let data = try (compressed as NSData).decompressed(using: .zlib) as Data
-        guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let list = root["channels"] as? [[String: Any]] else { return ([], nil) }
-        let generated = (root["generated"] as? Double).map { Date(timeIntervalSince1970: $0) }
-        let channels: [Channel] = list.compactMap { entry in
-            let names = entry["n"] as? [String] ?? []
-            let signs = entry["c"] as? [String] ?? []
-            let rows = entry["p"] as? [[Any]] ?? []
-            let programs: [RawProgram] = rows.compactMap { row in
-                guard row.count >= 6,
-                      let start = (row[0] as? NSNumber)?.intValue,
-                      let minutes = (row[1] as? NSNumber)?.intValue,
-                      let title = row[2] as? String else { return nil }
-                return RawProgram(
-                    startMinute: start, minutes: minutes, title: title,
-                    subtitle: row[3] as? String, overview: row[4] as? String,
-                    flags: (row[5] as? NSNumber)?.intValue ?? 0
-                )
+    /// Adds `extra` programs that don't overlap `base` by more than 5 minutes.
+    static func mergePrograms(_ base: [RawProgram], _ extra: [RawProgram]) -> [RawProgram] {
+        guard !base.isEmpty else { return extra.sorted { $0.s < $1.s } }
+        var result = base
+        for program in extra {
+            let end = program.s + program.m
+            let clashes = result.contains { other in
+                min(end, other.s + other.m) - max(program.s, other.s) > 5
             }
-            guard !programs.isEmpty, !names.isEmpty || !signs.isEmpty else { return nil }
-            return Channel(names: names, callsigns: signs, programs: programs)
+            if !clashes { result.append(program) }
         }
-        return (channels, generated)
+        return result.sorted { $0.s < $1.s }
     }
 
-    private static func parseStations(_ compressed: Data) throws -> [Station] {
-        let data = try (compressed as NSData).decompressed(using: .zlib) as Data
-        guard let rows = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return [] }
-        return rows.compactMap { row in
-            guard let sign = row["c"] as? String, let network = row["net"] as? String else { return nil }
-            let city = (row["city"] as? String ?? "").lowercased()
-            let tokens = city.split(whereSeparator: { !($0.isLetter || $0.isNumber) }).map(String.init)
-                .filter { $0 != "city" && $0 != "the" }
-            guard !tokens.isEmpty else { return nil }
-            return Station(callsign: sign, network: network, cityTokens: tokens, channelNumber: row["ch"] as? String ?? "")
+    /// Programs for one channel inside `from...to`.
+    static func programs(_ raw: [RawProgram], channelID: String, from: Date, to: Date) -> [LiveTVProgram] {
+        let low = Int(from.timeIntervalSince1970 / 60)
+        let high = Int(to.timeIntervalSince1970 / 60)
+        return raw.compactMap { item in
+            let end = item.s + item.m
+            guard end > low, item.s < high else { return nil }
+            var program = LiveTVProgram(
+                id: "og|\(channelID)|\(item.s)",
+                channelID: channelID,
+                title: item.t,
+                episodeTitle: item.st,
+                overview: item.d,
+                start: Date(timeIntervalSince1970: TimeInterval(item.s * 60)),
+                end: Date(timeIntervalSince1970: TimeInterval(end * 60)),
+                isMovie: item.f & 1 != 0,
+                isSports: item.f & 2 != 0,
+                isNews: item.f & 4 != 0,
+                isKids: item.f & 8 != 0,
+                isLive: item.f & 16 != 0,
+                isPremiere: item.f & 32 != 0,
+                imageURL: nil
+            )
+            program.fromOutsideGuide = true
+            return program
         }
     }
 
     // MARK: Matching
+
+    /// The user's channels as lookup keys: call signs (from the name, or from
+    /// network + city via the station directory) and normalized names.
+    struct Targets {
+        var bySign: [String: [String]] = [:]
+        var byName: [String: [String]] = [:]
+
+        init(channels: [LiveTVChannel], stations: [Station]) {
+            let stationsByNetwork = Dictionary(grouping: stations, by: \.network)
+            for channel in channels {
+                let isLocal = (channel.group ?? "").lowercased().contains("local")
+                var signs = OutsideGuide.callsigns(in: channel.name, strongContext: isLocal)
+                if signs.isEmpty, let sign = OutsideGuide.stationCallsign(for: channel.name, stations: stationsByNetwork) {
+                    signs = [sign]
+                }
+                for sign in signs { bySign[sign, default: []].append(channel.id) }
+                for text in Set([channel.displayName, channel.name]) {
+                    let key = OutsideGuide.normalize(text)
+                    if key.count >= 2 { byName[key, default: []].append(channel.id) }
+                }
+            }
+        }
+
+        /// The user's channels a guide channel stands for. Call signs win over
+        /// names, since a call sign can't be ambiguous.
+        func matches(names: [String], xmltvID: String, locals: Bool) -> [String] {
+            var found: [String] = []
+            for sign in OutsideGuide.callsigns(in: (names + [xmltvID]).joined(separator: " | "), strongContext: locals) {
+                found += bySign[sign] ?? []
+            }
+            if !found.isEmpty { return found }
+            for name in names {
+                let key = OutsideGuide.normalize(name)
+                if key.count >= 2 { found += byName[key] ?? [] }
+            }
+            return found
+        }
+    }
 
     /// Network words as they show up in IPTV channel names.
     private static let networkWords: [String: String] = [
@@ -181,6 +257,7 @@ enum OutsideGuide {
     /// "NBC 5 Chicago" → WMAQ: a network word plus the station's city in the
     /// name (the channel number breaks ties).
     static func stationCallsign(for name: String, stations: [String: [Station]]) -> String? {
+        guard !stations.isEmpty else { return nil }
         let lowered = name.lowercased()
             .replacingOccurrences(of: "^\\s*[^:|]{1,24}[:|]\\s*", with: "", options: .regularExpression)
         let tokens = lowered.split(whereSeparator: { !($0.isLetter || $0.isNumber) }).map(String.init)
@@ -209,8 +286,9 @@ enum OutsideGuide {
         "east", "west", "pacific"
     ]
 
-    /// Same rule as the builder: a bare four-letter word only counts as a call
-    /// sign in a locals group, in parentheses, or with a -DT style suffix.
+    /// Call signs ("WNBC", "KABC-2" for a sub-channel). A bare four-letter
+    /// word only counts in a locals context, in parentheses, or with a -DT
+    /// style suffix, so "WILD" or "KIDS" in a network name don't.
     static func callsigns(in text: String, strongContext: Bool) -> [String] {
         guard let callPattern else { return [] }
         let upper = text.uppercased()
@@ -231,8 +309,8 @@ enum OutsideGuide {
         return found
     }
 
-    /// Same as the builder: East is the default feed and dropped; West /
-    /// Pacific feeds keep a marker so they never match the East listing.
+    /// Comparable form of a channel name. East is the default feed and is
+    /// dropped; West / Pacific feeds keep a marker so they never match East.
     static func normalize(_ name: String) -> String {
         var s = name.lowercased()
             .replacingOccurrences(of: "&", with: " and ")
@@ -245,72 +323,5 @@ enum OutsideGuide {
             .filter { !dropTokens.contains($0) }
         let key = tokens.joined()
         return west && !key.isEmpty ? key + "~west" : key
-    }
-
-    /// Server channel id → index into `guide`, for every channel that matches.
-    static func match(_ channels: [LiveTVChannel], guide: [Channel], stations: [Station] = []) -> [String: Int] {
-        let stationsByNetwork = Dictionary(grouping: stations, by: \.network)
-        var bySign: [String: [Int]] = [:]
-        var byName: [String: [Int]] = [:]
-        for (index, channel) in guide.enumerated() {
-            for sign in channel.callsigns { bySign[sign, default: []].append(index) }
-            for name in channel.names {
-                let key = normalize(name)
-                guard key.count >= 2 else { continue }
-                byName[key, default: []].append(index)
-            }
-        }
-        func best(_ candidates: [Int]?) -> Int? {
-            candidates?.max { guide[$0].programs.count < guide[$1].programs.count }
-        }
-        var result: [String: Int] = [:]
-        for channel in channels {
-            let isLocal = (channel.group ?? "").lowercased().contains("local")
-            var found: Int?
-            for sign in callsigns(in: channel.name, strongContext: isLocal) {
-                if let hit = best(bySign[sign]) { found = hit; break }
-            }
-            if found == nil, !stationsByNetwork.isEmpty,
-               let sign = stationCallsign(for: channel.name, stations: stationsByNetwork) {
-                found = best(bySign[sign])
-            }
-            if found == nil {
-                for text in [channel.displayName, channel.name] {
-                    let key = normalize(text)
-                    guard key.count >= 2 else { continue }
-                    if let hit = best(byName[key]) { found = hit; break }
-                }
-            }
-            if let found { result[channel.id] = found }
-        }
-        return result
-    }
-
-    /// Programs for one matched channel inside `from...to`.
-    static func programs(_ channel: Channel, channelID: String, from: Date, to: Date) -> [LiveTVProgram] {
-        let low = Int(from.timeIntervalSince1970 / 60)
-        let high = Int(to.timeIntervalSince1970 / 60)
-        return channel.programs.compactMap { raw in
-            let end = raw.startMinute + raw.minutes
-            guard end > low, raw.startMinute < high else { return nil }
-            var program = LiveTVProgram(
-                id: "og|\(channelID)|\(raw.startMinute)",
-                channelID: channelID,
-                title: raw.title,
-                episodeTitle: raw.subtitle,
-                overview: raw.overview,
-                start: Date(timeIntervalSince1970: TimeInterval(raw.startMinute * 60)),
-                end: Date(timeIntervalSince1970: TimeInterval(end * 60)),
-                isMovie: raw.flags & 1 != 0,
-                isSports: raw.flags & 2 != 0,
-                isNews: raw.flags & 4 != 0,
-                isKids: raw.flags & 8 != 0,
-                isLive: raw.flags & 16 != 0,
-                isPremiere: raw.flags & 32 != 0,
-                imageURL: nil
-            )
-            program.fromOutsideGuide = true
-            return program
-        }
     }
 }
