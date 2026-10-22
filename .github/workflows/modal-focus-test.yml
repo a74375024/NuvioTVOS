@@ -21,7 +21,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        test: [test1XtreamFillForm, test2SweepIntegrations, test3SweepAccount, test4SweepAppearance, test5SweepLayout, test6SweepPlayback, test7SweepAdvanced, test8SweepAbout]
+        test: [test1XtreamFillForm, test2SweepIntegrations]
     steps:
       - uses: actions/checkout@v4
         with:

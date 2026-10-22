@@ -273,26 +273,9 @@ final class ModalFocusProbe: XCTestCase {
     @discardableResult
     private func openSettingsCategory(_ name: String) -> XCUIElement? {
         launch("settings")
-        // Walk the sidebar with the remote (lower categories aren't in the
-        // tree until scrolled to).
-        for _ in 0..<3 where !isSidebar(focused) { press(.left) }
-        for _ in 0..<10 { press(.up) }
-        // Sidebar pills have no accessibility label of their own; match the
-        // focused pill to the element carrying the category's title.
-        var found = false
-        var category = app.buttons.matching(NSPredicate(format: "label BEGINSWITH[c] %@", name)).firstMatch
-        for _ in 0..<14 {
-            let title = app.descendants(matching: .any).matching(NSPredicate(format: "label BEGINSWITH[c] %@", name)).firstMatch
-            let current = focused
-            if title.exists, current.exists, current.frame.insetBy(dx: -4, dy: -4).contains(CGPoint(x: title.frame.midX, y: title.frame.midY)) {
-                found = true
-                category = title
-                break
-            }
-            press(.down)
-        }
-        guard found else {
-            problem("no settings category \(name) (sidebar focus: \(describe(focused)))")
+        let category = app.buttons.matching(NSPredicate(format: "label BEGINSWITH[c] %@", name)).firstMatch
+        guard focus(category, "\(name) category") else {
+            problem("no settings category \(name)")
             return nil
         }
         press(.select)
