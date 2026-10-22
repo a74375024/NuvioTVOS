@@ -194,6 +194,22 @@ struct XtreamClient {
         }
     }
 
+    /// The provider's full guide (XMLTV) for every channel: one file, often
+    /// several days long. Its channel ids are the streams' `epg_channel_id`s.
+    func guideURL() -> URL? {
+        guard let base = account.serverURL,
+              var components = URLComponents(url: base.appendingPathComponent("xmltv.php"), resolvingAgainstBaseURL: false) else {
+            return nil
+        }
+        components.queryItems = [
+            URLQueryItem(name: "username", value: account.username),
+            URLQueryItem(name: "password", value: password)
+        ]
+        return components.url
+    }
+
+    static let userAgent = "Mozilla/5.0 (Apple TV) NuvioTV"
+
     // MARK: Playback
 
     /// Direct stream URL. HLS when the provider allows it (plays best on
@@ -219,7 +235,7 @@ struct XtreamClient {
         ] + query.sorted { $0.key < $1.key }.map { URLQueryItem(name: $0.key, value: $0.value) }
         guard let url = components.url else { throw ClientError(message: "Invalid server address") }
         var request = URLRequest(url: url, timeoutInterval: 45)
-        request.setValue("Mozilla/5.0 (Apple TV) NuvioTV", forHTTPHeaderField: "User-Agent")
+        request.setValue(Self.userAgent, forHTTPHeaderField: "User-Agent")
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse else { throw ClientError(message: "No response from the provider") }
         guard (200...299).contains(http.statusCode) else {

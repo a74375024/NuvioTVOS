@@ -1204,6 +1204,8 @@ struct ContentView: View {
             case .tab(let tab):
                 if ScreenTour.requested == "live-demo-outside" {
                     LiveTVStore.shared.loadOutsideDemo()
+                } else if ScreenTour.requested == "live-demo-provider" {
+                    LiveTVStore.shared.loadProviderDemo()
                 } else if ScreenTour.requested?.hasPrefix("live-demo") == true {
                     LiveTVStore.shared.loadDemo(configureLineup: ScreenTour.requested != "live-demo-setup")
                 }

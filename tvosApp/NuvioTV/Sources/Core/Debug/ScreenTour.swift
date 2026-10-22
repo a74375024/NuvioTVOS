@@ -1,7 +1,7 @@
 import Foundation
 
 /// Launch hook for the automated screenshot tour (CI simulator only).
-/// `-NuvioScreenTour channels | live | calendar | library | search | settings | home | details:<id>:<type>`
+/// `-NuvioScreenTour channels | live | live-demo… | calendar | library | search | settings | home | details:<id>:<type>`
 /// skips sign-in as a guest and opens that screen. Without the launch
 /// argument this does nothing.
 enum ScreenTour {
@@ -25,7 +25,7 @@ enum ScreenTour {
         switch parts.first?.lowercased() {
         case "channels": return .tab(.channels)
         case "calendar": return .tab(.calendar)
-        case "live", "live-demo", "live-demo-search", "live-demo-groups", "live-demo-sources", "live-demo-outside", "live-demo-events", "live-demo-all", "live-demo-setup": return .tab(.live)
+        case "live", "live-demo", "live-demo-search", "live-demo-groups", "live-demo-sources", "live-demo-outside", "live-demo-events", "live-demo-all", "live-demo-setup", "live-demo-provider": return .tab(.live)
         case "library": return .tab(.library)
         case "search": return .tab(.search)
         case "settings": return .tab(.settings)

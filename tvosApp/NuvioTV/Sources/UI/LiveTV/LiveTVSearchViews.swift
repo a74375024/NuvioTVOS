@@ -266,6 +266,29 @@ struct LiveTVGuideSourcesView: View {
     var body: some View {
         NavigationStack {
             List {
+                if !store.providerStates.isEmpty {
+                    Section {
+                        ForEach(store.providerStates.keys.sorted(), id: \.self) { key in
+                            if let state = store.providerStates[key] {
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text(state.name)
+                                    Text(providerText(state.status))
+                                        .font(.system(size: 20))
+                                        .foregroundColor(.secondary)
+                                }
+                            }
+                        }
+                        Button(L10n.string("live_provider_refresh", fallback: "Update provider guide now")) {
+                            store.loadProviderGuide(force: true)
+                        }
+                    } header: {
+                        Text(L10n.string("live_provider_header", fallback: "Your provider's guide"))
+                    } footer: {
+                        Text(L10n.string("live_provider_footer", fallback: "Xtream providers publish one guide file for their whole lineup. Your Apple TV downloads it about twice a day while Nuvio is open (pausing while you watch), keeps only your US channels and matches them by the provider's own guide id. It comes first; outside listings only fill channels it doesn't cover."))
+                            .font(.system(size: 20))
+                    }
+                }
+
                 Section {
                     Toggle(isOn: $enabled) {
                         VStack(alignment: .leading, spacing: 4) {
@@ -320,6 +343,22 @@ struct LiveTVGuideSourcesView: View {
         }
         .fullScreenCover(isPresented: $showReport) {
             LiveTVExportView()
+        }
+    }
+
+    private func providerText(_ status: ProviderGuide.Status) -> String {
+        switch status {
+        case .updating(let line):
+            return line
+        case .unavailable(let message):
+            return message
+        case .failed(let message):
+            return L10n.format("live_provider_failed", fallback: "Couldn't load the guide: %@", message)
+        case .ready(let matched, let total, let guideChannels, let updated):
+            let f = RelativeDateTimeFormatter()
+            f.unitsStyle = .full
+            return L10n.format("live_provider_ready", fallback: "Listings for %d of %d channels (the file lists %d). Updated %@.",
+                               matched, total, guideChannels, f.localizedString(for: updated, relativeTo: Date()))
         }
     }
 

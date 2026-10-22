@@ -49,6 +49,7 @@ shots=(
   "07c-live-tv-groups|live-demo-groups|12"
   "07d-live-tv-listings|live-demo-sources|12"
   "07e-live-tv-outside-listings|live-demo-outside|180"
+  "07h-live-tv-provider-guide|live-demo-provider|40"
   "08-settings|settings|12"
 )
 

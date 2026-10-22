@@ -140,6 +140,12 @@ final class LiveTVStore: ObservableObject {
     private var outsideBuiltAt: Date?
     private var outsideNotes: [String: String] = [:]
     private var outsideTask: Task<Void, Never>?
+    /// The Xtream providers' own full guides (xmltv.php), per channel id.
+    private var providerMatches: [String: [OutsideGuide.RawProgram]] = [:]
+    private var providerNotes: [String: String] = [:]
+    private var providerTask: Task<Void, Never>?
+    /// Provider guide status per Xtream account (source id), for Guide Listings.
+    @Published private(set) var providerStates: [String: ProviderGuide.State] = [:]
     private var guideWindowByChannel: [String: Date] = [:]
     private var pendingGuide: [String] = []
     private var pendingGuideSet: Set<String> = []
@@ -218,6 +224,11 @@ final class LiveTVStore: ObservableObject {
             serverPrograms = [:]
             outsideMatches = [:]
             outsideStatus = .off
+            providerTask?.cancel()
+            providerTask = nil
+            providerMatches = [:]
+            providerNotes = [:]
+            providerStates = [:]
             guideState = [:]
             guideWindowByChannel = [:]
             channelsLoadedAt = nil
@@ -302,11 +313,14 @@ final class LiveTVStore: ObservableObject {
             self.apply(channels: annotated, catalog: catalog)
             self.state = .loaded
             if isFirstLoad {
+                self.loadProviderGuide()
                 self.loadOutsideGuide()
                 let first = self.visibleEntries().prefix(60).map(\.id)
                 let favorites = self.entries.filter(\.isFavorite).prefix(40).map(\.id)
                 self.requestGuide(Array(favorites) + self.recentIDs.prefix(20) + first)
             } else {
+                // New channels may need the provider's guide; cheap if not.
+                self.loadProviderGuide()
                 self.rebuildOutsidePrograms()
             }
         }
@@ -516,7 +530,7 @@ final class LiveTVStore: ObservableObject {
                 for id in ids {
                     let server = (grouped[id] ?? []).sorted { $0.start < $1.start }
                     self.serverPrograms[id] = server
-                    merged[id] = self.bestListing(server: server, outside: self.outsideListing(for: id))
+                    merged[id] = self.bestListing(server: self.serverListing(for: id), outside: self.outsideListing(for: id))
                     states[id] = .loaded
                     self.guideWindowByChannel[id] = start
                 }
@@ -532,8 +546,24 @@ final class LiveTVStore: ObservableObject {
     }
 
     /// Xtream guides come per channel ("short EPG"), a few at a time.
-    private func fetchXtreamGuide(_ ids: [String], client: XtreamClient) {
+    /// Channels the provider's full guide already covers skip the request.
+    private func fetchXtreamGuide(_ allIDs: [String], client: XtreamClient) {
         let start = Self.windowStart()
+        let covered = allIDs.filter { providerCovers($0, from: start) }
+        if !covered.isEmpty {
+            var merged = programs
+            var states = guideState
+            for id in covered {
+                merged[id] = bestListing(server: serverListing(for: id), outside: outsideListing(for: id))
+                states[id] = .loaded
+                guideWindowByChannel[id] = start
+            }
+            applyEntryGuides(&merged, &states, entryIDs: Array(Set(covered.compactMap { entryOf[$0] })))
+            programs = merged
+            guideState = states
+        }
+        let ids = allIDs.filter { !covered.contains($0) }
+        guard !ids.isEmpty else { return }
         let items = ids.compactMap { id in indexByID[id].map { (id, channels[$0].itemID) } }
         var states = guideState
         ids.forEach { states[$0] = .loading }
@@ -562,7 +592,7 @@ final class LiveTVStore: ObservableObject {
             for id in ids {
                 let server = (results[id] ?? []).sorted { $0.start < $1.start }
                 self.serverPrograms[id] = server
-                merged[id] = self.bestListing(server: server, outside: self.outsideListing(for: id))
+                merged[id] = self.bestListing(server: self.serverListing(for: id), outside: self.outsideListing(for: id))
                 states[id] = .loaded
                 self.guideWindowByChannel[id] = start
             }
@@ -616,6 +646,141 @@ final class LiveTVStore: ObservableObject {
         }
     }
 
+    // MARK: Provider guide (Xtream xmltv.php)
+
+    /// Uses each Xtream account's saved full guide right away, then rebuilds
+    /// the old ones (or all, with `force`) in the background. Only channels
+    /// with a guide id from a selected country take part.
+    func loadProviderGuide(force: Bool = false) {
+        if !force, providerTask != nil { return }
+        providerTask?.cancel()
+        providerTask = nil
+        let accounts = xtreamClients()
+        guard !accounts.isEmpty, !channels.isEmpty else {
+            if !providerMatches.isEmpty || !providerStates.isEmpty {
+                providerMatches = [:]
+                providerNotes = [:]
+                providerStates = [:]
+                rebuildOutsidePrograms()
+            }
+            return
+        }
+        let profile = ProfileSettings.activeProfileScope
+        var jobs: [(sourceID: String, name: String, url: URL, channels: [LiveTVChannel], key: String)] = []
+        var matches = providerMatches
+        var notes = providerNotes
+        var states = providerStates
+        for client in accounts {
+            let sourceID = client.account.sourceID
+            let name = client.account.displayName
+            let scoped = channels.filter {
+                $0.serverID == sourceID && traits[$0.id]?.familyKey == nil && ProviderGuide.inScope($0)
+            }
+            guard !scoped.isEmpty, let url = client.guideURL() else {
+                states[sourceID] = ProviderGuide.State(name: name, status: .unavailable(
+                    "None of this provider's channels in your countries have a guide id."))
+                continue
+            }
+            let key = ProviderGuide.cacheKey(profile: profile, sourceID: sourceID)
+            let saved = ProviderGuide.loadSaved(key)
+            if let saved {
+                Self.replace(&matches, &notes, prefix: "\(sourceID)|", with: saved.programs, saved.notes)
+                states[sourceID] = ProviderGuide.State(name: name, status: .ready(
+                    matched: saved.programs.count, total: scoped.count, guideChannels: saved.guideChannels, updated: saved.built))
+            }
+            if force || ProviderGuide.needsRebuild(saved, channelCount: scoped.count) {
+                jobs.append((sourceID, name, url, scoped, key))
+                if saved == nil {
+                    states[sourceID] = ProviderGuide.State(name: name, status: .updating("Waiting to start…"))
+                }
+            }
+        }
+        providerMatches = matches
+        providerNotes = notes
+        providerStates = states
+        rebuildOutsidePrograms()
+        guard !jobs.isEmpty else { return }
+        providerTask = Task { [weak self] in
+            // Let the guide's first screen load before background work.
+            try? await Task.sleep(nanoseconds: force ? 0 : 4_000_000_000)
+            for job in jobs {
+                guard !Task.isCancelled else { break }
+                await self?.runProviderBuild(sourceID: job.sourceID, name: job.name, url: job.url,
+                                             channels: job.channels, key: job.key)
+            }
+            if !Task.isCancelled { self?.providerTask = nil }
+        }
+    }
+
+    /// Builds one provider's guide and installs it (also used by the demo).
+    private func runProviderBuild(sourceID: String, name: String, url: URL, channels scoped: [LiveTVChannel], key: String?) async {
+        let previous = providerStates[sourceID]?.status
+        providerStates[sourceID] = ProviderGuide.State(name: name, status: .updating("Starting…"))
+        let outcome = await ProviderGuide.build(url: url, channels: scoped) { line in
+            Task { @MainActor [weak self] in
+                guard let self, case .updating = self.providerStates[sourceID]?.status else { return }
+                self.providerStates[sourceID] = ProviderGuide.State(name: name, status: .updating(line))
+            }
+        }
+        guard !Task.isCancelled else { return }
+        switch outcome {
+        case .built(let saved):
+            if let key { ProviderGuide.save(saved, key: key) }
+            var matches = providerMatches
+            var notes = providerNotes
+            Self.replace(&matches, &notes, prefix: "\(sourceID)|", with: saved.programs, saved.notes)
+            providerMatches = matches
+            providerNotes = notes
+            providerStates[sourceID] = ProviderGuide.State(name: name, status: .ready(
+                matched: saved.programs.count, total: scoped.count, guideChannels: saved.guideChannels, updated: saved.built))
+            rebuildOutsidePrograms()
+        case .unavailable(let message):
+            providerStates[sourceID] = ProviderGuide.State(name: name, status: .unavailable(message))
+        case .failed(let message):
+            // Keep using a saved guide if there is one.
+            if let previous, case .ready = previous {
+                providerStates[sourceID] = ProviderGuide.State(name: name, status: previous)
+                flash("Couldn't update \(name)'s guide: \(message)")
+            } else {
+                providerStates[sourceID] = ProviderGuide.State(name: name, status: .failed(message))
+            }
+        }
+    }
+
+    /// Swaps one provider's listings (channel ids starting with `prefix`).
+    private static func replace(
+        _ matches: inout [String: [OutsideGuide.RawProgram]], _ notes: inout [String: String],
+        prefix: String, with programs: [String: [OutsideGuide.RawProgram]], _ newNotes: [String: String]
+    ) {
+        matches = matches.filter { !$0.key.hasPrefix(prefix) }
+        notes = notes.filter { !$0.key.hasPrefix(prefix) }
+        matches.merge(programs) { _, new in new }
+        notes.merge(newNotes) { _, new in new }
+    }
+
+    private func providerListing(for id: String) -> [LiveTVProgram]? {
+        guard let match = providerMatches[id] else { return nil }
+        let start = Self.windowStart().addingTimeInterval(-3600)
+        return OutsideGuide.programs(match, channelID: id, from: start, to: start.addingTimeInterval(14 * 3600),
+                                     idPrefix: "pg", outside: false)
+    }
+
+    /// The provider's own listing for a channel: its full guide first, the
+    /// per-channel short guide filling any gaps (Emby: the server guide).
+    private func serverListing(for id: String) -> [LiveTVProgram] {
+        let short = serverPrograms[id] ?? []
+        guard let full = providerListing(for: id), !full.isEmpty else { return short }
+        return bestListing(server: full, outside: short)
+    }
+
+    /// Whether the provider's full guide has something in the guide window.
+    private func providerCovers(_ id: String, from start: Date) -> Bool {
+        guard let raw = providerMatches[id] else { return false }
+        let low = Int(start.timeIntervalSince1970 / 60)
+        let high = low + Int(Self.guideHours * 60)
+        return raw.contains { $0.s < high && $0.s + $0.m > low }
+    }
+
     // MARK: Outside listings
 
     /// Uses saved outside listings right away, then (if they're old, or
@@ -645,6 +810,8 @@ final class LiveTVStore: ObservableObject {
         outsideTask = Task { [weak self] in
             // Give the app a moment to settle before starting background work.
             try? await Task.sleep(nanoseconds: force ? 0 : 8_000_000_000)
+            // One heavy guide job at a time: the provider's own guide first.
+            if let pending = self?.providerTask { await pending.value }
             guard !Task.isCancelled else { return }
             let built = await OutsideGuide.build(for: snapshot, shards: shardIDs) { line in
                 Task { @MainActor in
@@ -683,9 +850,9 @@ final class LiveTVStore: ObservableObject {
     /// window moves on), then the entries built from them.
     private func rebuildOutsidePrograms() {
         var merged = programs.filter { !$0.key.hasPrefix("e|") }
-        let ids = Set(outsideMatches.keys).union(merged.keys)
+        let ids = Set(outsideMatches.keys).union(providerMatches.keys).union(merged.keys)
         for id in ids {
-            merged[id] = bestListing(server: serverPrograms[id], outside: outsideListing(for: id))
+            merged[id] = bestListing(server: serverListing(for: id), outside: outsideListing(for: id))
         }
         merged = merged.filter { !$0.value.isEmpty }
         var states = guideState
@@ -721,7 +888,9 @@ final class LiveTVStore: ObservableObject {
     /// Whether any version of an entry has guide data (server or outside).
     func entryHasGuide(_ id: String) -> Bool {
         guard let info = entryInfo[id] else { return !(programs[id] ?? []).isEmpty }
-        return info.members.contains { outsideMatches[$0] != nil || !(serverPrograms[$0] ?? []).isEmpty }
+        return info.members.contains {
+            outsideMatches[$0] != nil || providerMatches[$0] != nil || !(serverPrograms[$0] ?? []).isEmpty
+        }
     }
 
     // MARK: My Lineup
@@ -832,7 +1001,8 @@ final class LiveTVStore: ObservableObject {
             "number", "name", "group", "tags", "hidden_group", "favorite",
             "callsign_in_name", "station_lookup", "match_key",
             "server_guide", "server_programs_next_3h", "outside_listing", "outside_programs_next_3h",
-            "now_title", "now_source", "entry", "category", "in_my_lineup", "event_family", "event_text"
+            "now_title", "now_source", "entry", "category", "in_my_lineup", "event_family", "event_text",
+            "provider", "country", "guide_id", "provider_guide", "provider_guide_programs_next_3h"
         ].joined(separator: ",")]
         for channel in channels {
             let isLocal = (channel.group ?? "").lowercased().contains("local")
@@ -851,6 +1021,32 @@ final class LiveTVStore: ObservableObject {
             let current = self.current(on: channel.id, at: now)
             let trait = traits[channel.id]
             let entryID = entryOf[channel.id]
+            let isXtream = channel.serverID.hasPrefix("xt:")
+            let providerCount = (providerListing(for: channel.id) ?? []).filter { $0.end > start && $0.start < end }.count
+            let providerGuide: String
+            if !isXtream {
+                providerGuide = ""
+            } else if let note = providerNotes[channel.id] {
+                providerGuide = note
+            } else if trait?.familyKey != nil {
+                providerGuide = "event feed"
+            } else if channel.epgID?.isEmpty ?? true {
+                providerGuide = "no guide id"
+            } else if !ProviderGuide.inScope(channel) {
+                providerGuide = "country not selected"
+            } else {
+                switch providerStates[channel.serverID]?.status {
+                case .ready: providerGuide = "not in provider guide"
+                case .updating: providerGuide = "provider guide loading"
+                case .unavailable(let message), .failed(let message): providerGuide = "provider guide: \(message)"
+                case nil: providerGuide = "provider guide not loaded"
+                }
+            }
+            let source: String = current.map { program in
+                if program.fromOutsideGuide { return "outside" }
+                if program.id.hasPrefix("pg|") || program.id.contains("|pg|") { return "provider guide" }
+                return isXtream ? "provider short guide" : "server"
+            } ?? ""
             lines.append([
                 cell(channel.number ?? ""), cell(channel.name), cell(channel.group ?? ""),
                 cell(channel.tags.joined(separator: " | ")), cell(isHidden(channel) ? "yes" : ""),
@@ -858,10 +1054,12 @@ final class LiveTVStore: ObservableObject {
                 cell(OutsideGuide.normalize(channel.displayName)), cell(serverState), cell(String(serverCount)),
                 cell(outsideNotes[channel.id] ?? (outsideMatches[channel.id] == nil ? "no match" : "matched")),
                 cell(String(outsideCount)), cell(current?.title ?? ""),
-                cell(current.map { $0.fromOutsideGuide ? "outside" : "server" } ?? ""),
+                cell(source),
                 cell(entryID.flatMap { entryInfo[$0]?.name } ?? ""), cell(trait?.category.rawValue ?? ""),
                 cell(entryID.map { lineupIDs.contains($0) ? "yes" : "" } ?? ""),
-                cell(trait?.familyKey ?? ""), cell(trait?.eventText ?? "")
+                cell(trait?.familyKey ?? ""), cell(trait?.eventText ?? ""),
+                cell(providerName(for: channel.serverID) ?? ""), cell(ProviderGuide.countryPrefix(of: channel.group) ?? ""),
+                cell(channel.epgID ?? ""), cell(providerGuide), cell(isXtream ? String(providerCount) : "")
             ].joined(separator: ","))
         }
         return lines.joined(separator: "\n") + "\n"
@@ -1542,5 +1740,57 @@ final class LiveTVStore: ObservableObject {
             rebuildEntries()
         }
         state = .loaded
+    }
+
+    /// Xtream-style channels whose listings come only from a provider guide
+    /// file built on this device (`-NuvioScreenTour live-demo-provider`):
+    /// an end-to-end check of the xmltv.php path (exact guide ids, two
+    /// streams sharing one id, case differences, a channel from another
+    /// country left out, one without a guide id).
+    func loadProviderDemo() {
+        let source = "xt:demo"
+        let items: [(name: String, group: String, epg: String?)] = [
+            ("US: ABC 7 (KGO) SAN FRANCISCO ᴴᴰ", "US| ABC ᴴᴰ/ᴿᴬᵂ ⁶⁰ᶠᵖˢ", "KGO.us"),
+            ("US: ABC 7 (KGO) SAN FRANCISCO (S)", "US| ABC ᴴᴰ/ᴿᴬᵂ ⁶⁰ᶠᵖˢ", "KGO.us"),
+            ("US: FOX 2 (KTVU) SAN FRANCISCO ᴿᴬᵂ", "US| FOX ᴴᴰ/ᴿᴬᵂ ⁶⁰ᶠᵖˢ", "KTVU.us"),
+            ("US: ESPN ᴴᴰ", "US| SPORT ᴴᴰ/ᴿᴬᵂ ⁶⁰ᶠᵖˢ", "ESPN.us"),
+            ("US: CNN ᴴᴰ", "US| NEWS ᴴᴰ/ᴿᴬᵂ ⁶⁰ᶠᵖˢ", "cnn.us"),
+            ("US: HGTV ᴴᴰ", "US| ENTERTAINMENT ᴴᴰ/ᴿᴬᵂ ⁶⁰ᶠᵖˢ", "HGTV.us"),
+            ("US: FOOD NETWORK ᴴᴰ", "US| ENTERTAINMENT ᴴᴰ/ᴿᴬᵂ ⁶⁰ᶠᵖˢ", "FoodNetwork.us"),
+            ("US: TCM ᴴᴰ", "US| MOVIES ᴴᴰ/ᴿᴬᵂ ⁶⁰ᶠᵖˢ", "TCM.us"),
+            ("US: CARTOON NETWORK ᴴᴰ", "US| KIDS ᴴᴰ/ᴿᴬᵂ ⁶⁰ᶠᵖˢ", nil),
+            ("UK: BBC ONE ᴴᴰ", "UK| GENERAL ᴴᴰ/ᴿᴬᵂ", "BBCOne.uk")
+        ]
+        let demo: [LiveTVChannel] = items.enumerated().map { index, item in
+            var channel = LiveTVChannel(id: "\(source)|\(100 + index)", serverID: source, itemID: String(100 + index),
+                                        name: item.name, number: String(index + 1), imageURL: nil, isFavorite: false,
+                                        tags: [item.group])
+            channel.epgID = item.epg
+            return channel
+        }
+        loadedSignature = currentSignature
+        channelsLoadedAt = Date()
+        let annotated = Self.annotated(demo)
+        apply(channels: annotated, catalog: ChannelCatalog.build(annotated))
+        programs = [:]
+        serverPrograms = [:]
+        guideState = Dictionary(uniqueKeysWithValues: demo.map { ($0.id, GuideState.loaded) })
+        state = .loaded
+        let file = ProviderGuide.writeDemoFile(
+            channels: [("KGO.us", "ABC 7 San Francisco"), ("KTVU.us", "FOX 2 Bay Area"), ("ESPN.us", "ESPN"),
+                       ("CNN.us", "CNN"), ("HGTV.us", "HGTV"), ("FoodNetwork.us", "Food Network"),
+                       ("BBCOne.uk", "BBC One"), ("NotYours.us", "Some Other Channel")],
+            titles: ["Provider: ABC7 News", "Provider: SportsCenter", "Provider: CNN Newsroom", "Provider: House Hunters",
+                     "Provider: Chopped", "Provider: World News Tonight", "Provider: Jeopardy!"]
+        )
+        guard let file else {
+            providerStates[source] = ProviderGuide.State(name: "Demo provider", status: .failed("Couldn't write the demo guide."))
+            return
+        }
+        let scoped = annotated.filter { traits[$0.id]?.familyKey == nil && ProviderGuide.inScope($0) }
+        providerTask = Task { [weak self] in
+            await self?.runProviderBuild(sourceID: source, name: "Demo provider", url: file, channels: scoped, key: nil)
+            self?.providerTask = nil
+        }
     }
 }

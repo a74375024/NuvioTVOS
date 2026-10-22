@@ -184,15 +184,17 @@ enum OutsideGuide {
         return result.sorted { $0.s < $1.s }
     }
 
-    /// Programs for one channel inside `from...to`.
-    static func programs(_ raw: [RawProgram], channelID: String, from: Date, to: Date) -> [LiveTVProgram] {
+    /// Programs for one channel inside `from...to`. `idPrefix` "pg" marks the
+    /// provider's own guide (which counts as the server's, not outside).
+    static func programs(_ raw: [RawProgram], channelID: String, from: Date, to: Date,
+                         idPrefix: String = "og", outside: Bool = true) -> [LiveTVProgram] {
         let low = Int(from.timeIntervalSince1970 / 60)
         let high = Int(to.timeIntervalSince1970 / 60)
         return raw.compactMap { item in
             let end = item.s + item.m
             guard end > low, item.s < high else { return nil }
             var program = LiveTVProgram(
-                id: "og|\(channelID)|\(item.s)",
+                id: "\(idPrefix)|\(channelID)|\(item.s)",
                 channelID: channelID,
                 title: item.t,
                 episodeTitle: item.st,
@@ -207,7 +209,7 @@ enum OutsideGuide {
                 isPremiere: item.f & 32 != 0,
                 imageURL: nil
             )
-            program.fromOutsideGuide = true
+            program.fromOutsideGuide = outside
             return program
         }
     }

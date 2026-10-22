@@ -34,20 +34,40 @@ enum GuideFiles {
         return folder
     }
 
+    /// A download answered with an HTTP error status.
+    struct HTTPStatusError: LocalizedError {
+        let status: Int
+        var errorDescription: String? { "The server answered \(status)." }
+    }
+
     /// Downloads to a file (never into memory), marked as background traffic.
-    static func download(_ urlString: String) async throws -> URL {
+    /// A file URL (used by the screenshot tour) is copied as it is.
+    static func download(_ urlString: String, userAgent: String = "NuvioTV/1.0 (Apple TV; personal use)") async throws -> URL {
         guard let url = URL(string: urlString) else { throw URLError(.badURL) }
+        return try await download(url, userAgent: userAgent)
+    }
+
+    static func download(_ url: URL, userAgent: String = "NuvioTV/1.0 (Apple TV; personal use)") async throws -> URL {
+        let destination = workFolder().appendingPathComponent(UUID().uuidString + ".gz")
+        if url.isFileURL {
+            try FileManager.default.copyItem(at: url, to: destination)
+            return destination
+        }
         var request = URLRequest(url: url, timeoutInterval: 180)
         request.networkServiceType = .background
-        request.setValue("NuvioTV/1.0 (Apple TV; personal use)", forHTTPHeaderField: "User-Agent")
+        request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
         let (temp, response) = try await URLSession.shared.download(for: request)
         guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
             try? FileManager.default.removeItem(at: temp)
+            if let http = response as? HTTPURLResponse { throw HTTPStatusError(status: http.statusCode) }
             throw URLError(.badServerResponse)
         }
-        let destination = workFolder().appendingPathComponent(UUID().uuidString + ".gz")
         try FileManager.default.moveItem(at: temp, to: destination)
         return destination
+    }
+
+    static func size(of file: URL) -> Int64 {
+        ((try? FileManager.default.attributesOfItem(atPath: file.path))?[.size] as? NSNumber)?.int64Value ?? 0
     }
 
     /// Streams a .gz file to a plain file 1 MB at a time. Plain files are
@@ -112,11 +132,17 @@ enum GuideFiles {
 // MARK: - XMLTV streaming reader
 
 /// Streams through one XMLTV file on a background thread, keeping only
-/// programmes for channels that match the user's lineup.
+/// programmes for channels that match the user's lineup. Outside sources
+/// match by call sign or name; a provider's own guide matches by its exact
+/// channel ids (`exact`).
 final class XMLTVReader: NSObject, XMLParserDelegate {
     private let targets: OutsideGuide.Targets
     private let locals: Bool
     private let window: (low: Int, high: Int)
+    /// Lower-cased XMLTV channel id → the user's channels with that guide id.
+    private let exact: [String: [String]]?
+    private(set) var guideChannelCount = 0
+    private(set) var programmeCount = 0
 
     private var channelNames: [String: [String]] = [:]
     private var currentChannel: String?
@@ -136,20 +162,42 @@ final class XMLTVReader: NSObject, XMLParserDelegate {
     private var collecting = false
     private var counter = 0
 
-    private init(targets: OutsideGuide.Targets, locals: Bool, window: (low: Int, high: Int)) {
+    private init(targets: OutsideGuide.Targets, locals: Bool, window: (low: Int, high: Int), exact: [String: [String]]? = nil) {
         self.targets = targets
         self.locals = locals
         self.window = window
+        self.exact = exact
     }
 
-    /// User channel id → its programmes from this source.
-    static func read(
-        source: OutsideGuide.Source,
-        targets: OutsideGuide.Targets,
+    struct ExactResult {
+        var programs: [String: (programs: [OutsideGuide.RawProgram], note: String)]
+        /// Channels and programmes listed in the whole file.
+        var guideChannels: Int
+        var programmes: Int
+        var bytes: Int64
+    }
+
+    /// A provider's own guide: keeps programmes whose channel id is one of
+    /// `ids` (lower-cased guide id → user channel ids).
+    static func readExact(
+        url: URL,
+        userAgent: String,
+        ids: [String: [String]],
         window: (low: Int, high: Int)
-    ) async throws -> [String: (programs: [OutsideGuide.RawProgram], note: String)] {
-        let compressed = try await GuideFiles.download(source.url)
-        return try await withCheckedThrowingContinuation { continuation in
+    ) async throws -> ExactResult {
+        let compressed = try await GuideFiles.download(url, userAgent: userAgent)
+        let bytes = GuideFiles.size(of: compressed)
+        let reader = try await parse(compressed) {
+            XMLTVReader(targets: OutsideGuide.Targets(channels: [], stations: []), locals: false, window: window, exact: ids)
+        }
+        return ExactResult(programs: reader.result(), guideChannels: reader.guideChannelCount,
+                           programmes: reader.programmeCount, bytes: bytes)
+    }
+
+    /// Unzips (if needed) and parses a downloaded file on a background
+    /// thread, then deletes the working files.
+    private static func parse(_ compressed: URL, make: @escaping @Sendable () -> XMLTVReader) async throws -> XMLTVReader {
+        try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .background).async {
                 var plain: URL?
                 defer {
@@ -159,17 +207,31 @@ final class XMLTVReader: NSObject, XMLParserDelegate {
                 do {
                     plain = try GuideFiles.gunzip(compressed)
                     guard let plain, let stream = InputStream(url: plain) else { throw CocoaError(.fileReadUnknown) }
-                    let reader = XMLTVReader(targets: targets, locals: source.locals, window: window)
+                    let reader = make()
                     let parser = XMLParser(stream: stream)
                     parser.delegate = reader
                     parser.shouldResolveExternalEntities = false
                     parser.parse()
-                    continuation.resume(returning: reader.result())
+                    continuation.resume(returning: reader)
                 } catch {
                     continuation.resume(throwing: error)
                 }
             }
         }
+    }
+
+    /// User channel id → its programmes from this source.
+    static func read(
+        source: OutsideGuide.Source,
+        targets: OutsideGuide.Targets,
+        window: (low: Int, high: Int)
+    ) async throws -> [String: (programs: [OutsideGuide.RawProgram], note: String)] {
+        let compressed = try await GuideFiles.download(source.url)
+        let locals = source.locals
+        let reader = try await parse(compressed) {
+            XMLTVReader(targets: targets, locals: locals, window: window)
+        }
+        return reader.result()
     }
 
     private func result() -> [String: (programs: [OutsideGuide.RawProgram], note: String)] {
@@ -197,6 +259,12 @@ final class XMLTVReader: NSObject, XMLParserDelegate {
     // Channels come first in XMLTV; the keep list is settled at the first programme.
     private func settleKeepList() {
         guard keep == nil else { return }
+        if let exact {
+            keep = exact.mapValues { ids in ids.map { (id: $0, how: "by guide id") } }
+            for (id, names) in channelNames { keepNames[id] = names.first ?? id }
+            channelNames = [:]
+            return
+        }
         var list: [String: [(id: String, how: String)]] = [:]
         for (id, names) in channelNames {
             let matches = targets.matches(names: names, xmltvID: id, locals: locals)
@@ -213,7 +281,13 @@ final class XMLTVReader: NSObject, XMLParserDelegate {
                 qualifiedName: String?, attributes: [String: String] = [:]) {
         switch element {
         case "channel":
+            guideChannelCount += 1
             currentChannel = attributes["id"]
+            if let exact, let id = currentChannel {
+                // Only the names of channels the user has are worth keeping.
+                let key = id.lowercased()
+                currentChannel = exact[key] != nil ? key : nil
+            }
             if let id = currentChannel { channelNames[id] = [] }
         case "display-name":
             collecting = currentChannel != nil
@@ -221,8 +295,10 @@ final class XMLTVReader: NSObject, XMLParserDelegate {
         case "programme":
             settleKeepList()
             counter += 1
+            programmeCount += 1
             if counter % 4000 == 0 { OutsideGuidePause.shared.waitWhilePaused() }
-            let id = attributes["channel"] ?? ""
+            let raw = attributes["channel"] ?? ""
+            let id = exact != nil ? raw.lowercased() : raw
             guard keep?[id] != nil,
                   let start = Self.minutes(attributes["start"]),
                   let end = Self.minutes(attributes["stop"]),

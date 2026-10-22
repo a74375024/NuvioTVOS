@@ -188,6 +188,24 @@ struct LiveTVGuideView: View {
         }
     }
 
+    /// The provider guide's progress while it builds (and its result during
+    /// the screenshot tour).
+    private var providerGuideLine: String? {
+        for state in store.providerStates.values.sorted(by: { $0.name < $1.name }) {
+            switch state.status {
+            case .updating(let line):
+                return line
+            case .ready(let matched, let total, _, _) where ScreenTour.isActive:
+                return "Provider guide: \(matched) of \(total) channels"
+            case .unavailable(let message) where ScreenTour.isActive, .failed(let message) where ScreenTour.isActive:
+                return "Provider guide: \(message)"
+            default:
+                continue
+            }
+        }
+        return nil
+    }
+
     private func runScreenTourHooks() {
         guard let request = ScreenTour.requested else { return }
         DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
@@ -373,7 +391,12 @@ struct LiveTVGuideView: View {
                     .font(.system(size: 24, weight: .bold))
                     .foregroundColor(.white.opacity(0.55))
                 if store.isLoadingGuide { ProgressView().tint(.white).scaleEffect(0.7) }
-                if case .updating(let line) = store.outsideStatus {
+                if let line = providerGuideLine {
+                    Text(line)
+                        .font(.system(size: 18, weight: .medium))
+                        .foregroundColor(.white.opacity(0.45))
+                        .lineLimit(1)
+                } else if case .updating(let line) = store.outsideStatus {
                     Text(line)
                         .font(.system(size: 18, weight: .medium))
                         .foregroundColor(.white.opacity(0.45))
