@@ -151,7 +151,7 @@ struct LiveTVGuideView: View {
             let ppm = gridWidth / CGFloat(LiveGuideMetrics.windowMinutes)
             let channels = visibleChannels
             VStack(alignment: .leading, spacing: 0) {
-                hero.frame(height: LiveGuideMetrics.heroHeight)
+                hero.frame(width: max(0, proxy.size.width - LiveGuideMetrics.sideInset * 2), height: LiveGuideMetrics.heroHeight).clipped()
                 filterBar.padding(.bottom, 14)
                 timeRuler(gridWidth: gridWidth, ppm: ppm).padding(.bottom, 8)
                 ScrollView(.vertical, showsIndicators: false) {
@@ -168,9 +168,11 @@ struct LiveTVGuideView: View {
                     }
                     .padding(.bottom, 60)
                 }
+                .mask(Rectangle().padding(.horizontal, -60).padding(.bottom, -200))
                 .focusSection()
             }
             .padding(.horizontal, LiveGuideMetrics.sideInset)
+            .frame(width: proxy.size.width, alignment: .leading)
             .overlay(alignment: .topLeading) {
                 nowLine(gridWidth: gridWidth, ppm: ppm, height: proxy.size.height)
             }
@@ -248,7 +250,8 @@ struct LiveTVGuideView: View {
                 }
                 Spacer(minLength: 0)
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
+            .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
+            .layoutPriority(-1)
 
             VStack(alignment: .trailing, spacing: 10) {
                 Text(ChannelsView.clockFormatter.string(from: now))
@@ -400,7 +403,12 @@ struct LiveTVGuideView: View {
             }
             let to = min(program.end, end)
             let width = CGFloat(to.timeIntervalSince(from) / 60) * ppm
-            result.append(.program(program, width: width, startsEarlier: program.start < start))
+            if width < 40 {
+                // Too thin to read or focus: leave it as space.
+                result.append(.gap(width: width))
+            } else {
+                result.append(.program(program, width: width, startsEarlier: program.start < start))
+            }
             cursor = to
         }
         return result
@@ -471,6 +479,7 @@ struct LiveTVGuideView: View {
             store.watch(channel)
         } label: {
             VStack(alignment: .leading, spacing: 4) {
+                if cellWidth >= 110 {
                 HStack(spacing: 6) {
                     if startsEarlier {
                         Image(systemName: "chevron.left").font(.system(size: 14, weight: .bold)).opacity(0.6)
@@ -483,6 +492,7 @@ struct LiveTVGuideView: View {
                     .font(.system(size: 17, weight: .medium))
                     .opacity(0.7)
                     .lineLimit(1)
+                }
             }
             .foregroundColor(isFocused ? .black : .white)
             .padding(.horizontal, cellWidth > 60 ? 14 : 4)

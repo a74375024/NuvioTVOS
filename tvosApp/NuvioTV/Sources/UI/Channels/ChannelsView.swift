@@ -38,10 +38,13 @@ struct ChannelsView: View {
             ZStack(alignment: .top) {
                 Color.nuvioBackground(amoled: amoled, body: bodyColor).ignoresSafeArea()
                 heroBackdrop
+                    .frame(width: proxy.size.width, height: proxy.size.height)
+                    .clipped()
 
                 VStack(alignment: .leading, spacing: 0) {
                     hero
-                        .frame(height: GuideMetrics.heroHeight)
+                        .frame(width: max(0, proxy.size.width - GuideMetrics.sideInset * 2), height: GuideMetrics.heroHeight)
+                        .clipped()
                     timeRuler(gridWidth: gridWidth, pointsPerMinute: pointsPerMinute)
                         .padding(.bottom, 10)
                     ScrollView(.vertical, showsIndicators: false) {
@@ -52,9 +55,13 @@ struct ChannelsView: View {
                         }
                         .padding(.bottom, 60)
                     }
+                    // Rows scroll under the ruler, not over it; sides and
+                    // bottom stay open for the focus lift.
+                    .mask(Rectangle().padding(.horizontal, -60).padding(.bottom, -200))
                     .focusSection()
                 }
                 .padding(.horizontal, GuideMetrics.sideInset)
+                .frame(width: proxy.size.width, alignment: .leading)
             }
         }
         .onAppear {
@@ -156,7 +163,8 @@ struct ChannelsView: View {
                 }
                 Spacer(minLength: 0)
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
+            .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
+            .layoutPriority(-1)
 
             VStack(alignment: .trailing, spacing: 10) {
                 Text(Self.clockFormatter.string(from: Date()))

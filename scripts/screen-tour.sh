@@ -45,12 +45,30 @@ shots=(
   "08-settings|settings|12"
 )
 
+is_running() {
+  xcrun simctl spawn "$udid" launchctl list 2>/dev/null | grep -q "UIKitApplication:$bundle"
+}
+
 for entry in "${shots[@]}"; do
   IFS='|' read -r name target wait <<<"$entry"
   echo "==> $name ($target, ${wait}s)"
-  xcrun simctl launch --terminate-running-process "$udid" "$bundle" -NuvioScreenTour "$target" >/dev/null || true
-  sleep "$wait"
+  for attempt in 1 2; do
+    xcrun simctl terminate "$udid" "$bundle" >/dev/null 2>&1 || true
+    sleep 2
+    xcrun simctl launch "$udid" "$bundle" -NuvioScreenTour "$target" >/dev/null || true
+    sleep "$wait"
+    if is_running; then break; fi
+    echo "  app not running after launch (attempt $attempt)"
+    echo "::warning title=Screen tour::$name: the app wasn't running after launch (attempt $attempt)"
+  done
   xcrun simctl io "$udid" screenshot --type=png "$OUT/$name.png" >/dev/null 2>&1 || echo "  (screenshot failed)"
+done
+
+# Surface any crash reports from the run.
+for report in "$HOME"/Library/Logs/DiagnosticReports/NuvioTV*; do
+  [ -f "$report" ] || continue
+  summary=$(grep -m1 -E '"exception"|Exception Type' "$report" | head -c 300)
+  echo "::warning title=Crash during screen tour::$(basename "$report") ${summary}"
 done
 
 xcrun simctl terminate "$udid" "$bundle" 2>/dev/null || true
