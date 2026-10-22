@@ -57,6 +57,7 @@ struct LiveTVGuideView: View {
     @State private var showSearch = false
     @State private var showGroups = false
     @State private var showGenres = false
+    @State private var showSources = false
     @State private var now = Date()
 
     private let ticker = Timer.publish(every: 30, on: .main, in: .common).autoconnect()
@@ -98,6 +99,8 @@ struct LiveTVGuideView: View {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1) { showSearch = true }
             } else if ScreenTour.requested == "live-demo-groups" {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1) { showGroups = true }
+            } else if ScreenTour.requested == "live-demo-sources" {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1) { showSources = true }
             }
         }
         .onReceive(ticker) { date in
@@ -118,6 +121,9 @@ struct LiveTVGuideView: View {
                 showSearch = false
                 store.watch(channel, lineup: lineup)
             }
+        }
+        .sheet(isPresented: $showSources) {
+            LiveTVGuideSourcesView()
         }
         .sheet(isPresented: $showGroups) {
             LiveTVGroupsView(selected: scopeGroup) { group in
@@ -286,6 +292,15 @@ struct LiveTVGuideView: View {
                         Text(timeRange(program))
                             .font(.system(size: 24, weight: .semibold).monospacedDigit())
                             .foregroundColor(.white.opacity(0.8))
+                        if program.fromOutsideGuide {
+                            Text(L10n.string("live_outside_badge", fallback: "OUTSIDE LISTING"))
+                                .font(.system(size: 14, weight: .heavy))
+                                .tracking(0.6)
+                                .foregroundColor(.white.opacity(0.6))
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 3)
+                                .overlay(RoundedRectangle(cornerRadius: 5).strokeBorder(Color.white.opacity(0.35), lineWidth: 1))
+                        }
                         if let episode = program.episodeTitle {
                             Text("· \(episode)")
                                 .font(.system(size: 24, weight: .medium))
@@ -406,6 +421,9 @@ struct LiveTVGuideView: View {
             }
             SourceModeChip(title: (genre?.title ?? L10n.string("live_genre", fallback: "Genre")) + " ▾", isSelected: genre != nil) {
                 showGenres = true
+            }
+            SourceModeChip(title: L10n.string("live_listings", fallback: "Listings"), isSelected: false) {
+                showSources = true
             }
             Spacer(minLength: 0)
             if !multiview.channels.isEmpty {
@@ -644,18 +662,6 @@ struct LiveTVGuideView: View {
             store.watch(channel)
         } label: {
             Label(L10n.string("live_watch", fallback: "Watch"), systemImage: "play.fill")
-        }
-        Button {
-            store.addToMultiview(channel)
-        } label: {
-            Label(L10n.string("live_add_multiview", fallback: "Add to Multiview"), systemImage: "rectangle.split.2x2")
-        }
-        if !multiview.channels.isEmpty {
-            Button {
-                multiview.isPresented = true
-            } label: {
-                Label(L10n.format("live_open_multiview", fallback: "Multiview (%d)", multiview.channels.count), systemImage: "rectangle.split.2x2.fill")
-            }
         }
         Button {
             let group = store.groupName(of: channel)

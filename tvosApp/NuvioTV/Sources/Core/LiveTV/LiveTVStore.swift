@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import UIKit
 
 /// Live TV from the Emby / Jellyfin servers signed in under Settings →
 /// Jellyfin: channel list, a few hours of real guide data, and tuning (with
@@ -7,6 +8,16 @@ import Combine
 @MainActor
 final class LiveTVStore: ObservableObject {
     static let shared = LiveTVStore()
+
+    private var backgroundObserver: NSObjectProtocol?
+
+    private init() {
+        backgroundObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.appDidEnterBackground() }
+        }
+    }
 
     enum LoadState: Equatable {
         case idle
@@ -20,6 +31,13 @@ final class LiveTVStore: ObservableObject {
     enum Overlay: Equatable {
         case tuning(LiveTVChannel)
         case failed(LiveTVChannel, String)
+    }
+
+    enum OutsideStatus: Equatable {
+        case off
+        case loading
+        case ready(matched: Int, total: Int, updated: Date?)
+        case failed(String)
     }
 
     enum GuideState: Equatable {
@@ -51,6 +69,7 @@ final class LiveTVStore: ObservableObject {
     @Published private(set) var groups: [ChannelGroup] = []
     @Published private(set) var hiddenGroups: Set<String> = []
     @Published private(set) var recentIDs: [String] = []
+    @Published private(set) var outsideStatus: OutsideStatus = .off
     @Published private(set) var watching: LiveTVChannel?
     @Published private(set) var overlay: Overlay?
     @Published private(set) var banner: Banner?
@@ -76,11 +95,18 @@ final class LiveTVStore: ObservableObject {
     private var guideWindowStart: Date?
     private var loadTask: Task<Void, Never>?
     private var guideTask: Task<Void, Never>?
-    private var tuneTask: Task<Void, Never>?
+    private var tuneGeneration = 0
+    private var streamWork: Task<Void, Never>?
     private var bannerTask: Task<Void, Never>?
     private var toastTask: Task<Void, Never>?
-    private var openStreams: [String: (stream: LiveTVStream, serverID: String)] = [:]
+    /// Streams currently open on the server (at most one in practice).
+    private var openStreams: [(stream: LiveTVStream, serverID: String)] = []
     private var indexByID: [String: Int] = [:]
+    /// What the server's guide returned, before outside listings are merged in.
+    private var serverPrograms: [String: [LiveTVProgram]] = [:]
+    /// Outside-listing channel matched to each server channel.
+    private var outsideMatches: [String: OutsideGuide.Channel] = [:]
+    private var outsideTask: Task<Void, Never>?
     private var guideWindowByChannel: [String: Date] = [:]
     private var pendingGuide: [String] = []
     private var pendingGuideSet: Set<String> = []
@@ -123,6 +149,9 @@ final class LiveTVStore: ObservableObject {
             pendingGuide = []
             pendingGuideSet = []
             programs = [:]
+            serverPrograms = [:]
+            outsideMatches = [:]
+            outsideStatus = .off
             guideState = [:]
             guideWindowByChannel = [:]
             channelsLoadedAt = nil
@@ -179,6 +208,7 @@ final class LiveTVStore: ObservableObject {
                 self.state = .loaded
                 self.guideLoadedAt = nil
                 // Favorites, recents and the top of the list first.
+                self.loadOutsideGuide()
                 let favorites = self.channels.filter(\.isFavorite).prefix(60).map(\.id)
                 self.requestGuide(Array(favorites) + self.recentIDs.prefix(20) + self.channels.prefix(80).map(\.id))
             }
@@ -212,6 +242,7 @@ final class LiveTVStore: ObservableObject {
         let start = Self.windowStart()
         guard guideWindowStart != start else { return }
         guideWindowStart = start
+        rebuildOutsidePrograms()
         requestGuide(recentlyRequested)
     }
 
@@ -296,7 +327,9 @@ final class LiveTVStore: ObservableObject {
             if let list = result {
                 let grouped = Dictionary(grouping: list, by: \.channelID)
                 for id in ids {
-                    merged[id] = (grouped[id] ?? []).sorted { $0.start < $1.start }
+                    let server = (grouped[id] ?? []).sorted { $0.start < $1.start }
+                    self.serverPrograms[id] = server
+                    merged[id] = self.bestListing(server: server, outside: self.outsideListing(for: id))
                     states[id] = .loaded
                     self.guideWindowByChannel[id] = start
                 }
@@ -308,6 +341,78 @@ final class LiveTVStore: ObservableObject {
             self.guideLoadedAt = Date()
             self.startGuideFetches()
         }
+    }
+
+    // MARK: Outside listings
+
+    /// Downloads (or reads cached) free outside listings and matches them to
+    /// this server's channels; channels the server has no guide for get them.
+    func loadOutsideGuide(force: Bool = false) {
+        outsideTask?.cancel()
+        guard OutsideGuide.isEnabled, !channels.isEmpty else {
+            outsideMatches = [:]
+            outsideStatus = .off
+            rebuildOutsidePrograms()
+            return
+        }
+        let shardIDs = OutsideGuide.enabledShards
+        let snapshot = channels
+        outsideStatus = .loading
+        outsideTask = Task { [weak self] in
+            let loaded = await OutsideGuide.load(shardIDs: shardIDs, force: force)
+            let matches = await Task.detached(priority: .utility) {
+                OutsideGuide.match(snapshot, guide: loaded.channels)
+            }.value
+            guard let self, !Task.isCancelled else { return }
+            self.outsideMatches = matches.mapValues { loaded.channels[$0] }
+            if loaded.channels.isEmpty, !loaded.problems.isEmpty {
+                self.outsideStatus = .failed(loaded.problems.joined(separator: "\n"))
+            } else {
+                self.outsideStatus = .ready(matched: matches.count, total: snapshot.count, updated: loaded.generated)
+            }
+            self.rebuildOutsidePrograms()
+        }
+    }
+
+    private func outsideListing(for id: String) -> [LiveTVProgram]? {
+        guard let match = outsideMatches[id] else { return nil }
+        let start = Self.windowStart().addingTimeInterval(-3600)
+        return OutsideGuide.programs(match, channelID: id, from: start, to: start.addingTimeInterval(14 * 3600))
+    }
+
+    /// Re-merges every channel's listing (after outside data loads or the
+    /// window moves on).
+    private func rebuildOutsidePrograms() {
+        var merged = programs
+        let ids = Set(outsideMatches.keys).union(merged.keys)
+        for id in ids {
+            merged[id] = bestListing(server: serverPrograms[id], outside: outsideListing(for: id))
+        }
+        programs = merged.filter { !$0.value.isEmpty }
+    }
+
+    /// Picks whichever listing covers more of the next three hours; the
+    /// server's wins ties and is topped up from outside where it has gaps.
+    private func bestListing(server: [LiveTVProgram]?, outside: [LiveTVProgram]?) -> [LiveTVProgram] {
+        let server = server ?? []
+        guard let outside, !outside.isEmpty else { return server }
+        guard !server.isEmpty else { return outside }
+        let start = Self.windowStart()
+        let end = start.addingTimeInterval(Self.guideHours * 3600)
+        func coverage(_ list: [LiveTVProgram]) -> TimeInterval {
+            list.reduce(0) { total, p in total + max(0, min(p.end, end).timeIntervalSince(max(p.start, start))) }
+        }
+        let outsideWins = coverage(outside) > coverage(server) + 15 * 60
+        let primary = outsideWins ? outside : server
+        let secondary = outsideWins ? server : outside
+        var result = primary
+        for program in secondary {
+            let clashes = result.contains { other in
+                min(program.end, other.end).timeIntervalSince(max(program.start, other.start)) > 300
+            }
+            if !clashes { result.append(program) }
+        }
+        return result.sorted { $0.start < $1.start }
     }
 
     // MARK: Guide helpers
@@ -477,40 +582,47 @@ final class LiveTVStore: ObservableObject {
 
     /// Watches a channel. `lineup` is the list it was picked from, which
     /// Up / Down then flips through (a group, favorites, search results…).
+    ///
+    /// Emby Live TV is held to ONE open stream at a time: every open first
+    /// closes whatever is open, opens run strictly one after another, and a
+    /// tune that's been superseded (fast Up / Down) never opens anything.
     func watch(_ channel: LiveTVChannel, lineup: [LiveTVChannel]? = nil) {
         if let lineup, lineup.contains(channel) { flipList = lineup }
         else if !flipList.contains(channel) { flipList = channels.filter { !isHidden($0) || $0 == channel } }
         remember(channel)
-        tuneTask?.cancel()
         bannerTask?.cancel()
         banner = nil
-        let previous = watching
+        tuneGeneration &+= 1
+        let generation = tuneGeneration
         watching = channel
         overlay = .tuning(channel)
-        tuneTask = Task { [weak self] in
+        enqueueStreamWork { [weak self] in
             guard let self else { return }
-            if let previous, previous.id != channel.id { await self.close(previous) }
+            // Let a burst of channel flips settle on the last one.
+            try? await Task.sleep(nanoseconds: 350_000_000)
+            guard generation == self.tuneGeneration else { return }
+            await self.closeAllStreams()
+            guard generation == self.tuneGeneration else { return }
             guard let client = self.client(for: channel.serverID) else {
                 self.overlay = .failed(channel, "Sign in to this server again in Settings → Jellyfin.")
                 return
             }
-            let started = Date()
             do {
+                // Not cancellable on purpose: once the server opens a stream we
+                // must learn its id so it can be closed.
                 let stream = try await client.openStream(channelItemID: channel.itemID)
-                guard !Task.isCancelled, self.watching?.id == channel.id else {
-                    await client.closeStream(stream)
+                self.openStreams.append((stream, channel.serverID))
+                guard generation == self.tuneGeneration, self.watching?.id == channel.id else {
+                    await self.closeAllStreams()
                     return
                 }
-                self.openStreams[channel.id] = (stream, channel.serverID)
-                let elapsed = Date().timeIntervalSince(started)
-                if elapsed < 0.6 { try? await Task.sleep(nanoseconds: UInt64((0.6 - elapsed) * 1_000_000_000)) }
-                guard !Task.isCancelled, self.watching?.id == channel.id else { return }
                 let now = self.current(on: channel.id)
                 self.overlay = nil
                 self.present?(channel, stream.url, self.meta(for: channel, now: now), now?.title ?? "")
                 self.showBanner(for: channel)
+                await client.reportPlaying(stream)
             } catch {
-                guard !Task.isCancelled, self.watching?.id == channel.id else { return }
+                guard generation == self.tuneGeneration, self.watching?.id == channel.id else { return }
                 self.overlay = .failed(channel, error.localizedDescription)
             }
         }
@@ -527,23 +639,41 @@ final class LiveTVStore: ObservableObject {
 
     /// Leaving the player or the tuning card.
     func stopWatching() {
-        tuneTask?.cancel()
+        tuneGeneration &+= 1
         bannerTask?.cancel()
-        let channel = watching
         watching = nil
         overlay = nil
         banner = nil
-        if let channel {
-            Task { [weak self] in await self?.close(channel) }
+        enqueueStreamWork { [weak self] in
+            await self?.closeAllStreams()
         }
     }
 
-    /// Frees the server-side stream unless Multiview is still showing it.
-    private func close(_ channel: LiveTVChannel) async {
-        guard let open = openStreams[channel.id] else { return }
-        if MultiviewStore.shared.contains(url: open.stream.url) { return }
-        openStreams[channel.id] = nil
-        await client(for: open.serverID)?.closeStream(open.stream)
+    /// Runs stream opens / closes strictly one at a time, in order.
+    private func enqueueStreamWork(_ work: @escaping @MainActor () async -> Void) {
+        let previous = streamWork
+        streamWork = Task { @MainActor in
+            await previous?.value
+            await work()
+        }
+    }
+
+    /// Closes every stream this app opened on the server.
+    private func closeAllStreams() async {
+        let open = openStreams
+        openStreams.removeAll()
+        for entry in open {
+            await client(for: entry.serverID)?.closeStream(entry.stream)
+        }
+    }
+
+    private func appDidEnterBackground() {
+        // Don't keep a server stream (and the provider's single slot) busy
+        // while the app is in the background, unless it's playing in PiP.
+        guard isWatching || !openStreams.isEmpty,
+              !PictureInPictureManager.shared.isPictureInPictureActive else { return }
+        leavePlayer?()
+        stopWatching()
     }
 
     func meta(for channel: LiveTVChannel, now: LiveTVProgram?) -> NuvioMeta {
@@ -571,29 +701,7 @@ final class LiveTVStore: ObservableObject {
         }
     }
 
-    // MARK: Multiview & favorites
-
-    func addToMultiview(_ channel: LiveTVChannel) {
-        Task { [weak self] in
-            guard let self, let client = self.client(for: channel.serverID) else { return }
-            self.flash("Opening \(channel.name)…")
-            do {
-                let stream = try await client.openStream(channelItemID: channel.itemID)
-                let store = MultiviewStore.shared
-                store.add(MultiviewChannel(
-                    id: stream.url.absoluteString,
-                    title: channel.name,
-                    subtitle: self.current(on: channel.id)?.title,
-                    url: stream.url,
-                    httpHeaders: [:],
-                    artworkURL: channel.imageURL
-                ))
-                self.flash("Added \(channel.name) to Multiview · \(store.channels.count) of \(MultiviewStore.maxTiles)")
-            } catch {
-                self.flash(error.localizedDescription)
-            }
-        }
-    }
+    // MARK: Favorites
 
     func toggleFavorite(_ channel: LiveTVChannel) {
         guard let index = channels.firstIndex(of: channel) else { return }
@@ -652,7 +760,8 @@ final class LiveTVStore: ObservableObject {
                     overview: "Sample listing used for the automated screenshot tour.",
                     start: cursor, end: end,
                     isMovie: show.2 == "movie", isSports: show.2 == "sports", isNews: show.2 == "news", isKids: show.2 == "kids",
-                    isLive: show.2 == "sports", isPremiere: offset == 0 && index % 3 == 0, imageURL: nil
+                    isLive: show.2 == "sports", isPremiere: offset == 0 && index % 3 == 0, imageURL: nil,
+                    fromOutsideGuide: index == 1
                 )
             }
         }

@@ -40,6 +40,8 @@ struct LiveTVProgram: Identifiable, Hashable {
     let isLive: Bool
     let isPremiere: Bool
     let imageURL: URL?
+    /// Came from the free outside listings rather than the server's guide.
+    var fromOutsideGuide = false
 
     var minutes: Int { max(1, Int(end.timeIntervalSince(start) / 60)) }
 
@@ -52,6 +54,9 @@ struct LiveTVStream {
     /// Server-side live stream to close when we're done (tuner / connection slot).
     let liveStreamID: String?
     let playSessionID: String?
+    var itemID: String = ""
+    var mediaSourceID: String?
+    var isTranscode = false
 }
 
 /// The Live TV part of the Emby / Jellyfin client API. Uses the same sign-in
@@ -276,7 +281,7 @@ struct LiveTVClient {
         }
         let sessionID = payload.PlaySessionId
         if let direct = source.DirectStreamUrl?.liveNonEmpty, let url = serverURL(direct) {
-            return LiveTVStream(url: url, liveStreamID: source.LiveStreamId, playSessionID: sessionID)
+            return LiveTVStream(url: url, liveStreamID: source.LiveStreamId, playSessionID: sessionID, itemID: channelItemID, mediaSourceID: source.Id)
         }
         if source.SupportsDirectStream ?? false {
             var query = [
@@ -288,22 +293,52 @@ struct LiveTVClient {
             if let live = source.LiveStreamId { query["LiveStreamId"] = live }
             if let sessionID { query["PlaySessionId"] = sessionID }
             if let url = makeURL("Videos/\(channelItemID)/stream.ts", query: query) {
-                return LiveTVStream(url: url, liveStreamID: source.LiveStreamId, playSessionID: sessionID)
+                return LiveTVStream(url: url, liveStreamID: source.LiveStreamId, playSessionID: sessionID, itemID: channelItemID, mediaSourceID: source.Id)
             }
         }
         if let transcode = source.TranscodingUrl?.liveNonEmpty, let url = serverURL(transcode) {
-            return LiveTVStream(url: url, liveStreamID: source.LiveStreamId, playSessionID: sessionID)
+            return LiveTVStream(url: url, liveStreamID: source.LiveStreamId, playSessionID: sessionID, itemID: channelItemID, mediaSourceID: source.Id, isTranscode: true)
         }
         if let path = source.Path, path.lowercased().hasPrefix("http"), let url = URL(string: path) {
-            return LiveTVStream(url: url, liveStreamID: source.LiveStreamId, playSessionID: sessionID)
+            return LiveTVStream(url: url, liveStreamID: source.LiveStreamId, playSessionID: sessionID, itemID: channelItemID, mediaSourceID: source.Id)
         }
         throw ClientError(status: nil, message: "This channel can't be streamed to this device.")
     }
 
     /// Frees the server's tuner / provider connection.
+    /// Tells the server playback started, so its session (and stream count)
+    /// is tracked like any Emby / Jellyfin app's.
+    func reportPlaying(_ stream: LiveTVStream) async {
+        _ = try? await request("Sessions/Playing", method: "POST", jsonBody: playbackBody(stream))
+    }
+
+    /// Ends the stream: reports playback stopped (which is how Emby / Jellyfin
+    /// apps release a live stream), stops any server transcode, then closes the
+    /// live stream itself. Each step is best-effort.
     func closeStream(_ stream: LiveTVStream) async {
-        guard let live = stream.liveStreamID else { return }
-        _ = try? await request("LiveStreams/Close", query: ["LiveStreamId": live], method: "POST", jsonBody: [:])
+        _ = try? await request("Sessions/Playing/Stopped", method: "POST", jsonBody: playbackBody(stream))
+        if stream.isTranscode {
+            var query = ["DeviceId": Self.deviceID]
+            if let session = stream.playSessionID { query["PlaySessionId"] = session }
+            _ = try? await request("Videos/ActiveEncodings", query: query, method: "DELETE")
+        }
+        if let live = stream.liveStreamID {
+            _ = try? await request("LiveStreams/Close", query: ["LiveStreamId": live], method: "POST", jsonBody: [:])
+        }
+    }
+
+    private func playbackBody(_ stream: LiveTVStream) -> [String: Any] {
+        var body: [String: Any] = [
+            "ItemId": stream.itemID,
+            "PositionTicks": 0,
+            "CanSeek": false,
+            "IsPaused": false,
+            "PlayMethod": stream.isTranscode ? "Transcode" : "DirectStream"
+        ]
+        if let source = stream.mediaSourceID { body["MediaSourceId"] = source }
+        if let session = stream.playSessionID { body["PlaySessionId"] = session }
+        if let live = stream.liveStreamID { body["LiveStreamId"] = live }
+        return body
     }
 
     func setFavorite(_ favorite: Bool, itemID: String) async throws {

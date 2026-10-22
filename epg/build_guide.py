@@ -30,15 +30,19 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = os.path.join(os.getcwd(), "out")
 NOW = int(time.time())
 LOW = NOW - 3 * 3600
-HIGH = NOW + 48 * 3600
-DESC_LIMIT = 220
+HIGH = NOW + 36 * 3600
+# Descriptions only for what's on soon: they're most of the size, and the
+# guide only shows the focused program's.
+DESC_UNTIL = NOW + 8 * 3600
+DESC_LIMIT = 200
 
 # ---------------------------------------------------------------- matching keys
 
 CALL_RE = re.compile(r"(?<![A-Z0-9])([KW][A-Z]{2,3})(?:[- ]?(DT|TV|LD|LP|CD|CA|HD)(\d)?)?(?![A-Z])")
 CALL_STOP = {"WWE", "WNBA", "WEST", "WILD", "KIDS", "WORK", "WIRE", "WAVE", "WARS", "WOW", "KICK", "WINE", "WORD", "WEEK"}
 DROP = {"hd", "fhd", "uhd", "sd", "4k", "hevc", "h265", "h264", "1080p", "720p", "1080", "720",
-        "50fps", "60fps", "backup", "alt", "vip", "raw", "feed", "usa", "us", "ca", "uk", "tv"}
+        "50fps", "60fps", "backup", "alt", "vip", "raw", "feed", "usa", "us", "ca", "uk", "tv",
+        "east", "west", "pacific"}
 
 
 def callsigns(texts, strong_context):
@@ -62,11 +66,15 @@ def callsigns(texts, strong_context):
 
 
 def normalize(name):
+    """Comparable form of a channel name. East is the default feed, so it's
+    dropped; West / Pacific feeds keep a marker so they never merge with East."""
     s = name.lower().replace("&", " and ").replace("+", " plus ")
+    west = re.search(r"\b(west|pacific)\b", s) is not None
     s = re.sub(r"[\[\(][^\]\)]*[\]\)]", " ", s)
     s = re.sub(r"^\s*[^:|]{1,24}[:|]\s*", "", s)
     tokens = [t for t in re.split(r"[^a-z0-9]+", s) if t and t not in DROP]
-    return "".join(tokens)
+    key = "".join(tokens)
+    return key + "~west" if key and west else key
 
 # ---------------------------------------------------------------- parsing
 
@@ -148,7 +156,7 @@ def parse_source(path, locals_source):
                 if start is not None and end is not None and end > start and end > LOW and start < HIGH:
                     title = text_of(element, "title")
                     if title:
-                        desc = text_of(element, "desc")
+                        desc = text_of(element, "desc") if start < DESC_UNTIL else None
                         if desc and len(desc) > DESC_LIMIT:
                             desc = desc[: DESC_LIMIT - 1].rstrip() + "…"
                         categories = [c.text for c in element.findall("category") if c.text]

@@ -28,6 +28,10 @@ jobs:
       - name: Build guide shards
         run: python3 epg/build_guide.py
 
+      - name: Build station directory
+        continue-on-error: true
+        run: python3 epg/stations.py
+
       - name: Summarize
         if: always()
         shell: bash
@@ -43,6 +47,7 @@ jobs:
           PY
           )
           echo "::notice title=Guide data::${line}"
+          [ -f out/stations-report.txt ] && echo "::notice title=Stations::$(cat out/stations-report.txt)" || true
 
       - name: Publish to the epg-data release
         env:

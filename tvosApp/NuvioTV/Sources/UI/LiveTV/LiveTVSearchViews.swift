@@ -94,11 +94,6 @@ struct LiveTVSearchView: View {
         }
         .contextMenu {
             Button {
-                store.addToMultiview(channel)
-            } label: {
-                Label(L10n.string("live_add_multiview", fallback: "Add to Multiview"), systemImage: "rectangle.split.2x2")
-            }
-            Button {
                 store.toggleFavorite(channel)
             } label: {
                 Label(
@@ -217,6 +212,87 @@ struct LiveTVGroupsView: View {
                 }
             }
             .navigationTitle(L10n.string("live_groups", fallback: "Groups"))
+        }
+    }
+}
+
+/// Where guide listings come from: the server, plus free outside listings
+/// matched to channels the server has no (or a thin) guide for.
+struct LiveTVGuideSourcesView: View {
+    @ObservedObject private var store = LiveTVStore.shared
+    @State private var enabled = OutsideGuide.isEnabled
+    @State private var shards = OutsideGuide.enabledShards
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section {
+                    Toggle(isOn: $enabled) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(L10n.string("live_outside_toggle", fallback: "Fill in missing listings"))
+                            Text(L10n.string("live_outside_toggle_detail", fallback: "Uses free TV listings for channels your server has no guide for"))
+                                .font(.system(size: 20))
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    .onChange(of: enabled) { _, value in
+                        OutsideGuide.isEnabled = value
+                        store.loadOutsideGuide()
+                    }
+                } footer: {
+                    Text(statusText).font(.system(size: 20))
+                }
+
+                if enabled {
+                    Section(L10n.string("live_outside_sources", fallback: "Listings to use")) {
+                        ForEach(OutsideGuide.shards) { shard in
+                            Toggle(isOn: Binding(
+                                get: { shards.contains(shard.id) },
+                                set: { on in
+                                    if on { shards.insert(shard.id) } else { shards.remove(shard.id) }
+                                    OutsideGuide.enabledShards = shards
+                                    store.loadOutsideGuide()
+                                }
+                            )) {
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text(shard.title)
+                                    Text(shard.detail)
+                                        .font(.system(size: 20))
+                                        .foregroundColor(.secondary)
+                                }
+                            }
+                        }
+                    }
+                    Section {
+                        Button(L10n.string("live_outside_refresh", fallback: "Refresh listings now")) {
+                            store.loadOutsideGuide(force: true)
+                        }
+                    } footer: {
+                        Text(L10n.string("live_outside_footer", fallback: "Listings come from free public guides (epgshare01, i.mjh.nz), merged and de-duplicated a few times a day, and are matched to your channels by call sign (like WNBC) or name. Your server's own guide is used whenever it covers more."))
+                            .font(.system(size: 20))
+                    }
+                }
+            }
+            .navigationTitle(L10n.string("live_guide_sources", fallback: "Guide Listings"))
+        }
+    }
+
+    private var statusText: String {
+        switch store.outsideStatus {
+        case .off:
+            return L10n.string("live_outside_off", fallback: "Only your server's guide is used.")
+        case .loading:
+            return L10n.string("live_outside_loading", fallback: "Loading outside listings…")
+        case .failed(let message):
+            return L10n.format("live_outside_failed", fallback: "Couldn't load outside listings: %@", message)
+        case .ready(let matched, let total, let updated):
+            var text = L10n.format("live_outside_ready", fallback: "Matched %d of %d channels.", matched, total)
+            if let updated {
+                let f = RelativeDateTimeFormatter()
+                f.unitsStyle = .full
+                text += " " + L10n.format("live_outside_updated", fallback: "Listings updated %@.", f.localizedString(for: updated, relativeTo: Date()))
+            }
+            return text
         }
     }
 }

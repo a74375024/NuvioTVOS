@@ -44,6 +44,7 @@ shots=(
   "07-live-tv-guide|live-demo|12"
   "07b-live-tv-search|live-demo-search|14"
   "07c-live-tv-groups|live-demo-groups|12"
+  "07d-live-tv-listings|live-demo-sources|12"
   "08-settings|settings|12"
 )
 
