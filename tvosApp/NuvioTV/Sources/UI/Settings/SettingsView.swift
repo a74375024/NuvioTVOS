@@ -15382,22 +15382,17 @@ private extension View {
 
 /// Makes a sheet's system plate transparent so liquid-glass content can frost
 /// over the presenter (Settings). No-op on older OS versions.
-///
-/// Also clears the Settings entry lock: sheets inherit the presenter's
-/// environment, and if the lock is on while a sheet is up every
-/// `.entryLockable()` row inside it (the text fields) is disabled, leaving
-/// only the dialog buttons focusable — focus gets stuck on Cancel.
 private struct ClearPresentationBackgroundIfAvailable: ViewModifier {
     @ViewBuilder
     func body(content: Content) -> some View {
         #if os(iOS)
         if #available(iOS 16.4, *) {
-            content.presentationBackground(.clear).settingsEntryAnchor()
+            content.presentationBackground(.clear)
         } else {
-            content.settingsEntryAnchor()
+            content
         }
         #else
-        content.settingsEntryAnchor()
+        content
         #endif
     }
 }
@@ -15527,6 +15522,7 @@ private struct XtreamAccountEditSheet: View {
     @State private var password: String
     @State private var isSaving = false
     @State private var message: String?
+    @Namespace private var focusScope
 
     init(account: XtreamAccount?, accentColor: Color) {
         self.account = account
@@ -15556,6 +15552,8 @@ private struct XtreamAccountEditSheet: View {
                             placeholder: "My IPTV",
                             text: $displayName
                         )
+                        // Open on the first field rather than Cancel.
+                        .prefersDefaultFocus(true, in: focusScope)
                         SettingsNativeTextFieldRow(
                             title: L10n.string("xtream_server", fallback: "Server URL"),
                             subtitle: "",
@@ -15581,6 +15579,11 @@ private struct XtreamAccountEditSheet: View {
                                 .foregroundColor(.red.opacity(0.85))
                         }
                     }
+                    // The fields sit at the right edge, so nothing lies straight
+                    // above Cancel (Save stays disabled until the form is filled)
+                    // and Up from Cancel went nowhere. As a focus section the
+                    // group catches Up from the buttons.
+                    .focusSection()
 
                     HStack {
                         SMBDialogButton(title: L10n.string("action_cancel", fallback: "Cancel"), isPrimary: false) {
@@ -15600,7 +15603,7 @@ private struct XtreamAccountEditSheet: View {
                 .padding(40)
             }
         }
-        .settingsEntryAnchor()
+        .focusScope(focusScope)
     }
 
     private var canSave: Bool {

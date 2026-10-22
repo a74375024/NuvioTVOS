@@ -1,0 +1,87 @@
+name: Modal focus test
+
+# Drives modals on the tvOS simulator with real remote presses (XCUIRemote)
+# and records a screenshot + the focused element after every press.
+# Runs on pushes to the focus-test branch only; never publishes a build.
+on:
+  push:
+    branches: [focus-test]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: modal-focus-test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    runs-on: xcode-27
+    timeout-minutes: 170
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Install pinned Tuist
+        uses: jdx/mise-action@v2
+
+      - name: Prepare sources
+        shell: bash
+        run: |
+          # Only the probe (older UI suites are not maintained).
+          find tvosApp/NuvioTVUITests -name '*.swift' ! -name 'ModalFocusProbe.swift' -delete
+          export XDG_STATE_HOME="$HOME/.tuist_state"
+          (cd tvosApp && mise exec -- tuist generate --no-open)
+
+      - name: Run probe on the simulator
+        shell: bash
+        run: |
+          set +e
+          udid=$(xcrun simctl list devices available --json | ruby -rjson -e '
+            devices = JSON.parse(STDIN.read).fetch("devices").select { |rt, _| rt.include?(".tvOS-") }.values.flatten
+            device = devices.find { |d| d["name"] =~ /4K/ && d["name"] !~ /1st/ } || devices.first
+            puts device.fetch("udid")
+          ')
+          xcrun simctl boot "$udid" 2>/dev/null
+          xcrun simctl bootstatus "$udid" -b
+          mkdir -p "$RUNNER_TEMP/probe"
+          export TEST_RUNNER_SHOT_DIR="$RUNNER_TEMP/probe"
+          xcodebuild test \
+            -workspace tvosApp/NuvioTV.xcworkspace -scheme NuvioTV-UI -configuration Debug \
+            -destination "platform=tvOS Simulator,id=$udid" \
+            -derivedDataPath "$RUNNER_TEMP/dd" \
+            -resultBundlePath "$RUNNER_TEMP/probe.xcresult" \
+            -only-testing:NuvioTVUITests/ModalFocusProbe \
+            CODE_SIGNING_ALLOWED=NO ONLY_ACTIVE_ARCH=YES 2>&1 | tee xcodebuild.log | grep -E "PROBE|error:|Test Case|\*\* TEST"
+          status=${PIPESTATUS[0]}
+          errors=$(grep -E "error:|Testing failed|TEST FAILED|TEST SUCCEEDED|Failing tests|Early unexpected exit|not signed|code sign" xcodebuild.log | sort -u | head -30)
+          encoded=$(printf '%s' "$errors" | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}')
+          echo "::warning title=xcodebuild exit ${status}::${encoded}"
+          exit 0
+
+      - name: Collect results
+        if: always()
+        shell: bash
+        run: |
+          out="$RUNNER_TEMP/probe"
+          mkdir -p "$out/attachments"
+          xcrun xcresulttool export attachments --path "$RUNNER_TEMP/probe.xcresult" --output-path "$out/attachments" >/dev/null 2>&1 || true
+          cp xcodebuild.log "$out/" 2>/dev/null || true
+          grep "PROBE" xcodebuild.log > "$out/probe-lines.txt" 2>/dev/null || true
+          for log in "$out"/*/log.txt; do
+            [ -f "$log" ] || continue
+            test=$(basename "$(dirname "$log")")
+            body=$(grep -E "PROBLEM|MODAL|opens on|focusable on screen|typed|RESULT|SUMMARY|swept|Up from|Save enabled|initial focus|MISSING|FAILED|no modal" "$log" | head -120)
+            encoded=$(printf '%s' "$body" | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}')
+            echo "::notice title=${test}::${encoded}"
+          done
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: modal-focus
+          path: ${{ runner.temp }}/probe
+          if-no-files-found: warn
