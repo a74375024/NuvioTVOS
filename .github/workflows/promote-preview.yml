@@ -3,6 +3,10 @@ name: Approve Preview Build
 # Turns a preview (pre-release) into the full latest release, so sideloading
 # tools that track "latest" pick it up. Defaults to the newest preview.
 on:
+  # Committing a tag name to .github/approved-build approves that preview.
+  push:
+    branches: [multiview]
+    paths: ['.github/approved-build']
   workflow_dispatch:
     inputs:
       tag:
@@ -17,6 +21,7 @@ jobs:
   promote:
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
       - name: Promote
         env:
           GH_TOKEN: ${{ github.token }}
@@ -24,6 +29,9 @@ jobs:
         shell: bash
         run: |
           repo="$GITHUB_REPOSITORY"
+          if [ -z "$TAG" ] && [ -f .github/approved-build ]; then
+            TAG=$(tr -d '[:space:]' < .github/approved-build)
+          fi
           if [ -z "$TAG" ]; then
             TAG=$(gh release list -R "$repo" --limit 50 --json tagName,isPrerelease \
               -q '[.[] | select(.isPrerelease and (.tagName | startswith("enh-")))][0].tagName')

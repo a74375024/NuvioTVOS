@@ -14,6 +14,7 @@ on:
         default: false
   push:
     branches: [multiview]
+    paths-ignore: ['.github/approved-build']
 
 permissions:
   contents: write
