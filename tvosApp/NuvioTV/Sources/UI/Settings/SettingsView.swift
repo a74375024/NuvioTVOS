@@ -14955,6 +14955,9 @@ private struct SettingsNativeTextFieldRow: View {
     var isSecure: Bool = false
     var fieldWidth: CGFloat = 300
     var onCommit: () -> Void = {}
+    /// Take focus when the row first appears (e.g. the first field of a form
+    /// sheet, so it doesn't open on Cancel). Focus only — no keyboard.
+    var focusOnAppear: Bool = false
 
     @FocusState private var isFocused: Bool
 
@@ -14999,6 +15002,10 @@ private struct SettingsNativeTextFieldRow: View {
             .modifier(GlassCapsule(focused: isFocused))
         }
         .entryLockable()
+        .onAppear {
+            guard focusOnAppear else { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { isFocused = true }
+        }
     }
 
     private var displayText: String {
@@ -15382,22 +15389,17 @@ private extension View {
 
 /// Makes a sheet's system plate transparent so liquid-glass content can frost
 /// over the presenter (Settings). No-op on older OS versions.
-///
-/// Also clears the Settings entry lock: sheets inherit the presenter's
-/// environment, and if the lock is on while a sheet is up every
-/// `.entryLockable()` row inside it (the text fields) is disabled, leaving
-/// only the dialog buttons focusable — focus gets stuck on Cancel.
 private struct ClearPresentationBackgroundIfAvailable: ViewModifier {
     @ViewBuilder
     func body(content: Content) -> some View {
         #if os(iOS)
         if #available(iOS 16.4, *) {
-            content.presentationBackground(.clear).settingsEntryAnchor()
+            content.presentationBackground(.clear)
         } else {
-            content.settingsEntryAnchor()
+            content
         }
         #else
-        content.settingsEntryAnchor()
+        content
         #endif
     }
 }
@@ -15554,7 +15556,9 @@ private struct XtreamAccountEditSheet: View {
                             title: L10n.string("smb_display_name", fallback: "Name"),
                             subtitle: L10n.string("xtream_name_subtitle", fallback: "Shown in Settings and the feed picker"),
                             placeholder: "My IPTV",
-                            text: $displayName
+                            text: $displayName,
+                            // Open on the first field rather than Cancel.
+                            focusOnAppear: true
                         )
                         SettingsNativeTextFieldRow(
                             title: L10n.string("xtream_server", fallback: "Server URL"),
@@ -15581,6 +15585,11 @@ private struct XtreamAccountEditSheet: View {
                                 .foregroundColor(.red.opacity(0.85))
                         }
                     }
+                    // The fields sit at the right edge, so nothing lies straight
+                    // above Cancel (Save stays disabled until the form is filled)
+                    // and Up from Cancel went nowhere. As a focus section the
+                    // group catches Up from the buttons.
+                    .focusSection()
 
                     HStack {
                         SMBDialogButton(title: L10n.string("action_cancel", fallback: "Cancel"), isPrimary: false) {
@@ -15600,7 +15609,6 @@ private struct XtreamAccountEditSheet: View {
                 .padding(40)
             }
         }
-        .settingsEntryAnchor()
     }
 
     private var canSave: Bool {
