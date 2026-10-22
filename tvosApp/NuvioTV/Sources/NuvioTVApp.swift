@@ -3955,10 +3955,14 @@ private struct TVMainTabView: View {
                 liveTabContent
                     .tabItem { Label(TVTab.live.title, systemImage: TVTab.live.symbol) }
                     .tag(TVTab.live)
+                calendarTabContent
+                    .tabItem { Label(TVTab.calendar.title, systemImage: TVTab.calendar.symbol) }
+                    .tag(TVTab.calendar)
+            } else {
+                calendarTabContent
+                    .tabItem { Label(TVTab.calendar.title, systemImage: TVTab.calendar.symbol) }
+                    .tag(TVTab.calendar)
             }
-            calendarTabContent
-                .tabItem { Label(TVTab.calendar.title, systemImage: TVTab.calendar.symbol) }
-                .tag(TVTab.calendar)
             settingsTabContent.tabItem { settingsTabLabel }.tag(TVTab.settings)
         }
     }
@@ -3999,13 +4003,18 @@ private struct TVMainTabView: View {
             Tab(TVTab.channels.title, systemImage: TVTab.channels.symbol, value: TVTab.channels) {
                 channelsTabContent
             }
+            // One builder slot for both: the tab builder takes at most ten.
             if showsLiveTab {
                 Tab(TVTab.live.title, systemImage: TVTab.live.symbol, value: TVTab.live) {
                     liveTabContent
                 }
-            }
-            Tab(TVTab.calendar.title, systemImage: TVTab.calendar.symbol, value: TVTab.calendar) {
-                calendarTabContent
+                Tab(TVTab.calendar.title, systemImage: TVTab.calendar.symbol, value: TVTab.calendar) {
+                    calendarTabContent
+                }
+            } else {
+                Tab(TVTab.calendar.title, systemImage: TVTab.calendar.symbol, value: TVTab.calendar) {
+                    calendarTabContent
+                }
             }
             Tab(value: TVTab.settings) { settingsTabContent } label: { settingsTabLabel }
             if !directCollectionDestinations.isEmpty {
