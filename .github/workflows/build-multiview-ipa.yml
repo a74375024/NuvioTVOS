@@ -62,12 +62,10 @@ jobs:
           fi
           exit $status
 
-      # Opt-in (GitHub pauses forks that use a lot of Actions time): runs
-      # when dispatched with screens=true or when the commit message has
-      # [screens].
+      # Manual only: runs when dispatched with screens=true, never on push.
       - name: Screen tour (simulator screenshots)
         id: tour
-        if: inputs.screens || contains(github.event.head_commit.message, '[screens]')
+        if: inputs.screens  # manual runs only (never on push)
         continue-on-error: true
         shell: bash
         run: bash scripts/screen-tour.sh

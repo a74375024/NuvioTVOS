@@ -5,7 +5,7 @@ enum LiveGuideMetrics {
     /// Extra side margin inside tvOS's own 80 pt safe area (none: the guide
     /// uses the full safe width).
     static let sideInset: CGFloat = 0
-    static let channelColumn: CGFloat = 290
+    static let channelColumn: CGFloat = 190
     static let rowHeight: CGFloat = 84
     static let rowSpacing: CGFloat = 8
     static let cellGap: CGFloat = 8
@@ -763,20 +763,9 @@ struct LiveTVGuideView: View {
         .padding(.bottom, 20)
     }
 
-    @ViewBuilder
     private func logo(_ channel: LiveTVChannel?, size: CGFloat) -> some View {
-        if let url = channel?.imageURL {
-            AsyncImage(url: url) { phase in
-                if let image = phase.image {
-                    image.resizable().scaledToFit()
-                } else {
-                    Image(systemName: "tv").font(.system(size: size * 0.5)).foregroundColor(.white.opacity(0.4))
-                }
-            }
-            .frame(width: size * 1.6, height: size)
-        } else {
+        ChannelLogoView(urls: store.logoSpec(for: channel).urls, width: size * 2.2, height: size) {
             Image(systemName: "tv").font(.system(size: size * 0.5)).foregroundColor(.white.opacity(0.4))
-                .frame(width: size * 1.6, height: size)
         }
     }
 
@@ -945,32 +934,8 @@ struct LiveTVGuideView: View {
     }
 
     private func channelCell(_ channel: LiveTVChannel, dimmed: Bool, isRowFocused: Bool) -> some View {
-        HStack(spacing: 12) {
-            logo(channel, size: 40)
-                .frame(width: 66)
-            Text(channel.name)
-                .font(.system(size: 20, weight: .bold))
-                .foregroundColor(isRowFocused ? .black : .white)
-                .lineLimit(2)
-            Spacer(minLength: 0)
-            if dimmed {
-                Image(systemName: "eye.slash")
-                    .font(.system(size: 15))
-                    .foregroundColor(isRowFocused ? .black.opacity(0.6) : .white.opacity(0.5))
-            } else if channel.isFavorite {
-                Image(systemName: "star.fill")
-                    .font(.system(size: 16))
-                    .foregroundColor(isRowFocused ? .orange : .yellow)
-            }
-        }
-        .padding(.horizontal, 12)
-        .frame(maxHeight: .infinity)
-        .background(
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .fill(isRowFocused ? Color.white : Color.white.opacity(0.07))
-        )
-        .padding(.trailing, LiveGuideMetrics.cellGap)
-        .animation(.easeOut(duration: 0.12), value: isRowFocused)
+        LiveChannelCell(channel: channel, spec: store.logoSpec(for: channel), focused: isRowFocused, dimmed: dimmed)
+            .padding(.trailing, LiveGuideMetrics.cellGap)
     }
 
     private func programCell(_ program: LiveTVProgram, channel: LiveTVChannel, lineup: [LiveTVChannel], width: CGFloat, startsEarlier: Bool) -> some View {

@@ -722,12 +722,54 @@ final class LiveTVStore: ObservableObject {
         browseEntries = output.browseEntries
         groups = output.groups.map { ChannelGroup(name: $0.name, count: $0.count) }
         entriesRevision &+= 1
+        logoSpecs = [:]
         // Entry guides from whatever member data is already here.
         var merged = programs
         var states = guideState
         applyEntryGuides(&merged, &states, entryIDs: Array(entryInfo.keys))
         programs = merged
         guideState = states
+    }
+
+    // MARK: Channel logos
+
+    /// Logo specs by channel id (cleared when entries are rebuilt or the
+    /// iptv-org index arrives).
+    private var logoSpecs: [String: ChannelLogoSpec] = [:]
+    @Published private(set) var logosRevision = 0
+
+    /// Which logos a guide row tries and how its cell reads (see ChannelLogos).
+    func logoSpec(for channel: LiveTVChannel?) -> ChannelLogoSpec {
+        guard let channel else { return .empty }
+        if let hit = logoSpecs[channel.id] { return hit }
+        IptvOrgLogos.shared.start { [weak self] in
+            guard let self else { return }
+            self.logoSpecs = [:]
+            self.logosRevision &+= 1
+        }
+        let spec: ChannelLogoSpec
+        if let info = entryInfo[channel.id] {
+            let member = info.members.first.flatMap { self.channel(id: $0) }
+            spec = ChannelLogos.spec(
+                name: info.name, core: info.core, isWest: info.id.hasSuffix("~west"),
+                isLocal: info.category == .local && info.callsign != nil, callsign: info.callsign,
+                virtualNumber: info.virtualNumber, provider: channel.imageURL,
+                epgID: member?.epgID, category: info.category)
+        } else if events.contains(where: { $0.id == channel.id }) {
+            spec = ChannelLogoSpec(urls: channel.imageURL.map { [$0] } ?? [], style: .named)
+        } else {
+            let trait = traits[channel.id]
+            let isLocal = trait?.scope == "local"
+            let callsign = isLocal ? ChannelCatalog.callsignCandidates(channel.displayName).first?.sign : nil
+            let west = ChannelCatalog.coreKey(channel.displayName).west
+            spec = ChannelLogos.spec(
+                name: channel.displayName, core: trait?.core, isWest: west,
+                isLocal: callsign != nil, callsign: callsign,
+                virtualNumber: ChannelCatalog.virtualNumber(in: channel.displayName), provider: channel.imageURL,
+                epgID: channel.epgID, category: trait?.category)
+        }
+        logoSpecs[channel.id] = spec
+        return spec
     }
 
     /// The entries the guide starts with: My Lineup once set up, else all.
