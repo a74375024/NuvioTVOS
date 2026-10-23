@@ -869,6 +869,29 @@ struct LiveTVOverlay: View {
                     .transition(.move(edge: .bottom).combined(with: .opacity))
                     .allowsHitTesting(false)
             }
+            if store.isWatching, store.overlay == nil, let note = store.playbackNote {
+                // Recovery in progress: a small note, never a full screen and
+                // never focusable, so the remote keeps working.
+                VStack {
+                    HStack {
+                        Spacer()
+                        HStack(spacing: 12) {
+                            ProgressView().tint(.white).scaleEffect(0.8)
+                            Text(note)
+                                .font(.system(size: 22, weight: .semibold))
+                                .foregroundColor(.white)
+                        }
+                        .padding(.horizontal, 22)
+                        .padding(.vertical, 12)
+                        .background(Capsule().fill(Color.black.opacity(0.7)))
+                    }
+                    .padding(.top, 50)
+                    .padding(.trailing, 60)
+                    Spacer()
+                }
+                .transition(.opacity)
+                .allowsHitTesting(false)
+            }
             if store.isWatching, store.overlay == nil, let toast = store.toast {
                 VStack {
                     Text(toast)
@@ -885,6 +908,7 @@ struct LiveTVOverlay: View {
             }
         }
         .animation(.easeInOut(duration: 0.3), value: store.overlay)
+        .animation(.easeInOut(duration: 0.25), value: store.playbackNote)
         .animation(.easeInOut(duration: 0.35), value: store.banner)
         .animation(.easeInOut(duration: 0.25), value: store.toast)
     }

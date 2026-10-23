@@ -129,10 +129,11 @@ class PlayerViewModel: ObservableObject {
         didSet {
             if case .error = status, oldValue != status {
                 PlaybackTimelineRecorder.record(.playbackError, engine: activeEngineKind)
-                // Live TV switches to a backup feed when one fails to start.
-                if let id = activeMeta?.id, id.hasPrefix("live:"), !hasRenderedFirstFrame {
-                    NotificationCenter.default.post(name: LiveTVStore.playbackFailedNotification, object: id)
-                }
+            }
+            // Live TV decides how to recover (reconnect, backup feed), so it
+            // hears every status change of its streams.
+            if oldValue != status, let id = activeMeta?.id, id.hasPrefix("live:") {
+                LiveTVStore.postPlayerStatus(metaID: id, status: status, hasPicture: hasRenderedFirstFrame)
             }
             guard case .error(let message) = status,
                   ProfileSettings.current.bool(forKey: SettingsKey.playbackDiagnostics) else { return }
@@ -633,6 +634,39 @@ class PlayerViewModel: ObservableObject {
             name: AVAudioSession.routeChangeNotification,
             object: nil
         )
+        NotificationCenter.default.publisher(for: LiveTVStore.replaceStreamNotification)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] note in
+                guard let self,
+                      let from = note.userInfo?["from"] as? String,
+                      let url = note.userInfo?["url"] as? URL,
+                      let meta = note.userInfo?["meta"] as? NuvioMeta else { return }
+                self.replaceLiveStream(from: from, url: url, meta: meta,
+                                       subtitle: note.userInfo?["subtitle"] as? String ?? "")
+            }
+            .store(in: &cancellables)
+    }
+
+    /// A Live TV stream (meta ids start with "live:"). Live TV owns recovery
+    /// for these: no add-on re-resolve, no reload loop, no error overlay.
+    var isLiveTVSession: Bool {
+        activeMeta?.id.hasPrefix("live:") == true
+    }
+
+    /// Live TV: reconnect, or move to another version of the channel, inside
+    /// the running player instead of closing and reopening it. Only the
+    /// player showing `from` acts (Multiview tiles ignore it).
+    func replaceLiveStream(from: String, url: URL, meta: NuvioMeta, subtitle: String) {
+        guard !didShutdown, activeMeta?.id == from else { return }
+        activeMeta = meta
+        reloadAttempts = 0
+        retriedLiveURLs = []
+        failedStreamURLs = []
+        replaceStream(
+            prepared: PreparedNextStream(url: url, subtitleLine: subtitle, subtitles: []),
+            episode: nil,
+            resumeFrom: nil
+        )
     }
 
     private func bindSessionCoordinatorCallbacks() {
@@ -807,6 +841,8 @@ class PlayerViewModel: ObservableObject {
     }
 
     var currentErrorDiagnostic: PlaybackErrorDiagnostic? {
+        // Live TV shows its own reconnecting / failed states.
+        if isLiveTVSession { return nil }
         if isFailingOver || isReloadingStream || isSwitchingSource || (!hasRenderedFirstFrame && reloadCurrentStream != nil && reloadAttempts < Self.maxReloadAttempts) {
             return nil
         }
@@ -7331,6 +7367,8 @@ extension PlayerViewModel {
     /// Whether the in-player Multiview button applies: live streams only.
     var canAddToMultiview: Bool {
         // Emby / Jellyfin Live TV is held to one stream at a time.
+        // Emby / Jellyfin Live TV keeps one stream at a time; Xtream
+        // ("live:xt:") can join Multiview.
         guard activeMeta?.id.hasPrefix("live:jf:") != true else { return false }
         return isLiveStream && multiviewChannel != nil
     }

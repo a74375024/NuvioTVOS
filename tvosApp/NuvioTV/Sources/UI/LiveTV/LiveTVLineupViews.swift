@@ -10,6 +10,8 @@ struct LiveTVOptionsView: View {
     @State private var showEdit = false
     @State private var showSources = false
     @State private var showReport = false
+    @State private var showLog = false
+    @State private var preferTS = LiveTVStore.xtreamPrefersTS
 
     var body: some View {
         NavigationStack {
@@ -43,8 +45,25 @@ struct LiveTVOptionsView: View {
                     Button { showReport = true } label: {
                         row("square.and.arrow.up", L10n.string("live_report_open", fallback: "Export Channel Report…"), nil)
                     }
+                    Button { showLog = true } label: {
+                        row("waveform.path.ecg", L10n.string("live_log_open", fallback: "Export Playback Log…"), nil)
+                    }
                 } header: {
                     Text(L10n.string("live_guide", fallback: "Guide"))
+                }
+                if !XtreamStore.shared.accounts.isEmpty {
+                    Section {
+                        Toggle(isOn: $preferTS) {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(L10n.string("live_xtream_ts", fallback: "Xtream: use MPEG-TS instead of HLS"))
+                                Text(L10n.string("live_xtream_ts_detail", fallback: "Try this if Xtream channels stutter. Applies to the next channel you open; the playback log shows which format played."))
+                                    .font(.system(size: 20)).foregroundColor(.secondary)
+                            }
+                        }
+                        .onChange(of: preferTS) { _, value in LiveTVStore.xtreamPrefersTS = value }
+                    } header: {
+                        Text(L10n.string("live_playback", fallback: "Playback"))
+                    }
                 }
             }
             .navigationTitle(L10n.string("live_options", fallback: "Options"))
@@ -52,6 +71,7 @@ struct LiveTVOptionsView: View {
         .sheet(isPresented: $showSources) { LiveTVGuideSourcesView() }
         .fullScreenCover(isPresented: $showEdit) { LineupEditView() }
         .fullScreenCover(isPresented: $showReport) { LiveTVExportView() }
+        .fullScreenCover(isPresented: $showLog) { LiveTVExportView(kind: .playbackLog) }
     }
 
     private func row(_ symbol: String, _ title: String, _ value: String?) -> some View {
@@ -434,14 +454,37 @@ struct LiveFeedPickerView: View {
                                     HStack {
                                         Text(feed.name)
                                         Spacer()
-                                        if index == 0 { Text(L10n.string("live_feed_main", fallback: "Main")).foregroundColor(.secondary) }
+                                        if store.pinnedFeed(for: channel) == feed.id {
+                                            Text(L10n.string("live_feed_pinned", fallback: "Always first")).foregroundColor(.secondary)
+                                        } else if index == 0 {
+                                            Text(L10n.string("live_feed_main", fallback: "Main")).foregroundColor(.secondary)
+                                        }
                                     }
                                     Text(store.feedSummary(feed)).font(.system(size: 19)).foregroundColor(.secondary)
                                 }
                             }
                         }
+                    } header: {
+                        Text(L10n.string("live_feed_watch_header", fallback: "Watch with"))
                     } footer: {
-                        Text(L10n.string("live_feed_footer", fallback: "If a feed doesn't start, the next one is tried automatically."))
+                        Text(L10n.string("live_feed_footer", fallback: "If a feed stops working, it's reconnected first; if it still doesn't play, the next one takes over."))
+                    }
+
+                    Section {
+                        pinRow(title: L10n.string("live_feed_auto", fallback: "Automatic (the version that works best)"),
+                               selected: store.pinnedFeed(for: channel) == nil) {
+                            store.pin(nil, for: channel)
+                        }
+                        ForEach(store.versions(of: channel)) { feed in
+                            pinRow(title: feed.name, detail: store.feedSummary(feed),
+                                   selected: store.pinnedFeed(for: channel) == feed.id) {
+                                store.pin(feed, for: channel)
+                            }
+                        }
+                    } header: {
+                        Text(L10n.string("live_feed_pin_header", fallback: "Always start with"))
+                    } footer: {
+                        Text(L10n.string("live_feed_pin_footer", fallback: "The chosen version is tried first every time; the others stay as backups."))
                     }
                 } else if let family = picker.family {
                     Section {
@@ -462,6 +505,19 @@ struct LiveFeedPickerView: View {
                 }
             }
             .navigationTitle(picker.title)
+        }
+    }
+
+    private func pinRow(title: String, detail: String? = nil, selected: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 16) {
+                Image(systemName: selected ? "checkmark.circle.fill" : "circle")
+                    .foregroundColor(selected ? .accentColor : .secondary)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(title).lineLimit(1)
+                    if let detail { Text(detail).font(.system(size: 19)).foregroundColor(.secondary).lineLimit(1) }
+                }
+            }
         }
     }
 }

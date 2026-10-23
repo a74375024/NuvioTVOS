@@ -17,9 +17,11 @@ final class LiveTVStore: ObservableObject {
         observers.append(center.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor in self?.appDidEnterBackground() }
         })
-        observers.append(center.addObserver(forName: Self.playbackFailedNotification, object: nil, queue: .main) { [weak self] note in
+        observers.append(center.addObserver(forName: Self.playerStatusNotification, object: nil, queue: .main) { [weak self] note in
             let metaID = note.object as? String
-            Task { @MainActor in self?.playerFailed(metaID: metaID) }
+            let status = note.userInfo?["status"] as? String ?? ""
+            let message = note.userInfo?["message"] as? String
+            Task { @MainActor in self?.playerStatusChanged(metaID: metaID, status: status, message: message) }
         })
         observers.append(center.addObserver(forName: Self.firstFrameNotification, object: nil, queue: .main) { [weak self] note in
             let metaID = note.object as? String
@@ -27,9 +29,11 @@ final class LiveTVStore: ObservableObject {
         })
     }
 
-    /// Posted by the player (object: meta id) for Emby / Jellyfin live streams.
-    nonisolated static let playbackFailedNotification = Notification.Name("nuvio.livetv.playbackFailed")
+    /// Posted by the player (object: meta id) for Live TV streams.
+    nonisolated static let playerStatusNotification = Notification.Name("nuvio.livetv.playerStatus")
     nonisolated static let firstFrameNotification = Notification.Name("nuvio.livetv.firstFrame")
+    /// Asks the player showing `from` to switch to another stream in place.
+    nonisolated static let replaceStreamNotification = Notification.Name("nuvio.livetv.replaceStream")
 
     enum LoadState: Equatable {
         case idle
@@ -161,6 +165,22 @@ final class LiveTVStore: ObservableObject {
     private var playingMetaID: String?
     private var sawFirstFrame = false
     private var surfStep = 0
+    /// Whether a Live TV player is up (so recovery can swap streams in it),
+    /// and the meta id it's showing.
+    private var playerOnScreen = false
+    private var playerMetaID: String?
+    private var session = 0
+    private var tuneStartedAt = Date()
+    private var feedPresentedAt: Date?
+    private var feedFirstFrameAt: Date?
+    private var stallStartedAt: Date?
+    private var stallTask: Task<Void, Never>?
+    private var reconnectsOnFeed = 0
+    private var recoveries: [Date] = []
+    private var startupRetryFeed: String?
+    private var announceBackup = false
+    /// Small note over the player while recovering ("Reconnecting…").
+    @Published private(set) var playbackNote: String?
 
     // MARK: Servers
 
@@ -1157,7 +1177,12 @@ final class LiveTVStore: ObservableObject {
     /// Raw versions of an entry, best first (reliable sources moved up).
     func versions(of channel: LiveTVChannel) -> [LiveTVChannel] {
         if let info = entryInfo[channel.id] {
-            return orderedByReliability(info.members.compactMap { self.channel(id: $0) })
+            var list = orderedByReliability(info.members.compactMap { self.channel(id: $0) })
+            // A version the viewer pinned always goes first.
+            if let pinned = pinnedFeeds[channel.id], let index = list.firstIndex(where: { $0.id == pinned }), index > 0 {
+                list.insert(list.remove(at: index), at: 0)
+            }
+            return list
         }
         if let event = events.first(where: { $0.id == channel.id }) {
             let feeds = event.feeds.compactMap { self.channel(id: $0) }
@@ -1166,6 +1191,35 @@ final class LiveTVStore: ObservableObject {
                 + orderedByReliability(feeds.filter { !$0.serverID.hasPrefix("xt:") })
         }
         return [channel]
+    }
+
+    // MARK: Xtream stream format
+
+    private static let preferTSKey = "nuvio.tv.livetv.xtreamPreferTS"
+
+    /// Use MPEG-TS instead of HLS for Xtream streams when the provider allows.
+    static var xtreamPrefersTS: Bool {
+        get { UserDefaults.standard.bool(forKey: preferTSKey) }
+        set { UserDefaults.standard.set(newValue, forKey: preferTSKey) }
+    }
+
+    // MARK: Pinned versions
+
+    private static let pinnedFeedsKey = "nuvio.tv.livetv.pinnedFeeds"
+
+    /// Entry id → the version (raw channel id) to always start with.
+    private(set) var pinnedFeeds: [String: String] = {
+        (UserDefaults.standard.dictionary(forKey: LiveTVStore.pinnedFeedsKey) as? [String: String]) ?? [:]
+    }()
+
+    func pinnedFeed(for channel: LiveTVChannel) -> String? { pinnedFeeds[channel.id] }
+
+    /// Always start `channel` with `feed` (nil: back to automatic order).
+    func pin(_ feed: LiveTVChannel?, for channel: LiveTVChannel) {
+        pinnedFeeds[channel.id] = feed?.id
+        UserDefaults.standard.set(pinnedFeeds, forKey: Self.pinnedFeedsKey)
+        objectWillChange.send()
+        flash(feed == nil ? "\(channel.name) picks its best version automatically" : "\(channel.name) will start with this version")
     }
 
     // MARK: Groups
@@ -1436,20 +1490,64 @@ final class LiveTVStore: ObservableObject {
         )
     }
 
-    private func tune(_ display: LiveTVChannel, candidates list: [LiveTVChannel], from startIndex: Int, followFeed: Bool) {
+    // MARK: Playback & recovery
+    //
+    // Live TV alone decides how a stream recovers; the player only reports
+    // its status. Starting: up to `startupTimeout` for a picture. A quick
+    // failure on an Xtream feed is retried once after a pause (a provider's
+    // connection limit usually means the previous stream hasn't let go
+    // yet); otherwise the next version is tried. Playing: a stall shows a
+    // small "Buffering" note after a moment, and only a stall that lasts
+    // `stallTimeout`, an error or the stream ending triggers recovery:
+    // reconnect the same feed first (twice for a feed that has played a
+    // while), then the next version, all inside the open player. At most
+    // `maxRecoveries` actions per `recoveryWindow`, then it stops and says so.
+
+    private static let startupTimeout: UInt64 = 20
+    private static let stallNoteDelay: UInt64 = 3
+    private static let stallTimeout: UInt64 = 10
+    private static let maxRecoveries = 6
+    private static let recoveryWindow: TimeInterval = 180
+    private static let xtreamRetryDelay: UInt64 = 2
+
+    private func tune(_ display: LiveTVChannel, candidates list: [LiveTVChannel], from startIndex: Int,
+                      followFeed: Bool, inPlace: Bool = false, reason: String? = nil, delay: UInt64 = 0) {
         bannerTask?.cancel()
         watchdogTask?.cancel()
+        stallTask?.cancel()
+        stallStartedAt = nil
         banner = nil
         tuneGeneration &+= 1
         let generation = tuneGeneration
+        let replacing = inPlace && playerOnScreen
         watching = display
-        overlay = .tuning(display)
+        if !replacing {
+            // A new channel: new log session and a fresh recovery budget.
+            session = LiveTVPlaybackLog.shared.newSession()
+            recoveries = []
+            reconnectsOnFeed = 0
+            startupRetryFeed = nil
+            playbackNote = nil
+            var detail = "\(list.count) version(s)"
+            if let first = list.first, first.serverID.hasPrefix("xt:"),
+               let limit = XtreamStore.shared.account(sourceID: first.serverID)?.maxConnections {
+                detail += "; provider allows \(limit) stream(s) at once"
+            }
+            if let reason { detail += "; \(reason)" }
+            log("tune", list.indices.contains(startIndex) ? list[startIndex] : nil, detail: detail)
+        }
+        overlay = replacing ? nil : .tuning(display)
         candidates = list
         sawFirstFrame = false
+        // Events from the stream being replaced don't count any more.
+        playingMetaID = nil
+        feedPresentedAt = nil
+        feedFirstFrameAt = nil
         enqueueStreamWork { [weak self] in
             guard let self else { return }
-            // Let a burst of channel flips settle on the last one.
-            try? await Task.sleep(nanoseconds: 350_000_000)
+            // Let a burst of channel flips settle on the last one (plus any
+            // requested pause before a retry).
+            try? await Task.sleep(nanoseconds: 350_000_000 + delay * 1_000_000_000)
             guard generation == self.tuneGeneration else { return }
             await self.closeAllStreams()
             var index = startIndex
@@ -1461,59 +1559,44 @@ final class LiveTVStore: ObservableObject {
                     // Xtream streams are direct links: nothing to open or close
                     // on a server, the player connects straight away.
                     guard let xtream = self.xtreamClient(for: raw.serverID),
-                          let url = xtream.streamURL(streamID: raw.itemID, formats: self.xtreamFormats[raw.serverID] ?? []) else {
+                          let url = xtream.streamURL(streamID: raw.itemID, formats: self.xtreamFormats[raw.serverID] ?? [],
+                                                     preferTS: Self.xtreamPrefersTS) else {
                         lastError = "Sign in to this Xtream account again in Settings → Integrations."
+                        self.log("can't open", raw, detail: lastError)
                         index += 1
                         continue
                     }
                     guard generation == self.tuneGeneration else { return }
-                    let shown = followFeed ? raw : display
-                    self.watching = shown
-                    self.candidateIndex = index
-                    self.overlay = nil
-                    let now = self.current(on: shown.id)
-                    let meta = self.meta(for: shown, feed: raw, now: now)
-                    self.playingMetaID = meta.id
-                    self.present?(shown, url, meta, now?.title ?? "")
-                    if index > startIndex {
-                        self.flash(followFeed ? "Skipped feeds that aren't live" : "Switched to a backup feed (\(index + 1) of \(list.count))")
-                    }
-                    self.showBanner(for: shown)
-                    self.armFirstFrameWatchdog(generation)
+                    self.startFeed(display: display, feed: raw, url: url, index: index, of: list.count,
+                                   followFeed: followFeed, replacing: replacing, generation: generation)
                     return
                 }
                 guard let client = self.client(for: raw.serverID) else {
                     lastError = "Sign in to this server again in Settings → Jellyfin."
+                    self.log("can't open", raw, detail: lastError)
                     index += 1
                     continue
                 }
                 do {
                     // Not cancellable on purpose: once the server opens a stream
                     // we must learn its id so it can be closed.
+                    let opened = Date()
                     let stream = try await client.openStream(channelItemID: raw.itemID)
                     self.openStreams.append((stream, raw.serverID))
                     guard generation == self.tuneGeneration else {
                         await self.closeAllStreams()
                         return
                     }
-                    let shown = followFeed ? raw : display
-                    self.watching = shown
-                    self.candidateIndex = index
-                    self.overlay = nil
-                    let now = self.current(on: shown.id)
-                    let meta = self.meta(for: shown, feed: raw, now: now)
-                    self.playingMetaID = meta.id
-                    self.present?(shown, stream.url, meta, now?.title ?? "")
-                    if index > startIndex {
-                        self.flash(followFeed ? "Skipped feeds that aren't live" : "Switched to a backup feed (\(index + 1) of \(list.count))")
-                    }
-                    self.showBanner(for: shown)
-                    self.armFirstFrameWatchdog(generation)
+                    self.log("server opened stream", raw, detail: "in \(Int(Date().timeIntervalSince(opened) * 1000)) ms"
+                             + (stream.isTranscode ? "; transcoding" : "; direct"))
+                    self.startFeed(display: display, feed: raw, url: stream.url, index: index, of: list.count,
+                                   followFeed: followFeed, replacing: replacing, generation: generation)
                     await client.reportPlaying(stream)
                     return
                 } catch {
                     self.record(raw, worked: false)
                     lastError = error.localizedDescription
+                    self.log("open failed", raw, detail: lastError)
                     index += 1
                 }
             }
@@ -1521,40 +1604,224 @@ final class LiveTVStore: ObservableObject {
             let message = list.count > 1
                 ? (followFeed ? "None of the next feeds are live right now." : "None of this channel's \(list.count) versions could be opened right now. \(lastError)")
                 : lastError
-            self.overlay = .failed(display, message)
+            self.giveUp(display, message: message)
         }
     }
 
-    /// No picture after a while counts as a failed version.
+    /// Hands one version to the player: swapped into the open player when
+    /// recovering, otherwise a fresh player.
+    private func startFeed(display: LiveTVChannel, feed raw: LiveTVChannel, url: URL, index: Int, of count: Int,
+                           followFeed: Bool, replacing: Bool, generation: Int) {
+        let shown = followFeed ? raw : display
+        watching = shown
+        candidateIndex = index
+        overlay = nil
+        let now = current(on: shown.id)
+        let meta = self.meta(for: shown, feed: raw, now: now)
+        if replacing, playerOnScreen, let from = playerMetaID {
+            NotificationCenter.default.post(name: Self.replaceStreamNotification, object: nil, userInfo: [
+                "from": from, "url": url, "meta": meta, "subtitle": now?.title ?? ""
+            ])
+        } else {
+            present?(shown, url, meta, now?.title ?? "")
+            playerOnScreen = true
+            showBanner(for: shown)
+        }
+        playerMetaID = meta.id
+        playingMetaID = meta.id
+        feedPresentedAt = Date()
+        let format = url.pathExtension.isEmpty ? "stream" : url.pathExtension.uppercased()
+        log(replacing ? "swapped in player" : "play", raw, detail: "version \(index + 1) of \(count); \(format)")
+        armFirstFrameWatchdog(generation)
+    }
+
+    /// No picture after a while counts as a failed start.
     private func armFirstFrameWatchdog(_ generation: Int) {
         watchdogTask?.cancel()
         watchdogTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: Self.firstFrameTimeout * 1_000_000_000)
+            try? await Task.sleep(nanoseconds: Self.startupTimeout * 1_000_000_000)
             guard let self, !Task.isCancelled, generation == self.tuneGeneration, !self.sawFirstFrame else { return }
-            self.failOver()
+            self.startupFailed(reason: "no picture after \(Self.startupTimeout)s")
         }
     }
 
+    /// Posted by the player for Live TV streams on every status change.
+    nonisolated static func postPlayerStatus(metaID: String, status: PlayerStatus, hasPicture: Bool) {
+        var info: [String: Any] = ["hasPicture": hasPicture]
+        switch status {
+        case .idle: info["status"] = "idle"
+        case .buffering: info["status"] = "buffering"
+        case .playing: info["status"] = "playing"
+        case .paused: info["status"] = "paused"
+        case .ended: info["status"] = "ended"
+        case .error(let message):
+            info["status"] = "error"
+            info["message"] = message
+        }
+        NotificationCenter.default.post(name: playerStatusNotification, object: metaID, userInfo: info)
+    }
+
     private func playerStarted(metaID: String?) {
-        guard let metaID, metaID == playingMetaID else { return }
+        guard let metaID, metaID == playingMetaID, !sawFirstFrame else { return }
         sawFirstFrame = true
         watchdogTask?.cancel()
+        feedFirstFrameAt = Date()
+        let elapsed = feedPresentedAt.map { "\(Int(Date().timeIntervalSince($0) * 1000)) ms after the link" } ?? ""
+        log("picture", detail: elapsed + "; \(Int(Date().timeIntervalSince(tuneStartedAt) * 1000)) ms since tuning")
+        playbackNote = nil
+        if announceBackup {
+            announceBackup = false
+            flash("Playing a backup feed (\(candidateIndex + 1) of \(candidates.count))")
+        }
         if candidateIndex < candidates.count { record(candidates[candidateIndex], worked: true) }
     }
 
-    private func playerFailed(metaID: String?) {
-        guard let metaID, metaID == playingMetaID, isWatching, !sawFirstFrame else { return }
-        failOver()
+    private func playerStatusChanged(metaID: String?, status: String, message: String?) {
+        guard let metaID, metaID == playingMetaID, isWatching else { return }
+        switch status {
+        case "playing":
+            guard let began = stallStartedAt else { return }
+            stallStartedAt = nil
+            stallTask?.cancel()
+            playbackNote = nil
+            log("stall ended", detail: String(format: "%.1fs", Date().timeIntervalSince(began)))
+        case "buffering":
+            // Before the first picture this is just the start; Startup has its
+            // own timer.
+            guard sawFirstFrame, stallStartedAt == nil else { return }
+            stallStartedAt = Date()
+            log("stall")
+            let generation = tuneGeneration
+            stallTask?.cancel()
+            stallTask = Task { [weak self] in
+                try? await Task.sleep(nanoseconds: Self.stallNoteDelay * 1_000_000_000)
+                guard let self, !Task.isCancelled, generation == self.tuneGeneration, self.stallStartedAt != nil else { return }
+                self.playbackNote = "Buffering…"
+                try? await Task.sleep(nanoseconds: (Self.stallTimeout - Self.stallNoteDelay) * 1_000_000_000)
+                guard !Task.isCancelled, generation == self.tuneGeneration, self.stallStartedAt != nil else { return }
+                self.recover(reason: "stalled for \(Self.stallTimeout)s")
+            }
+        case "error":
+            // Never show or keep a stream link (Xtream links carry the password).
+            let text = (message ?? "playback error")
+                .rxReplace("[a-z][a-z0-9+.-]*://\\S+", with: "the stream", caseInsensitive: true)
+            log("player error", detail: text)
+            if sawFirstFrame { recover(reason: "error: \(text)") } else { startupFailed(reason: "error: \(text)") }
+        case "ended":
+            log("stream ended")
+            if sawFirstFrame { recover(reason: "the stream ended") } else { startupFailed(reason: "ended before a picture") }
+        default:
+            break
+        }
     }
 
-    /// Moves to the next version of what's playing, if there is one.
-    private func failOver() {
-        guard let display = watching else { return }
-        if candidateIndex < candidates.count { record(candidates[candidateIndex], worked: false) }
-        let nextIndex = candidateIndex + 1
-        guard nextIndex < candidates.count else { return }
-        leavePlayer?()
-        tune(display, candidates: candidates, from: nextIndex, followFeed: surfStep != 0)
+    /// A version that never showed a picture.
+    private func startupFailed(reason: String) {
+        guard let display = watching, candidateIndex < candidates.count else { return }
+        watchdogTask?.cancel()
+        let feed = candidates[candidateIndex]
+        log("start failed", feed, detail: reason)
+        // A quick failure on Xtream is usually the provider's connection
+        // limit (the previous stream hasn't let go yet): wait, try once more.
+        if feed.serverID.hasPrefix("xt:"), startupRetryFeed != feed.id,
+           let presented = feedPresentedAt, Date().timeIntervalSince(presented) < 8 {
+            startupRetryFeed = feed.id
+            guard allowRecovery() else {
+                giveUp(display, message: "This channel keeps failing to start. Try another version from Choose Feed, or try again later.")
+                return
+            }
+            playbackNote = "Retrying…"
+            log("retry", feed, detail: "same feed after \(Self.xtreamRetryDelay)s (connection limit?)")
+            tune(display, candidates: candidates, from: candidateIndex, followFeed: surfStep != 0,
+                 inPlace: true, reason: reason, delay: Self.xtreamRetryDelay)
+            return
+        }
+        record(feed, worked: false)
+        moveToNext(display, reason: reason)
+    }
+
+    /// A playing stream stalled for good, errored or ended: reconnect the
+    /// same feed first, then move to the next version.
+    private func recover(reason: String) {
+        guard let display = watching, candidateIndex < candidates.count else { return }
+        stallTask?.cancel()
+        stallStartedAt = nil
+        let feed = candidates[candidateIndex]
+        let played = feedFirstFrameAt.map { Date().timeIntervalSince($0) } ?? 0
+        // A long healthy run earns a fresh set of reconnects.
+        if played > 300 { reconnectsOnFeed = 0 }
+        let allowance = played > 60 ? 2 : 1
+        if reconnectsOnFeed < allowance {
+            guard allowRecovery() else {
+                giveUp(display, message: "This channel keeps dropping. Try another version from Choose Feed, or try again later.")
+                return
+            }
+            reconnectsOnFeed += 1
+            playbackNote = "Reconnecting…"
+            log("reconnect", feed, detail: "\(reason); attempt \(reconnectsOnFeed) of \(allowance); played \(Int(played))s")
+            tune(display, candidates: candidates, from: candidateIndex, followFeed: surfStep != 0,
+                 inPlace: true, reason: reason)
+        } else {
+            record(feed, worked: false)
+            moveToNext(display, reason: reason)
+        }
+    }
+
+    private func moveToNext(_ display: LiveTVChannel, reason: String) {
+        let next = candidateIndex + 1
+        guard next < candidates.count else {
+            giveUp(display, message: candidates.count > 1
+                ? "None of this channel's \(candidates.count) versions are working right now."
+                : "This channel stopped working. \(reason.prefix(1).uppercased() + reason.dropFirst()).")
+            return
+        }
+        guard allowRecovery() else {
+            giveUp(display, message: "This channel keeps failing. Try another version from Choose Feed, or try again later.")
+            return
+        }
+        reconnectsOnFeed = 0
+        announceBackup = surfStep == 0
+        playbackNote = surfStep != 0 ? "Skipping to the next feed…" : "Switching to a backup feed…"
+        log("switch", candidates[next], detail: "to version \(next + 1) of \(candidates.count); \(reason)")
+        tune(display, candidates: candidates, from: next, followFeed: surfStep != 0, inPlace: true, reason: reason)
+    }
+
+    /// Counts one automatic recovery; false once there have been too many.
+    private func allowRecovery() -> Bool {
+        let now = Date()
+        recoveries = recoveries.filter { now.timeIntervalSince($0) < Self.recoveryWindow }
+        guard recoveries.count < Self.maxRecoveries else { return false }
+        recoveries.append(now)
+        return true
+    }
+
+    /// Stops trying: closes the player and shows the "can't play" card.
+    private func giveUp(_ display: LiveTVChannel, message: String) {
+        log("gave up", detail: message)
+        tuneGeneration &+= 1
+        watchdogTask?.cancel()
+        stallTask?.cancel()
+        stallStartedAt = nil
+        playbackNote = nil
+        playingMetaID = nil
+        if playerOnScreen {
+            playerOnScreen = false
+            playerMetaID = nil
+            leavePlayer?()
+        }
+        watching = display
+        overlay = .failed(display, message)
+        enqueueStreamWork { [weak self] in
+            await self?.closeAllStreams()
+        }
+    }
+
+    private func log(_ event: String, _ feed: LiveTVChannel? = nil, detail: String = "") {
+        let feed = feed ?? (candidateIndex < candidates.count ? candidates[candidateIndex] : nil)
+        LiveTVPlaybackLog.shared.add(
+            event, session: session, channel: watching?.name ?? "", feed: feed?.name ?? "",
+            provider: feed.flatMap { providerName(for: $0.serverID) } ?? "", detail: detail
+        )
     }
 
     /// Channel up / down from the player.
@@ -1562,6 +1829,8 @@ final class LiveTVStore: ObservableObject {
         let list = flipList.isEmpty ? visibleEntries() : flipList
         guard let current = watching, let index = list.firstIndex(of: current), list.count > 1 else { return }
         let target = list[(index + step + list.count) % list.count]
+        playerOnScreen = false
+        playerMetaID = nil
         leavePlayer?()
         if surfStep != 0 {
             surfStep = step
@@ -1574,13 +1843,22 @@ final class LiveTVStore: ObservableObject {
 
     /// Leaving the player or the tuning card.
     func stopWatching() {
+        if isWatching {
+            let watched = feedFirstFrameAt.map { "watched \(Int(Date().timeIntervalSince($0)))s" } ?? "before a picture"
+            log("stop", detail: watched)
+        }
         tuneGeneration &+= 1
         bannerTask?.cancel()
         watchdogTask?.cancel()
+        stallTask?.cancel()
+        stallStartedAt = nil
+        playbackNote = nil
         watching = nil
         overlay = nil
         banner = nil
         playingMetaID = nil
+        playerMetaID = nil
+        playerOnScreen = false
         enqueueStreamWork { [weak self] in
             await self?.closeAllStreams()
         }
@@ -1620,7 +1898,9 @@ final class LiveTVStore: ObservableObject {
     func meta(for channel: LiveTVChannel, feed: LiveTVChannel, now: LiveTVProgram?) -> NuvioMeta {
         let description = [now?.title, now?.episodeTitle, now?.overview].compactMap { $0 }.joined(separator: "\n")
         return NuvioMeta(
-            id: "live:jf:\(feed.serverID):\(feed.itemID)",
+            // "live:xt:<account>:<stream>" for Xtream, "live:jf:<server>:<item>"
+            // for Emby / Jellyfin (which Multiview leaves out: one stream).
+            id: feed.serverID.hasPrefix("xt:") ? "live:\(feed.serverID):\(feed.itemID)" : "live:jf:\(feed.serverID):\(feed.itemID)",
             name: channel.name,
             description: description.isEmpty ? nil : description,
             posterUrl: channel.imageURL?.absoluteString,

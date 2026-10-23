@@ -3128,7 +3128,9 @@ struct ContentView: View {
                     startupToken: startupToken
                 )
             },
-            reloadCurrentStream: (isStandalonePlaybackSession || party != nil) ? nil : { currentEpisode, excludedURLs in
+            // Live TV recovers its own streams (reconnect / backup feed);
+            // the add-on source search and reload loop don't apply.
+            reloadCurrentStream: (isStandalonePlaybackSession || party != nil || meta.id.hasPrefix("live:")) ? nil : { currentEpisode, excludedURLs in
                 let profileId = profileViewModel.activeProfile?.id
                 let excluded = Set(excludedURLs)
                 if let episode = currentEpisode {
@@ -3155,14 +3157,14 @@ struct ContentView: View {
                     startupToken: nil
                 )
             },
-            fetchPlaybackSources: (isStandalonePlaybackSession || party != nil) ? nil : { contentId, type in
+            fetchPlaybackSources: (isStandalonePlaybackSession || party != nil || meta.id.hasPrefix("live:")) ? nil : { contentId, type in
                 Self.playbackSourcesProgressively(
                     contentId: contentId,
                     type: type,
                     profileId: profileViewModel.activeProfile?.id
                 )
             },
-            resolvePlaybackStream: (isStandalonePlaybackSession || party != nil) ? nil : { stream, contentId, subtitleLine, startupToken in
+            resolvePlaybackStream: (isStandalonePlaybackSession || party != nil || meta.id.hasPrefix("live:")) ? nil : { stream, contentId, subtitleLine, startupToken in
                 await Self.resolveChosenStream(
                     stream,
                     contentId: contentId,
@@ -3172,7 +3174,7 @@ struct ContentView: View {
                     startupToken: startupToken
                 )
             },
-            onRequestSources: (isStandalonePlaybackSession || party != nil) ? nil : {
+            onRequestSources: (isStandalonePlaybackSession || party != nil || meta.id.hasPrefix("live:")) ? nil : {
                 withAnimation(.easeInOut(duration: 0.28)) {
                     reopenStreamPickerOnDetails = true
                     reopenStreamPickerEpisode = playbackCurrentEpisode

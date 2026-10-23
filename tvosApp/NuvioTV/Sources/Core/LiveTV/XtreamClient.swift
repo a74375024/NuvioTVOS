@@ -212,11 +212,14 @@ struct XtreamClient {
 
     // MARK: Playback
 
-    /// Direct stream URL. HLS when the provider allows it (plays best on
-    /// Apple TV), otherwise MPEG-TS.
-    func streamURL(streamID: String, formats: [String] = []) -> URL? {
+    /// Direct stream URL. HLS when the provider allows it, otherwise
+    /// MPEG-TS; `preferTS` picks MPEG-TS whenever it's allowed (many
+    /// providers build HLS on the fly, which can stutter more).
+    func streamURL(streamID: String, formats: [String] = [], preferTS: Bool = false) -> URL? {
         guard let base = account.serverURL else { return nil }
-        let ext = formats.isEmpty || formats.contains("m3u8") ? "m3u8" : "ts"
+        let allowsTS = formats.isEmpty || formats.contains("ts")
+        let allowsHLS = formats.isEmpty || formats.contains("m3u8")
+        let ext = (preferTS && allowsTS) || !allowsHLS ? "ts" : "m3u8"
         let user = account.username.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? account.username
         let pass = password.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? password
         return URL(string: "\(base.absoluteString)/live/\(user)/\(pass)/\(streamID).\(ext)")

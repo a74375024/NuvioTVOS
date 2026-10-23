@@ -394,25 +394,31 @@ final class LiveTVExportModel: ObservableObject {
     @Published var working = false
     private let server = PlaybackDiagnosticExportServer()
 
-    func start() {
+    func start(kind: LiveTVExportKind = .channels) {
         guard !working else { return }
         working = true
         url = nil
         qrImage = nil
-        message = L10n.string("live_report_checking", fallback: "Checking guides for your channels…")
         Task {
-            await LiveTVStore.shared.checkAllGuides { [weak self] done, total in
-                self?.message = L10n.format("live_report_progress", fallback: "Checking guides: %d of %d channels…", done, total)
-            }
-            message = L10n.string("live_report_building", fallback: "Writing the report…")
-            let csv = await LiveTVStore.shared.channelReportCSV { [weak self] done, total in
-                self?.message = L10n.format("live_report_writing", fallback: "Writing the report: %d of %d channels…", done, total)
+            let csv: String
+            switch kind {
+            case .playbackLog:
+                csv = LiveTVPlaybackLog.shared.csv()
+            case .channels:
+                message = L10n.string("live_report_checking", fallback: "Checking guides for your channels…")
+                await LiveTVStore.shared.checkAllGuides { [weak self] done, total in
+                    self?.message = L10n.format("live_report_progress", fallback: "Checking guides: %d of %d channels…", done, total)
+                }
+                message = L10n.string("live_report_building", fallback: "Writing the report…")
+                csv = await LiveTVStore.shared.channelReportCSV { [weak self] done, total in
+                    self?.message = L10n.format("live_report_writing", fallback: "Writing the report: %d of %d channels…", done, total)
+                }
             }
             message = L10n.string("live_report_starting", fallback: "Starting the download link…")
             server.start(
                 report: Data(csv.utf8),
                 contentType: "text/csv; charset=utf-8",
-                filename: "nuvio-live-tv-channels.csv",
+                filename: kind == .playbackLog ? "nuvio-live-tv-playback-log.csv" : "nuvio-live-tv-channels.csv",
                 // Big provider lists (70k channels) make a 20-30 MB report.
                 maximumBytes: 96 * 1024 * 1024,
                 lifetime: 600
@@ -447,15 +453,25 @@ final class LiveTVExportModel: ObservableObject {
     }
 }
 
+enum LiveTVExportKind {
+    case channels
+    case playbackLog
+}
+
 struct LiveTVExportView: View {
+    var kind: LiveTVExportKind = .channels
     @StateObject private var model = LiveTVExportModel()
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
         VStack(alignment: .leading, spacing: 28) {
-            Text(L10n.string("live_report_title", fallback: "Channel Report"))
+            Text(kind == .playbackLog
+                 ? L10n.string("live_log_title", fallback: "Playback Log")
+                 : L10n.string("live_report_title", fallback: "Channel Report"))
                 .font(.largeTitle.bold())
-            Text(L10n.string("live_report_detail", fallback: "A spreadsheet (CSV) of every Live TV channel: number, name, group, the call sign or station detected, whether your server has guide data, which outside listing matched and how, and what's on now. Stream links, passwords and tokens are not included."))
+            Text(kind == .playbackLog
+                 ? L10n.string("live_log_detail", fallback: "A spreadsheet (CSV) of what happened each time Live TV tuned a channel: which version was tried, how long the picture took, stalls, reconnects, switches to backup feeds and why. Stream links, passwords and tokens are not included.")
+                 : L10n.string("live_report_detail", fallback: "A spreadsheet (CSV) of every Live TV channel: number, name, group, the call sign or station detected, whether your server has guide data, which outside listing matched and how, and what's on now. Stream links, passwords and tokens are not included."))
                 .font(.system(size: 23))
                 .foregroundStyle(.secondary)
             if !model.message.isEmpty {
@@ -482,7 +498,7 @@ struct LiveTVExportView: View {
                     Button(model.working
                            ? L10n.string("live_report_working", fallback: "Preparing…")
                            : L10n.string("live_report_create", fallback: "Create Report")) {
-                        model.start()
+                        model.start(kind: kind)
                     }
                     .disabled(model.working)
                 }
