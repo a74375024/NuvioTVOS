@@ -196,11 +196,11 @@ final class SportsData: ObservableObject {
         guard let object = await get("lookup_all_teams.php?id=\(league.id)"),
               let list = object["teams"] as? [[String: Any]] else { return nil }
         let teams = list.compactMap { item -> SportsTeam? in
-            guard let id = Self.text(item["idTeam"]), let name = Self.text(item["strTeam"]) else { return nil }
-            let alternates = (Self.text(item["strTeamAlternate"]) ?? "")
+            guard let id = SportsParse.text(item["idTeam"]), let name = SportsParse.text(item["strTeam"]) else { return nil }
+            let alternates = (SportsParse.text(item["strTeamAlternate"]) ?? "")
                 .split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
-            return SportsTeam(id: id, name: name, short: Self.text(item["strTeamShort"]), alternates: alternates,
-                              badge: Self.text(item["strBadge"]) ?? Self.text(item["strTeamBadge"]))
+            return SportsTeam(id: id, name: name, short: SportsParse.text(item["strTeamShort"]), alternates: alternates,
+                              badge: SportsParse.text(item["strBadge"]) ?? SportsParse.text(item["strTeamBadge"]))
         }
         return teams.isEmpty ? nil : teams
     }
@@ -210,37 +210,38 @@ final class SportsData: ObservableObject {
         guard let list = object["events"] as? [[String: Any]] else { return [] }
         let teams = Dictionary((saved.teams[league.id] ?? []).map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
         return list.compactMap { item -> SportsGame? in
-            guard let id = Self.text(item["idEvent"]),
-                  let leagueName = Self.text(item["strLeague"]),
+            guard let id = SportsParse.text(item["idEvent"]),
+                  let leagueName = SportsParse.text(item["strLeague"]),
                   league.expect.contains(where: { leagueName.lowercased().contains($0) }),
-                  let homeName = Self.text(item["strHomeTeam"]), let awayName = Self.text(item["strAwayTeam"]),
-                  let start = Self.date(item) else { return nil }
+                  let homeName = SportsParse.text(item["strHomeTeam"]), let awayName = SportsParse.text(item["strAwayTeam"]),
+                  let start = SportsParse.date(item) else { return nil }
             func team(_ idKey: String, _ name: String, _ badgeKey: String) -> SportsTeam {
-                let teamID = Self.text(item[idKey]) ?? name
+                let teamID = SportsParse.text(item[idKey]) ?? name
                 var value = teams[teamID] ?? SportsTeam(id: teamID, name: name)
-                if value.badge == nil { value.badge = Self.text(item[badgeKey]) }
+                if value.badge == nil { value.badge = SportsParse.text(item[badgeKey]) }
                 return value
             }
-            let postponed = (Self.text(item["strPostponed"]) ?? "").lowercased() == "yes"
-                || (Self.text(item["strStatus"]) ?? "").lowercased().contains("postponed")
+            let postponed = (SportsParse.text(item["strPostponed"]) ?? "").lowercased() == "yes"
+                || (SportsParse.text(item["strStatus"]) ?? "").lowercased().contains("postponed")
             return SportsGame(
                 id: id, league: league.group, leagueShort: league.short, leagueName: leagueName, isSoccer: league.soccer,
-                round: Self.text(item["intRound"]),
+                round: SportsParse.text(item["intRound"]),
                 home: team("idHomeTeam", homeName, "strHomeTeamBadge"),
                 away: team("idAwayTeam", awayName, "strAwayTeamBadge"),
-                start: start, status: Self.text(item["strStatus"]),
-                homeScore: Self.text(item["intHomeScore"]).flatMap(Int.init),
-                awayScore: Self.text(item["intAwayScore"]).flatMap(Int.init),
-                venue: Self.text(item["strVenue"]),
-                thumb: Self.text(item["strThumb"]),
+                start: start, status: SportsParse.text(item["strStatus"]),
+                homeScore: SportsParse.text(item["intHomeScore"]).flatMap(Int.init),
+                awayScore: SportsParse.text(item["intAwayScore"]).flatMap(Int.init),
+                venue: SportsParse.text(item["strVenue"]),
+                thumb: SportsParse.text(item["strThumb"]),
                 postponed: postponed
             )
         }
     }
+}
 
-    // MARK: Parsing
-
-    private static func text(_ value: Any?) -> String? {
+/// JSON helpers, outside the main actor so the parsing closures can use them.
+private enum SportsParse {
+    static func text(_ value: Any?) -> String? {
         switch value {
         case let string as String:
             let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -252,13 +253,13 @@ final class SportsData: ObservableObject {
         }
     }
 
-    private static let isoFormatter: ISO8601DateFormatter = {
+    static let isoFormatter: ISO8601DateFormatter = {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime]
         return formatter
     }()
 
-    private static let plainFormatter: DateFormatter = {
+    static let plainFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.timeZone = TimeZone(identifier: "UTC")
@@ -267,7 +268,7 @@ final class SportsData: ObservableObject {
     }()
 
     /// Start time in UTC: strTimestamp, else dateEvent + strTime.
-    private static func date(_ item: [String: Any]) -> Date? {
+    static func date(_ item: [String: Any]) -> Date? {
         if let stamp = text(item["strTimestamp"]) {
             if let date = isoFormatter.date(from: stamp) { return date }
             if let date = plainFormatter.date(from: String(stamp.prefix(19))) { return date }
