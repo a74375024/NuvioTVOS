@@ -1,10 +1,7 @@
-name: Build Enhancements IPA
+name: Build
 
-# Builds an unsigned tvOS .ipa from this fork so it can be sideloaded
-# (Feather, Sideloadly, etc. re-sign it on install).
-# Pushes publish a *preview* (pre-release with screenshots) that sideloaders
-# watching "latest" ignore. Promote it with promote-preview.yml, or dispatch
-# this workflow with release=true to publish straight to latest.
+# Unsigned tvOS build. Pushes publish a pre-release; promote-preview.yml
+# marks it latest.
 on:
   workflow_dispatch:
     inputs:
@@ -85,45 +82,17 @@ jobs:
           [ -z "$version" ] && version="dev"
           tag="enh-${version}-b${{ github.run_number }}"
 
-          git remote add upstream https://github.com/bobsupra/NuvioTVOS.git 2>/dev/null || true
-          git fetch --no-tags --quiet upstream main || true
-          prev=$(git tag --list 'enh-*' --sort=-creatordate | head -1)
-          if [ -n "$prev" ]; then
-            range="$prev..HEAD"
-          else
-            range="$(git merge-base HEAD upstream/main 2>/dev/null || git rev-list --max-parents=0 HEAD | tail -1)..HEAD"
-          fi
-
-          ours=$(git log "$range" --no-merges --author="a74375024" --format='%s' | { grep -v '^ci:' || true; } | sed 's/^/- /')
-          upstream_count=$(git log "$range" --no-merges --format='%ae' | grep -v 'a74375024@users.noreply.github.com' | grep -vc 'github-actions' || true)
-
-          {
-            echo "## What's new in this build"
-            if [ -n "$ours" ]; then echo "$ours"; else echo "- No changes to the enhancements."; fi
-            echo
-            echo "## From bobsupra"
-            if [ "${upstream_count:-0}" -gt 0 ]; then
-              echo "- ${upstream_count} new upstream commits (Nuvio ${version})."
-            else
-              echo "- No new upstream changes (Nuvio ${version})."
-            fi
-            echo
-            echo "**Includes:** Multiview + Spotlight · Release Calendar · Shuffle · Auto-skip intros & endings"
-            echo
-            echo "Unsigned tvOS build of commit ${GITHUB_SHA::7}. Install with your sideloading tool; it re-signs the app on install."
-            echo "Always-newest download: https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/NuvioTV-unsigned.ipa"
-          } > release-notes.md
+          # Quiet notes: no feature list, no install instructions.
+          echo "Build ${{ github.run_number }} · ${GITHUB_SHA::7}" > release-notes.md
           cat release-notes.md
 
-          name="Nuvio ${version} + Enhancements · build ${{ github.run_number }}"
+          name="Build ${{ github.run_number }}"
           if [ "${{ inputs.release }}" = "true" ]; then
             echo "full=true" >> "$GITHUB_OUTPUT"
           else
             name="${name} (preview)"
             echo "full=false" >> "$GITHUB_OUTPUT"
-            { echo; echo "> **Preview.** Not marked latest yet, so auto-installs skip it until it is approved."; } >> release-notes.md
           fi
-          ls screens/*.png >/dev/null 2>&1 || echo "> Screenshots unavailable for this build." >> release-notes.md
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "name=${name}" >> "$GITHUB_OUTPUT"
 
@@ -139,17 +108,15 @@ jobs:
           fail_on_unmatched_files: false
           files: |
             build-ipa/NuvioTV-unsigned.ipa
-            screens/*.png
-            screens/screens.zip
 
       - name: Tidy up old releases
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
-        # Drops the old single rolling release and keeps the 15 newest builds.
+        # Drops the old single rolling release and keeps the 5 newest builds.
         run: |
           gh release delete multiview-latest --cleanup-tag --yes -R "$GITHUB_REPOSITORY" 2>/dev/null || true
           gh release list -R "$GITHUB_REPOSITORY" --limit 100 --json tagName -q '.[].tagName' \
-            | { grep '^enh-' || true; } | tail -n +16 \
+            | { grep '^enh-' || true; } | tail -n +6 \
             | while read -r old; do gh release delete "$old" --cleanup-tag --yes -R "$GITHUB_REPOSITORY" || true; done \
             || true
