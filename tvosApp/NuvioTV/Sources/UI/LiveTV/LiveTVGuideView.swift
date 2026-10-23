@@ -195,11 +195,12 @@ struct LiveTVGuideView: View {
     @State private var genre: LiveGenre?
     @State private var showingEvents = false
     @State private var showSearch = false
-    @State private var showViewPicker = false
-    @State private var showGenres = false
+    /// The Filter or Options panel over the guide's right side.
+    @State private var panel: LivePanelKind?
+    @AppStorage(LiveTabsSetting.allChannelsKey) private var allChannelsTab = -1
+    @FocusState private var barFocus: String?
     @State private var genreCounts: (channels: [LineupCategory: Int], now: [LiveNowGenre: Int])?
     @State private var rowsMemo = LiveRowsMemo()
-    @State private var showOptions = false
     @State private var showSetup = false
     @State private var feedPicker: LiveFeedPicker?
     @State private var now = Date()
@@ -207,7 +208,11 @@ struct LiveTVGuideView: View {
     private let ticker = Timer.publish(every: 30, on: .main, in: .common).autoconnect()
 
     private var currentView: LiveView {
-        chosenView ?? (store.prefs.configured ? .lineup : .all)
+        chosenView ?? (store.prefs.configured || !showsAllTab ? .lineup : .all)
+    }
+
+    private var showsAllTab: Bool {
+        LiveTabsSetting.showsAllChannels(allChannelsTab, configured: store.prefs.configured)
     }
 
     var body: some View {
@@ -249,8 +254,34 @@ struct LiveTVGuideView: View {
                 .transition(.move(edge: .bottom).combined(with: .opacity))
                 .allowsHitTesting(false)
             }
+            if let panel {
+                Group {
+                    switch panel {
+                    case .filter:
+                        filterPanel
+                    case .options:
+                        LiveTVOptionsPanel(
+                            onSetup: {
+                                closePanel()
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { showSetup = true }
+                            },
+                            onClose: { closePanel() }
+                        )
+                    }
+                }
+                .transition(.move(edge: .trailing).combined(with: .opacity))
+            }
         }
         .animation(.easeInOut(duration: 0.25), value: store.toast)
+        .animation(.easeOut(duration: 0.22), value: panel)
+        .onChange(of: showsAllTab) { _, shows in
+            // Turning the tab off while on it lands on My Lineup.
+            guard !shows else { return }
+            switch currentView {
+            case .all, .group: chosenView = .lineup
+            default: break
+            }
+        }
         .onAppear {
             now = Date()
             store.loadIfNeeded()
@@ -274,7 +305,7 @@ struct LiveTVGuideView: View {
         }
         .onChange(of: store.entriesRevision) { _, _ in
             // Keep the genre picker's counts current while it's open.
-            if showGenres { genreCounts = countGenres() }
+            if panel == .filter { genreCounts = countGenres() }
         }
         .onChange(of: genre) { _, newGenre in
             // "On now" filtering needs guide data for the whole list.
@@ -297,27 +328,8 @@ struct LiveTVGuideView: View {
         .fullScreenCover(isPresented: $showSetup) {
             LineupSetupView { showSetup = false; chosenView = nil }
         }
-        .sheet(isPresented: $showViewPicker) {
-            LiveTVViewPicker(current: currentView) { view in
-                chosenView = view
-                showingEvents = false
-                showViewPicker = false
-            }
-        }
-        .sheet(isPresented: $showOptions) {
-            LiveTVOptionsView(onSetup: {
-                showOptions = false
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { showSetup = true }
-            })
-        }
         .sheet(item: $feedPicker) { picker in
             LiveFeedPickerView(picker: picker) { feedPicker = nil }
-        }
-        .sheet(isPresented: $showGenres) {
-            LiveTVGenrePicker(current: genre, counts: genreCounts ?? ([:], [:])) { picked in
-                genre = picked
-                showGenres = false
-            }
         }
     }
 
@@ -344,13 +356,13 @@ struct LiveTVGuideView: View {
         DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
             switch request {
             case "live-demo-search": showSearch = true
-            case "live-demo-groups": showViewPicker = true
-            case "live-demo-sources": showOptions = true
+            case "live-demo-groups": panel = .filter
+            case "live-demo-sources": panel = .options
             case "live-demo-events": showingEvents = true
-            case "live-demo-all": chosenView = .all; store.setShowHidden(true)
+            case "live-demo-all": chosenView = .all
             case "live-demo-setup": showSetup = true
             case "live-demo-genres":
-                DispatchQueue.main.asyncAfter(deadline: .now() + 3) { genreCounts = countGenres(); showGenres = true }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3) { genreCounts = countGenres(); panel = .filter }
             default: break
             }
         }
@@ -395,7 +407,8 @@ struct LiveTVGuideView: View {
 
     /// Rows for the current view, before the genre filter.
     private var baseRows: [LiveGuideRow] {
-        let showHidden = store.prefs.showHidden
+        // "Show hidden channels" gave way to the All Channels tab setting.
+        let showHidden = false
         switch currentView {
         case .lineup:
             guard showHidden else { return store.lineupEntries.map { LiveGuideRow(channel: $0, dimmed: false) } }
@@ -417,7 +430,7 @@ struct LiveTVGuideView: View {
     }
 
     private var rows: [LiveGuideRow] {
-        var key = "\(currentView)|\(genre?.id ?? "")|\(store.prefs.showHidden)|\(store.entriesRevision)|\(store.hiddenGroups.hashValue)"
+        var key = "\(currentView)|\(genre?.id ?? "")|\(store.entriesRevision)|\(store.hiddenGroups.hashValue)"
         if currentView == .recent { key += "|\(store.recentIDs.hashValue)" }
         if genre?.needsPrograms == true {
             key += "|\(store.programsRevision)|\(Int(now.timeIntervalSince1970 / 60))"
@@ -479,13 +492,13 @@ struct LiveTVGuideView: View {
             VStack(alignment: .leading, spacing: 0) {
                 if showingEvents {
                     eventsHeader
-                    filterBar.padding(.bottom, 16)
+                    tabBar.padding(.bottom, 16)
                     LiveEventsView(onPickFamily: { family in
                         feedPicker = LiveFeedPicker(title: family.name, channel: nil, family: family)
                     })
                 } else {
                     hero.frame(width: max(0, proxy.size.width - LiveGuideMetrics.sideInset * 2), height: LiveGuideMetrics.heroHeight).clipped()
-                    filterBar.padding(.bottom, 14)
+                    tabBar.padding(.bottom, 14)
                     if !store.prefs.configured {
                         setupPrompt.padding(.bottom, 14)
                     }
@@ -495,6 +508,7 @@ struct LiveTVGuideView: View {
             }
             .padding(.horizontal, LiveGuideMetrics.sideInset)
             .frame(width: proxy.size.width, alignment: .leading)
+            .disabled(panel != nil)
             .overlay(alignment: .topLeading) {
                 if !showingEvents, !railOpen {
                     nowLine(gridWidth: gridWidth, ppm: ppm, height: proxy.size.height)
@@ -654,30 +668,28 @@ struct LiveTVGuideView: View {
     }
 
     private func neighborhoodRail(_ hoods: [Neighborhood], list: [LiveGuideRow], ppm: CGFloat, scroller: ScrollViewProxy) -> some View {
-        let buttons = VStack(alignment: .leading, spacing: 4) {
+        let buttons = VStack(alignment: .leading, spacing: 8) {
             ForEach(hoods) { hood in
                 railButton(hood, ppm: ppm, scroller: scroller)
             }
         }
-        return VStack(alignment: .leading, spacing: 10) {
-            Text(L10n.string("live_jump_to", fallback: "JUMP TO"))
-                .font(.system(size: 16, weight: .heavy))
-                .tracking(2)
-                .foregroundColor(.white.opacity(0.5))
-                .padding(.leading, 20)
+        return VStack(alignment: .leading, spacing: 12) {
+            LiveSectionLabel(text: L10n.string("live_jump_to", fallback: "Jump to"))
+                .padding(.leading, 22)
             ViewThatFits(in: .vertical) {
                 buttons
                 ScrollView(.vertical, showsIndicators: false) { buttons.padding(.vertical, 6) }
             }
         }
-        .padding(.top, 22)
+        .padding(.top, 24)
         .padding(.bottom, 14)
         .padding(.horizontal, 12)
-        .frame(width: 360, alignment: .leading)
+        .frame(width: 380, alignment: .leading)
         .background(
-            RoundedRectangle(cornerRadius: 26, style: .continuous)
-                .fill(Color(white: 0.12))
-                .overlay(RoundedRectangle(cornerRadius: 26, style: .continuous).strokeBorder(Color.white.opacity(0.12), lineWidth: 1))
+            RoundedRectangle(cornerRadius: LiveStyle.panelRadius, style: .continuous)
+                .fill(.regularMaterial)
+                .overlay(RoundedRectangle(cornerRadius: LiveStyle.panelRadius, style: .continuous).fill(Color.black.opacity(0.55)))
+                .overlay(RoundedRectangle(cornerRadius: LiveStyle.panelRadius, style: .continuous).strokeBorder(Color.white.opacity(0.10), lineWidth: 1))
                 .shadow(color: .black.opacity(0.6), radius: 30, x: 8, y: 8)
         )
         .focusSection()
@@ -689,31 +701,24 @@ struct LiveTVGuideView: View {
         return Button {
             closeRail(landingOn: hood, ppm: ppm, scroller: scroller)
         } label: {
-            HStack(spacing: 10) {
+            HStack(spacing: 12) {
                 Circle()
-                    .fill(Color(red: 1, green: 0.32, blue: 0.32))
-                    .frame(width: 8, height: 8)
+                    .fill(LiveStyle.watching)
+                    .frame(width: 9, height: 9)
                     .opacity(hood.category == railOrigin && !focused ? 1 : 0)
                 Text(hood.category.genreTitle)
-                    .font(.system(size: 24, weight: .bold))
+                    .font(LiveStyle.rowTitle)
                     .lineLimit(1)
-                    .minimumScaleFactor(0.8)
+                    .minimumScaleFactor(0.75)
                 Spacer(minLength: 8)
                 Text("\(hood.count)")
-                    .font(.system(size: 18, weight: .bold).monospacedDigit())
-                    .opacity(0.55)
+                    .font(LiveStyle.rowValue.monospacedDigit())
+                    .opacity(0.6)
             }
-            .foregroundColor(focused ? .black : .white.opacity(0.9))
-            .padding(.leading, 10)
-            .padding(.trailing, 18)
-            .frame(height: 50)
-            .background(
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .fill(focused ? Color.white : Color.clear)
-            )
-            .animation(.easeOut(duration: 0.12), value: focused)
+            .padding(.leading, 12)
+            .padding(.trailing, 22)
         }
-        .buttonStyle(PosterCardButtonStyle())
+        .buttonStyle(LivePillButtonStyle(focused: focused))
         .focused($railFocus, equals: hood.category)
         .focusEffectDisabledIfAvailable()
         .onMoveCommand { direction in
@@ -793,6 +798,12 @@ struct LiveTVGuideView: View {
 
     private var heroChannel: LiveTVChannel? { focusedChannel ?? rows.first?.channel }
 
+    /// The small label over the hero: the channel's neighborhood (the tab
+    /// already says which view this is).
+    private var heroNeighborhood: String {
+        heroChannel.flatMap { store.category(of: $0.id)?.genreTitle } ?? currentView.title
+    }
+
     private var heroProgram: LiveTVProgram? {
         if let focusedProgram { return focusedProgram }
         guard let channel = heroChannel else { return nil }
@@ -817,7 +828,7 @@ struct LiveTVGuideView: View {
     private var heroInfo: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 14) {
-                Text(currentView.title)
+                Text(heroNeighborhood)
                     .font(.system(size: 24, weight: .bold))
                     .foregroundColor(.white.opacity(0.55))
                 if store.isLoadingGuide { ProgressView().tint(.white).scaleEffect(0.7) }
@@ -956,7 +967,7 @@ struct LiveTVGuideView: View {
     private var previewTarget: String {
         if ScreenTour.requested == "live-demo-preview" { return rows.first?.channel.id ?? "" }
         guard focusedCell != nil, let channel = focusedChannel, !showingEvents, !showSearch, !showSetup,
-              !showOptions, !showViewPicker, !showGenres, feedPicker == nil, !store.isWatching, store.overlay == nil,
+              panel == nil, feedPicker == nil, !store.isWatching, store.overlay == nil,
               !multiview.isPresented, scenePhase == .active else { return "" }
         return channel.id
     }
@@ -1012,32 +1023,55 @@ struct LiveTVGuideView: View {
 
     // MARK: Filters
 
-    private var filterBar: some View {
-        HStack(spacing: 14) {
-            SourceModeChip(title: L10n.string("live_search", fallback: "Search"), isSelected: false) {
-                showSearch = true
+    // MARK: Tabs
+
+    private var tabs: [LiveTab] {
+        [.lineup, .favorites, .recent, .events] + (showsAllTab ? [.all] : [])
+    }
+
+    private var currentTab: LiveTab {
+        if showingEvents { return .events }
+        switch currentView {
+        case .lineup: return .lineup
+        case .favorites: return .favorites
+        case .recent: return .recent
+        case .all, .group: return .all
+        }
+    }
+
+    /// Moving across the tabs only highlights them; Select switches.
+    private func selectTab(_ tab: LiveTab) {
+        guard tab != currentTab || (tab == .all && currentView != .all) else { return }
+        genre = nil
+        switch tab {
+        case .events:
+            showingEvents = true
+        case .lineup: showingEvents = false; chosenView = .lineup
+        case .favorites: showingEvents = false; chosenView = .favorites
+        case .recent: showingEvents = false; chosenView = .recent
+        case .all: showingEvents = false; chosenView = .all
+        }
+    }
+
+    /// What the filter chip says: the genre, or the provider group.
+    private var filterTitle: String? {
+        if showingEvents { return nil }
+        if let genre { return genre.title }
+        if case .group(let name) = currentView { return name }
+        return nil
+    }
+
+    private func clearFilter() {
+        genre = nil
+        if case .group = currentView { chosenView = .all }
+    }
+
+    private var tabBar: some View {
+        HStack(spacing: 10) {
+            ForEach(tabs, id: \.self) { tab in
+                LiveTabButton(title: tab.title, selected: tab == currentTab) { selectTab(tab) }
             }
-            SourceModeChip(title: (currentView == .favorites ? (store.prefs.configured ? LiveView.lineup : LiveView.all).title : currentView.title) + " ▾",
-                           isSelected: !showingEvents && currentView != .favorites) {
-                if showingEvents { showingEvents = false } else { showViewPicker = true }
-            }
-            SourceModeChip(title: L10n.string("live_filter_favorites", fallback: "Favorites"), isSelected: !showingEvents && currentView == .favorites) {
-                showingEvents = false
-                chosenView = currentView == .favorites ? nil : .favorites
-            }
-            SourceModeChip(title: L10n.string("live_events_chip", fallback: "Live Events"), isSelected: showingEvents) {
-                showingEvents.toggle()
-            }
-            if !showingEvents {
-                SourceModeChip(title: (genre?.title ?? L10n.string("live_genre", fallback: "Genre")) + " ▾", isSelected: genre != nil) {
-                    genreCounts = countGenres()
-                    showGenres = true
-                }
-            }
-            SourceModeChip(title: L10n.string("live_options", fallback: "Options"), isSelected: false) {
-                showOptions = true
-            }
-            Spacer(minLength: 0)
+            Spacer(minLength: 20)
             if !multiview.channels.isEmpty {
                 SourceModeChip(
                     title: L10n.format("live_open_multiview", fallback: "Multiview (%d)", multiview.channels.count),
@@ -1046,9 +1080,97 @@ struct LiveTVGuideView: View {
                     multiview.isPresented = true
                 }
             }
+            if let filterTitle {
+                LiveFilterChip(title: filterTitle) { clearFilter() }
+            }
+            LiveIconButton(symbol: "magnifyingglass", focus: $barFocus, id: "search") { showSearch = true }
+            if !showingEvents {
+                LiveIconButton(symbol: "line.3.horizontal.decrease", dot: filterTitle != nil, focus: $barFocus, id: "filter") {
+                    openPanel(.filter)
+                }
+            }
+            LiveIconButton(symbol: "gearshape", focus: $barFocus, id: "options") { openPanel(.options) }
         }
         .frame(height: 60)
         .focusSection()
+    }
+
+    // MARK: Panels
+
+    private func openPanel(_ kind: LivePanelKind) {
+        if kind == .filter { genreCounts = countGenres() }
+        panel = kind
+    }
+
+    /// Closes the panel and puts focus back on the icon that opened it.
+    private func closePanel() {
+        let opened = panel
+        panel = nil
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            barFocus = opened == .options ? "options" : "filter"
+        }
+    }
+
+    private var filterPanel: some View {
+        let counts = genreCounts ?? ([:], [:])
+        let total = baseRows.count
+        let isGroup: Bool = { if case .group = currentView { return true }; return false }()
+        return LiveSidePanel(edge: .trailing, width: 760) {
+            ScrollView(.vertical, showsIndicators: false) {
+                VStack(alignment: .leading, spacing: 6) {
+                    LiveSectionLabel(text: L10n.string("live_filter", fallback: "Filter") + "  ·  " + currentTab.title)
+                        .padding(.leading, 4)
+                        .padding(.bottom, 10)
+                    LivePanelRow(title: L10n.string("live_filter_all", fallback: "All channels"),
+                                 accessory: .countChecked(total, genre == nil && !isGroup)) {
+                        genre = nil
+                        if isGroup { chosenView = .all }
+                        closePanel()
+                    }
+                    panelSection(L10n.string("live_genre_now", fallback: "On now"))
+                    ForEach(LiveNowGenre.allCases) { kind in
+                        LivePanelRow(title: kind.title, accessory: .countChecked(counts.now[kind] ?? 0, genre == .onNow(kind)),
+                                     dot: LiveStyle.watching) {
+                            genre = .onNow(kind)
+                            closePanel()
+                        }
+                    }
+                    let categories = LineupCategory.allCases.filter { (counts.channels[$0] ?? 0) > 0 }
+                    if !categories.isEmpty {
+                        panelSection(L10n.string("live_neighborhoods", fallback: "Neighborhoods"))
+                        ForEach(categories) { category in
+                            LivePanelRow(title: category.genreTitle,
+                                         accessory: .countChecked(counts.channels[category] ?? 0, genre == .channels(category))) {
+                                genre = .channels(category)
+                                closePanel()
+                            }
+                        }
+                    }
+                    if currentTab == .all, !store.groups.isEmpty {
+                        panelSection(L10n.format("live_groups_count", fallback: "Provider groups (%d)", store.groups.count))
+                        ForEach(store.groups) { group in
+                            LivePanelRow(title: group.name, accessory: .countChecked(group.count, currentView == .group(group.name))) {
+                                genre = nil
+                                chosenView = .group(group.name)
+                                closePanel()
+                            }
+                        }
+                    }
+                }
+                .padding(.top, 50)
+                .padding(.bottom, 60)
+                .padding(.trailing, 70)
+            }
+            .focusSection()
+        }
+        .onExitCommand { closePanel() }
+    }
+
+    private func panelSection(_ title: String) -> some View {
+        LiveSectionLabel(text: title)
+            .padding(.top, 22)
+            .padding(.bottom, 6)
+            .padding(.leading, 4)
     }
 
     // MARK: Time ruler
