@@ -500,7 +500,8 @@ struct LiveTVGuideView: View {
 
     private func guideList(gridWidth: CGFloat, ppm: CGFloat) -> some View {
         let list = rows
-        return ScrollView(.vertical, showsIndicators: false) {
+        return ScrollViewReader { scroller in
+        ScrollView(.vertical, showsIndicators: false) {
             LazyVStack(alignment: .leading, spacing: LiveGuideMetrics.rowSpacing) {
                 if list.isEmpty {
                     Text(emptyMessage)
@@ -521,6 +522,35 @@ struct LiveTVGuideView: View {
         }
         .mask(Rectangle().padding(.horizontal, -60).padding(.bottom, -200))
         .focusSection()
+        .onChange(of: store.isWatching) { _, watching in
+            guard !watching else { return }
+            returnFocus(list: list, ppm: ppm, scroller: scroller)
+        }
+        }
+    }
+
+    /// Back from the player: scroll to the channel that was on screen and
+    /// focus what's on it now, instead of letting focus land at the top.
+    /// The player is still fading out at first, so focus is set once it's
+    /// gone and checked again a moment later.
+    private func returnFocus(list: [LiveGuideRow], ppm: CGFloat, scroller: ScrollViewProxy) {
+        guard let id = store.lastWatchedID, let row = list.first(where: { $0.channel.id == id }) else { return }
+        var key = "\(id)#none"
+        let programs = segments(for: row.channel, ppm: ppm).compactMap { part -> LiveTVProgram? in
+            if case .program(let program, _, _) = part { return program }
+            return nil
+        }
+        if let program = programs.first(where: { $0.isOn(at: Date()) }) ?? programs.first {
+            key = "\(id)#\(program.id)"
+        }
+        scroller.scrollTo(row.id, anchor: .center)
+        for delay in [0.35, 0.7] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                guard !store.isWatching, focusedCell != key else { return }
+                scroller.scrollTo(row.id, anchor: .center)
+                focusedCell = key
+            }
+        }
     }
 
     /// Rows with a header where each neighborhood starts (Local, News,

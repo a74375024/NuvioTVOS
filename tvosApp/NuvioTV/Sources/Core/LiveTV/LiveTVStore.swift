@@ -102,6 +102,9 @@ final class LiveTVStore: ObservableObject {
     @Published private(set) var recentIDs: [String] = []
     @Published private(set) var outsideStatus: OutsideStatus = .off
     @Published private(set) var watching: LiveTVChannel?
+    /// The channel on screen when the viewer left the player, for the guide
+    /// to focus when it comes back.
+    private(set) var lastWatchedID: String?
     @Published private(set) var overlay: Overlay?
     @Published private(set) var banner: Banner?
     @Published private(set) var lineupBuild: String?
@@ -2362,6 +2365,11 @@ final class LiveTVStore: ObservableObject {
         stallTask?.cancel()
         stallStartedAt = nil
         playbackNote = nil
+        // The guide puts focus back on this channel (the last one surfed to).
+        switch overlay {
+        case .some(.tuning(let channel)), .some(.failed(let channel, _)): lastWatchedID = watching?.id ?? channel.id
+        case .none: if let watching { lastWatchedID = watching.id }
+        }
         watching = nil
         overlay = nil
         banner = nil
