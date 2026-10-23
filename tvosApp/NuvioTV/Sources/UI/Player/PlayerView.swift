@@ -19,6 +19,8 @@ import Combine
 struct PlayerView: View {
     @StateObject var viewModel: PlayerViewModel
     @Environment(\.scenePhase) var scenePhase
+    /// Live TV's mini guide takes the remote while it's open.
+    @ObservedObject var liveOverlay = LiveOverlayState.shared
 
     let url: URL
     let meta: NuvioMeta

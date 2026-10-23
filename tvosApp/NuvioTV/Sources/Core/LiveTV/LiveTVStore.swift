@@ -6,6 +6,18 @@ import UIKit
 /// Jellyfin. Raw server channels are turned into one guide entry per real
 /// channel (other versions become automatic backup feeds), numbered event
 /// feeds into Live Events, and a suggested, editable My Lineup.
+/// What the Live TV overlay has open over the player; the player watches
+/// this (not the whole store) to hand its remote input to the overlay.
+@MainActor
+final class LiveOverlayState: ObservableObject {
+    static let shared = LiveOverlayState()
+    @Published var miniGuideOpen = false
+    /// A "starting now" reminder card is up and wants the remote.
+    @Published var reminderShowing = false
+
+    var blocksPlayerInput: Bool { miniGuideOpen || reminderShowing }
+}
+
 @MainActor
 final class LiveTVStore: ObservableObject {
     static let shared = LiveTVStore()
@@ -74,6 +86,7 @@ final class LiveTVStore: ObservableObject {
         let channel: LiveTVChannel
         let now: LiveTVProgram?
         let next: LiveTVProgram?
+        var previous: LiveTVChannel? = nil
         let token = UUID()
     }
 
@@ -102,6 +115,10 @@ final class LiveTVStore: ObservableObject {
     @Published private(set) var recentIDs: [String] = []
     @Published private(set) var outsideStatus: OutsideStatus = .off
     @Published private(set) var watching: LiveTVChannel?
+    /// The channel before the one on screen: Right in the player goes back
+    /// to it (and Right again bounces forward), like a cable LAST button.
+    @Published private(set) var previousChannel: LiveTVChannel?
+    private var lastDisplay: LiveTVChannel?
     /// The channel on screen when the viewer left the player, for the guide
     /// to focus when it comes back.
     private(set) var lastWatchedID: String?
@@ -1972,6 +1989,10 @@ final class LiveTVStore: ObservableObject {
         }
         let settleDelay = settle
         let handed = handoff
+        if !replacing {
+            if let last = lastDisplay, last.id != display.id { previousChannel = last }
+            lastDisplay = display
+        }
         watching = display
         if !replacing {
             // A new channel: new log session and a fresh recovery budget.
@@ -2350,8 +2371,183 @@ final class LiveTVStore: ObservableObject {
         }
     }
 
+    // MARK: Later in the day
+    //
+    // The guide normally shows the three hours from the last half hour. When
+    // the viewer moves later (Right past the last show, or Tonight ▾), rows
+    // ask for listings around that start instead: worked out from the same
+    // provider and outside guides (which cover many hours ahead) plus a
+    // server fetch for Emby channels. Kept for one start at a time.
+
+    @Published private(set) var laterRevision = 0
+    private var laterStart: Date?
+    private var laterPrograms: [String: [LiveTVProgram]] = [:]
+    private var laterServer: [String: [LiveTVProgram]] = [:]
+    private var laterRequested: Set<String> = []
+    private var laterFetching: Set<String> = []
+
+    /// A row's programs for the guide: the live window, or a later one.
+    func guidePrograms(on id: String, viewStart: Date?) -> [LiveTVProgram] {
+        guard let viewStart, viewStart != Self.windowStart() else { return programs[id] ?? [] }
+        guard laterStart == viewStart else { return [] }
+        return laterPrograms[id] ?? []
+    }
+
+    /// Whether a later window has anything for a row yet.
+    func laterLoaded(_ id: String, viewStart: Date) -> Bool {
+        laterStart == viewStart && laterRequested.contains(id) && !laterFetching.contains(where: { member in
+            (entryInfo[id]?.members.prefix(2).contains(member) ?? (member == id))
+        })
+    }
+
+    func requestLaterGuide(_ ids: [String], viewStart: Date) {
+        if laterStart != viewStart {
+            laterStart = viewStart
+            laterPrograms = [:]
+            laterServer = [:]
+            laterRequested = []
+            laterFetching = []
+        }
+        var fetch: [String: [String]] = [:]
+        var changed = false
+        for id in ids where !laterRequested.contains(id) {
+            laterRequested.insert(id)
+            changed = true
+            let members = entryInfo[id].map { Array($0.members.prefix(2)) } ?? [id]
+            for member in members {
+                if laterPrograms[member] == nil { laterPrograms[member] = laterListing(member, start: viewStart) }
+                if let index = indexByID[member], index < channels.count, traits[member]?.familyKey == nil,
+                   !channels[index].serverID.hasPrefix("xt:"), !laterFetching.contains(member) {
+                    fetch[channels[index].serverID, default: []].append(member)
+                    laterFetching.insert(member)
+                }
+            }
+            if entryInfo[id] != nil { laterPrograms[id] = laterEntryListing(id, start: viewStart) }
+        }
+        if changed { laterRevision &+= 1 }
+        guard !fetch.isEmpty else { return }
+        let clients = Dictionary(uniqueKeysWithValues: servers().map { ($0.config.id, $0.client) })
+        for (serverID, members) in fetch {
+            guard let client = clients[serverID] else {
+                members.forEach { laterFetching.remove($0) }
+                continue
+            }
+            for batch in stride(from: 0, to: members.count, by: Self.programBatch).map({ Array(members[$0..<min($0 + Self.programBatch, members.count)]) }) {
+                let itemIDs = batch.compactMap { indexByID[$0].map { channels[$0].itemID } }
+                Task { [weak self] in
+                    let list = try? await client.programs(channelItemIDs: itemIDs, from: viewStart.addingTimeInterval(-1800),
+                                                         to: viewStart.addingTimeInterval(Self.guideHours * 3600 + 1800))
+                    guard let self, self.laterStart == viewStart else { return }
+                    let grouped = Dictionary(grouping: list ?? [], by: \.channelID)
+                    var entries: Set<String> = []
+                    for member in batch {
+                        self.laterFetching.remove(member)
+                        self.laterServer[member] = (grouped[member] ?? []).sorted { $0.start < $1.start }
+                        self.laterPrograms[member] = self.laterListing(member, start: viewStart)
+                        if let entry = self.entryOf[member] { entries.insert(entry) }
+                    }
+                    for entry in entries where self.laterRequested.contains(entry) {
+                        self.laterPrograms[entry] = self.laterEntryListing(entry, start: viewStart)
+                    }
+                    self.laterRevision &+= 1
+                }
+            }
+        }
+    }
+
+    private func laterListing(_ id: String, start: Date) -> [LiveTVProgram] {
+        let isXtream = indexByID[id].map { channels[$0].serverID.hasPrefix("xt:") } ?? false
+        return LiveTVWork.listing(id: id, server: laterServer[id] ?? (isXtream ? serverPrograms[id] : nil),
+                                  provider: providerMatches[id], outside: outsideMatches[id], windowStart: start)
+    }
+
+    /// An entry's later listing: its best-covered version, under the entry's id.
+    private func laterEntryListing(_ id: String, start: Date) -> [LiveTVProgram] {
+        guard let info = entryInfo[id] else { return [] }
+        let end = start.addingTimeInterval(Self.guideHours * 3600)
+        func coverage(_ list: [LiveTVProgram]) -> TimeInterval {
+            list.reduce(0) { total, p in total + max(0, min(p.end, end).timeIntervalSince(max(p.start, start))) }
+        }
+        var best: [LiveTVProgram] = []
+        var bestCoverage: TimeInterval = -1
+        for member in info.members.prefix(2) {
+            let list = laterPrograms[member] ?? []
+            guard !list.isEmpty else { continue }
+            let value = coverage(list)
+            if value > bestCoverage { best = list; bestCoverage = value }
+        }
+        return best.map { program in
+            LiveTVProgram(
+                id: "\(id)|\(program.id)", channelID: id, title: program.title, episodeTitle: program.episodeTitle,
+                overview: program.overview, start: program.start, end: program.end, isMovie: program.isMovie,
+                isSports: program.isSports, isNews: program.isNews, isKids: program.isKids, isLive: program.isLive,
+                isPremiere: program.isPremiere, imageURL: program.imageURL, fromOutsideGuide: program.fromOutsideGuide
+            )
+        }
+    }
+
+    /// Other upcoming airings of a show (same title) on the guide's entries.
+    func otherAirings(of program: LiveTVProgram, limit: Int = 5) -> [(channel: LiveTVChannel, program: LiveTVProgram)] {
+        let now = Date()
+        var seen: Set<String> = [program.channelID + "|" + "\(program.start.timeIntervalSince1970)"]
+        var result: [(channel: LiveTVChannel, program: LiveTVProgram)] = []
+        for source in [programs, laterPrograms] {
+            for (id, list) in source where id.hasPrefix("e|") {
+                for other in list where other.title == program.title && other.end > now {
+                    let key = id + "|" + "\(other.start.timeIntervalSince1970)"
+                    guard !seen.contains(key), let channel = entry(id: id) else { continue }
+                    seen.insert(key)
+                    result.append((channel, other))
+                }
+            }
+        }
+        return Array(result.sorted { $0.program.start < $1.program.start }.prefix(limit))
+    }
+
+    // MARK: Mini guide and previous channel
+
+    /// The channels the player's mini guide lists: the list Up / Down surf.
+    func miniGuideChannels() -> [LiveTVChannel] {
+        flipList.isEmpty ? visibleEntries() : flipList
+    }
+
+    /// Left in the live player: the mini guide over the picture.
+    func openMiniGuide() {
+        guard isWatching, overlay == nil else { return }
+        requestGuide(miniGuideChannels().prefix(300).map(\.id))
+        LiveOverlayState.shared.miniGuideOpen = true
+    }
+
+    func closeMiniGuide() {
+        LiveOverlayState.shared.miniGuideOpen = false
+    }
+
+    /// A channel picked in the mini guide; the surf list stays as it was.
+    func watchFromMiniGuide(_ channel: LiveTVChannel) {
+        closeMiniGuide()
+        guard isWatching, channel.id != watching?.id else { return }
+        switchInPlayer(to: channel)
+    }
+
+    /// Right in the live player: back to the previous channel.
+    func goToPreviousChannel() {
+        guard isWatching, overlay == nil, let target = previousChannel, target.id != watching?.id else { return }
+        flash(L10n.format("live_back_to", fallback: "Back to %@", target.name))
+        switchInPlayer(to: target)
+    }
+
+    private func switchInPlayer(to target: LiveTVChannel) {
+        playerOnScreen = false
+        playerMetaID = nil
+        leavePlayer?()
+        surfStep = 0
+        remember(target)
+        tune(target, candidates: versions(of: target), from: 0, followFeed: false)
+    }
+
     /// Leaving the player or the tuning card.
     func stopWatching() {
+        LiveOverlayState.shared.miniGuideOpen = false
         // The provider may take a moment to let go of the stream: the guide
         // preview waits at least `previewMinGap` before opening another.
         lastPreviewOpen = Date()
@@ -2600,7 +2796,8 @@ final class LiveTVStore: ObservableObject {
         bannerTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: 1_500_000_000)
             guard let self, !Task.isCancelled, self.watching?.id == channel.id else { return }
-            self.banner = Banner(channel: channel, now: self.current(on: channel.id), next: self.next(on: channel.id))
+            self.banner = Banner(channel: channel, now: self.current(on: channel.id), next: self.next(on: channel.id),
+                                 previous: self.previousChannel)
             try? await Task.sleep(nanoseconds: 6_000_000_000)
             guard !Task.isCancelled else { return }
             self.banner = nil

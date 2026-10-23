@@ -206,6 +206,7 @@ extension PlayerView {
             // when controls are hidden or when the timeline is focused.
             isActive: PlayerWindowInputCapturePolicy.allowsCapture(
                 existingConditions: !isWakingFromBackground
+                && !liveOverlay.blocksPlayerInput
                 && viewModel.currentErrorDiagnostic == nil
                 && !viewModel.showSettingsPanel
                 && !viewModel.showScenePanel
@@ -252,7 +253,8 @@ extension PlayerView {
     }
 
     private var canRevealControlsFromRemotePress: Bool {
-        !viewModel.showControls
+        !liveOverlay.blocksPlayerInput
+            && !viewModel.showControls
             && !viewModel.showSettingsPanel
             && !viewModel.showScenePanel
             && !viewModel.isSceneDetailVisible
@@ -318,6 +320,7 @@ extension PlayerView {
                     && !viewModel.isSceneDetailVisible
                     && !viewModel.postPlayState.isVisible
                     && viewModel.sidePanel == nil
+                    && !liveOverlay.blocksPlayerInput
             )
             .focused($remoteInputFocused)
             .onTapGesture {

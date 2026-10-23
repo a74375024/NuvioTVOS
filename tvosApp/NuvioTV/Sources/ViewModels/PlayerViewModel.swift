@@ -4987,6 +4987,20 @@ class PlayerViewModel: ObservableObject {
     /// Performs discrete linear skips (e.g. +10s, +20s, +30s) per tap/move event.
     func handleMoveSeek(direction: MoveCommandDirection) {
         guard !isLiveStream else {
+            // Live TV: Left opens the mini guide, Right goes back to the
+            // previous channel (cable's LAST button).
+            if LiveTVStore.shared.isWatching, activeMeta?.id.hasPrefix("live:") == true {
+                if direction == .left {
+                    LiveTVStore.shared.openMiniGuide()
+                } else if direction == .right {
+                    if LiveTVStore.shared.previousChannel != nil {
+                        LiveTVStore.shared.goToPreviousChannel()
+                    } else {
+                        revealControls()
+                    }
+                }
+                return
+            }
             revealControls()
             return
         }

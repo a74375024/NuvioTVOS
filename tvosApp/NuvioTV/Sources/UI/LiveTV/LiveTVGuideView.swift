@@ -199,6 +199,14 @@ struct LiveTVGuideView: View {
     @State private var panel: LivePanelKind?
     @AppStorage(LiveTabsSetting.allChannelsKey) private var allChannelsTab = -1
     @FocusState private var barFocus: String?
+    /// Later in the day: the start the guide shows (nil = now).
+    @State private var viewStart: Date?
+    @State private var lastActivity = Date()
+    @State private var showTimeMenu = false
+    @FocusState private var timeFocus: String?
+    /// The details card for a future show.
+    @State private var detail: LiveProgramDetail?
+    @ObservedObject private var reminders = LiveReminders.shared
     @State private var genreCounts: (channels: [LineupCategory: Int], now: [LiveNowGenre: Int])?
     @State private var rowsMemo = LiveRowsMemo()
     @State private var showSetup = false
@@ -254,6 +262,10 @@ struct LiveTVGuideView: View {
                 .transition(.move(edge: .bottom).combined(with: .opacity))
                 .allowsHitTesting(false)
             }
+            if let detail {
+                LiveProgramDetailCard(detail: detail, onClose: { self.detail = nil })
+                    .transition(.opacity)
+            }
             if let panel {
                 Group {
                     switch panel {
@@ -274,6 +286,14 @@ struct LiveTVGuideView: View {
         }
         .animation(.easeInOut(duration: 0.25), value: store.toast)
         .animation(.easeOut(duration: 0.22), value: panel)
+        .animation(.easeOut(duration: 0.2), value: detail?.id)
+        .onChange(of: store.isWatching) { _, watching in
+            // After watching, the guide is back on Now.
+            if watching {
+                viewStart = nil
+                detail = nil
+            }
+        }
         .onChange(of: showsAllTab) { _, shows in
             // Turning the tab off while on it lands on My Lineup.
             guard !shows else { return }
@@ -403,7 +423,10 @@ struct LiveTVGuideView: View {
 
     // MARK: Rows
 
-    private var windowStart: Date { LiveTVStore.windowStart(for: now) }
+    /// The live window's start; the guide shows `viewStart` instead when the
+    /// viewer has moved later.
+    private var liveStart: Date { LiveTVStore.windowStart(for: now) }
+    private var windowStart: Date { viewStart ?? liveStart }
 
     /// Rows for the current view, before the genre filter.
     private var baseRows: [LiveGuideRow] {
@@ -503,12 +526,13 @@ struct LiveTVGuideView: View {
                         setupPrompt.padding(.bottom, 14)
                     }
                     timeRuler(gridWidth: gridWidth, ppm: ppm).padding(.bottom, 8)
+                        .zIndex(2)
                     guideList(gridWidth: gridWidth, ppm: ppm)
                 }
             }
             .padding(.horizontal, LiveGuideMetrics.sideInset)
             .frame(width: proxy.size.width, alignment: .leading)
-            .disabled(panel != nil)
+            .disabled(panel != nil || detail != nil)
             .overlay(alignment: .topLeading) {
                 if !showingEvents, !railOpen {
                     nowLine(gridWidth: gridWidth, ppm: ppm, height: proxy.size.height)
@@ -542,7 +566,7 @@ struct LiveTVGuideView: View {
                     .padding(.bottom, 60)
                 }
                 .mask(Rectangle().padding(.horizontal, -60).padding(.bottom, -200))
-                .disabled(railOpen)
+                .disabled(railOpen || showTimeMenu)
                 .overlay(Color.black.opacity(railOpen ? 0.5 : 0).allowsHitTesting(false))
                 .focusSection()
                 if railOpen {
@@ -557,8 +581,16 @@ struct LiveTVGuideView: View {
                 returnFocus(list: list, ppm: ppm, scroller: scroller)
             }
             .onChange(of: focusedCell) { old, new in
+                lastActivity = Date()
                 channelColumnFocused(old: old, new: new, list: list, items: items, ppm: ppm)
             }
+            .onReceive(ticker) { date in
+                // Two idle minutes later in the day: back to Now.
+                if viewStart != nil, date.timeIntervalSince(lastActivity) > 120, panel == nil, detail == nil {
+                    backToNow(ppm: ppm)
+                }
+            }
+            .onExitCommand(perform: viewStart != nil && !railOpen && !showTimeMenu ? { backToNow(ppm: ppm) } : nil)
             .onChange(of: railFocus) { old, new in
                 if let new, let hood = neighborhoods(items).first(where: { $0.category == new }) {
                     // The guide follows the rail, so you see where you'll land.
@@ -641,6 +673,11 @@ struct LiveTVGuideView: View {
         let id = String(new.dropLast(3))
         guard let row = list.first(where: { $0.channel.id == id }) else { return }
         let fromRow = old.map { $0.hasPrefix(id + "#") && !$0.hasSuffix("#ch") } ?? false
+        if fromRow, viewStart != nil {
+            // Later in the day, Left walks back toward Now first.
+            moveEarlier(row: row.channel, ppm: ppm)
+            return
+        }
         if fromRow, let old, let category = store.category(of: id),
            neighborhoods(items).contains(where: { $0.category == category }) {
             railReturnKey = old
@@ -723,6 +760,183 @@ struct LiveTVGuideView: View {
         .focusEffectDisabledIfAvailable()
         .onMoveCommand { direction in
             if direction == .right { closeRail(landingOn: hood, ppm: ppm, scroller: scroller) }
+        }
+    }
+
+    // MARK: Later in the day
+    //
+    // One timeline that starts at Now: Right past a row's last show moves
+    // the guide later, Left retraces (and at Now, Left opens the
+    // neighborhoods). Tonight ▾ jumps; Back returns to Now; the guide also
+    // returns to Now after watching, switching tabs, or two idle minutes.
+
+    private static let laterStep: TimeInterval = 90 * 60
+    private static let laterLimit: TimeInterval = 48 * 3600
+
+    /// The cell to focus on a row at a moment in the shown window: the show
+    /// on at `time`, else the next one, else the first, else "no guide".
+    private func cellKey(for channel: LiveTVChannel, at time: Date, ppm: CGFloat) -> String {
+        let programs = segments(for: channel, ppm: ppm).compactMap { part -> LiveTVProgram? in
+            if case .program(let program, _, _) = part { return program }
+            return nil
+        }
+        if let program = programs.first(where: { $0.start <= time && time < $0.end })
+            ?? programs.first(where: { $0.start >= time }) ?? programs.last {
+            return "\(channel.id)#\(program.id)"
+        }
+        return "\(channel.id)#none"
+    }
+
+    /// Rows around the focused one, for asking a new window's listings.
+    private func rowsNear(_ channelID: String?) -> [String] {
+        let list = rows
+        let index = channelID.flatMap { id in list.firstIndex(where: { $0.channel.id == id }) } ?? 0
+        let low = max(0, index - 20), high = min(list.count, index + 20)
+        return low < high ? list[low..<high].map(\.channel.id) : []
+    }
+
+    private func show(start: Date?, focusRow channel: LiveTVChannel?, at time: Date, ppm: CGFloat) {
+        let target: Date? = start.flatMap { $0 <= liveStart ? nil : $0 }
+        viewStart = target
+        lastActivity = Date()
+        if let target {
+            store.requestLaterGuide(rowsNear(channel?.id ?? focusedChannel?.id), viewStart: target)
+        }
+        guard let channel else { return }
+        let key = cellKey(for: channel, at: max(time, target ?? now), ppm: ppm)
+        for delay in [0.05, 0.3] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                guard focusedCell != key else { return }
+                focusedCell = key
+            }
+        }
+    }
+
+    private func moveLater(row channel: LiveTVChannel, after time: Date, ppm: CGFloat) {
+        let next = windowStart.addingTimeInterval(Self.laterStep)
+        guard next < liveStart.addingTimeInterval(Self.laterLimit) else { return }
+        show(start: next, focusRow: channel, at: time, ppm: ppm)
+    }
+
+    private func moveEarlier(row channel: LiveTVChannel, ppm: CGFloat) {
+        let back = windowStart.addingTimeInterval(-Self.laterStep)
+        show(start: back, focusRow: channel, at: windowStart.addingTimeInterval(-60), ppm: ppm)
+    }
+
+    /// Back (or the idle timer): the guide returns to Now on the same row.
+    private func backToNow(ppm: CGFloat) {
+        guard viewStart != nil else { return }
+        show(start: nil, focusRow: focusedChannel, at: now, ppm: ppm)
+    }
+
+    private func timeLabel(for start: Date?) -> String {
+        guard let start else { return L10n.string("live_time_today", fallback: "Today") }
+        let calendar = Calendar.current
+        let hour = calendar.component(.hour, from: start)
+        if calendar.isDateInToday(start) {
+            return hour < 17 ? L10n.string("live_time_afternoon", fallback: "This Afternoon")
+                             : L10n.string("live_time_tonight", fallback: "Tonight")
+        }
+        if calendar.isDateInTomorrow(start) {
+            if hour < 12 { return L10n.string("live_time_tomorrow_morning", fallback: "Tomorrow Morning") }
+            if hour < 17 { return L10n.string("live_time_tomorrow_afternoon", fallback: "Tomorrow Afternoon") }
+            return L10n.string("live_time_tomorrow_night", fallback: "Tomorrow Night")
+        }
+        return Self.weekdayFormatter.string(from: start)
+    }
+
+    /// The Tonight ▾ menu's choices: (label, start or nil for Now).
+    private var timeChoices: [(String, Date?)] {
+        let calendar = Calendar.current
+        let today = calendar.startOfDay(for: now)
+        func at(_ day: Int, _ hour: Int) -> Date {
+            calendar.date(byAdding: .hour, value: hour, to: calendar.date(byAdding: .day, value: day, to: today) ?? today) ?? today
+        }
+        var choices: [(String, Date?)] = [(L10n.string("live_time_now", fallback: "Now"), nil)]
+        let hour = calendar.component(.hour, from: now)
+        if hour < 12 { choices.append((L10n.string("live_time_afternoon", fallback: "This Afternoon"), at(0, 12))) }
+        if hour < 19 { choices.append((L10n.string("live_time_tonight", fallback: "Tonight"), at(0, 19))) }
+        choices.append((L10n.string("live_time_tomorrow_morning", fallback: "Tomorrow Morning"), at(1, 8)))
+        choices.append((L10n.string("live_time_tomorrow_afternoon", fallback: "Tomorrow Afternoon"), at(1, 12)))
+        choices.append((L10n.string("live_time_tomorrow_night", fallback: "Tomorrow Night"), at(1, 19)))
+        return choices
+    }
+
+    private static let weekdayFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.setLocalizedDateFormatFromTemplate("EEEE ha")
+        return formatter
+    }()
+
+    /// The Tonight ▾ button where the date used to be, and its menu.
+    private func timeButton(ppm: CGFloat) -> some View {
+        let focused = timeFocus == "button"
+        return Button {
+            showTimeMenu = true
+            DispatchQueue.main.async { timeFocus = "choice0" }
+        } label: {
+            HStack(spacing: 8) {
+                Text(timeLabel(for: viewStart))
+                    .font(.system(size: 19, weight: .bold))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.7)
+                Image(systemName: "chevron.down").font(.system(size: 13, weight: .heavy))
+            }
+            .foregroundColor(focused ? .black : .white)
+            .padding(.horizontal, 16)
+            .frame(height: 40)
+            .background(Capsule().fill(focused ? Color.white : Color.white.opacity(0.14)))
+        }
+        .buttonStyle(PosterCardButtonStyle())
+        .focused($timeFocus, equals: "button")
+        .focusEffectDisabledIfAvailable()
+        .disabled(showTimeMenu)
+        .overlay(alignment: .topLeading) {
+            if showTimeMenu {
+                timeMenu(ppm: ppm)
+                    .offset(y: 52)
+            }
+        }
+    }
+
+    private func timeMenu(ppm: CGFloat) -> some View {
+        let choices = timeChoices
+        return VStack(alignment: .leading, spacing: 6) {
+            ForEach(Array(choices.enumerated()), id: \.offset) { index, choice in
+                let id = "choice\(index)"
+                let focused = timeFocus == id
+                let current = choice.1 == nil ? viewStart == nil : viewStart == choice.1
+                Button {
+                    showTimeMenu = false
+                    show(start: choice.1, focusRow: focusedChannel ?? rows.first?.channel, at: choice.1 ?? now, ppm: ppm)
+                } label: {
+                    HStack(spacing: 14) {
+                        Text(choice.0).font(LiveStyle.rowTitle).lineLimit(1)
+                        Spacer(minLength: 10)
+                        if let start = choice.1 {
+                            Text(ChannelsView.clockFormatter.string(from: start)).font(LiveStyle.rowValue).opacity(0.6)
+                        }
+                        Image(systemName: "checkmark").font(.system(size: 18, weight: .bold)).opacity(current ? 1 : 0)
+                    }
+                    .padding(.horizontal, 20)
+                }
+                .buttonStyle(LivePillButtonStyle(focused: focused, height: 58))
+                .focused($timeFocus, equals: id)
+                .focusEffectDisabledIfAvailable()
+            }
+        }
+        .padding(12)
+        .frame(width: 420)
+        .background(
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .fill(.regularMaterial)
+                .overlay(RoundedRectangle(cornerRadius: 22, style: .continuous).fill(Color.black.opacity(0.6)))
+                .shadow(color: .black.opacity(0.6), radius: 24, x: 6, y: 8)
+        )
+        .focusSection()
+        .onExitCommand {
+            showTimeMenu = false
+            DispatchQueue.main.async { timeFocus = "button" }
         }
     }
 
@@ -876,8 +1090,20 @@ struct LiveTVGuideView: View {
                     .lineLimit(1)
                 HStack(spacing: 12) {
                     if program.isOn(at: now) { badge(L10n.string("live_badge_live", fallback: "LIVE"), color: Color(red: 1, green: 0.3, blue: 0.3)) }
+                    if program.start > now {
+                        Text(L10n.string("live_badge_later", fallback: "LATER"))
+                            .font(.system(size: 16, weight: .heavy))
+                            .tracking(0.8)
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 9)
+                            .padding(.vertical, 3)
+                            .overlay(RoundedRectangle(cornerRadius: 5).strokeBorder(Color.white.opacity(0.7), lineWidth: 2))
+                    }
                     if program.isPremiere { badge(L10n.string("live_badge_new", fallback: "NEW"), color: .blue) }
-                    Text(timeRange(program))
+                    if reminders.isSet(channelID: heroChannel?.id ?? "", start: program.start) {
+                        Image(systemName: "bell.fill").font(.system(size: 20, weight: .bold)).foregroundColor(.white.opacity(0.85))
+                    }
+                    Text(dayPrefix(program.start) + timeRange(program))
                         .font(.system(size: 24, weight: .semibold).monospacedDigit())
                         .foregroundColor(.white.opacity(0.8))
                     if program.fromOutsideGuide {
@@ -898,6 +1124,10 @@ struct LiveTVGuideView: View {
                 }
                 if program.isOn(at: now) {
                     progressBar(program).frame(width: 420, height: 6)
+                } else if program.start > now {
+                    Text(startsIn(program.start))
+                        .font(.system(size: 20, weight: .semibold))
+                        .foregroundColor(.white.opacity(0.7))
                 }
                 if let overview = program.overview {
                     Text(overview)
@@ -1016,6 +1246,29 @@ struct LiveTVGuideView: View {
         }
     }
 
+    /// "Tonight · ", "Tomorrow · " or "Sat · " before a later show's times.
+    private func dayPrefix(_ date: Date) -> String {
+        let calendar = Calendar.current
+        if calendar.isDateInToday(date) {
+            return calendar.component(.hour, from: date) >= 17 && calendar.component(.hour, from: now) < 17
+                ? L10n.string("live_time_tonight", fallback: "Tonight") + " · " : ""
+        }
+        if calendar.isDateInTomorrow(date) { return L10n.string("live_time_tomorrow", fallback: "Tomorrow") + " · " }
+        return Self.shortWeekday.string(from: date) + " · "
+    }
+
+    private static let shortWeekday: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.setLocalizedDateFormatFromTemplate("EEE")
+        return formatter
+    }()
+
+    private func startsIn(_ date: Date) -> String {
+        let minutes = max(1, Int(date.timeIntervalSince(now) / 60))
+        let text = minutes >= 60 ? "\(minutes / 60) h \(minutes % 60) m" : "\(minutes) m"
+        return L10n.format("live_starts_in", fallback: "Starts in %@", text)
+    }
+
     private func timeRange(_ program: LiveTVProgram) -> String {
         let f = ChannelsView.clockFormatter
         return "\(f.string(from: program.start))–\(f.string(from: program.end))"
@@ -1043,6 +1296,7 @@ struct LiveTVGuideView: View {
     private func selectTab(_ tab: LiveTab) {
         guard tab != currentTab || (tab == .all && currentView != .all) else { return }
         genre = nil
+        viewStart = nil
         switch tab {
         case .events:
             showingEvents = true
@@ -1079,6 +1333,23 @@ struct LiveTVGuideView: View {
                 ) {
                     multiview.isPresented = true
                 }
+            }
+            if viewStart != nil {
+                // Not a button: Back is how you return (see "Later in the day").
+                HStack(spacing: 10) {
+                    Text(L10n.string("live_key_back", fallback: "BACK"))
+                        .font(.system(size: 14, weight: .heavy))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(Color.white.opacity(0.7), lineWidth: 2))
+                    Text(L10n.string("live_back_to_now", fallback: "returns to Now"))
+                        .font(.system(size: 18, weight: .bold))
+                }
+                .foregroundColor(Color(red: 1, green: 0.8, blue: 0.8))
+                .padding(.horizontal, 16)
+                .frame(height: 46)
+                .background(Capsule().fill(Color(red: 0.35, green: 0.08, blue: 0.1)))
+                .overlay(Capsule().strokeBorder(LiveStyle.watching, lineWidth: 2))
             }
             if let filterTitle {
                 LiveFilterChip(title: filterTitle) { clearFilter() }
@@ -1178,10 +1449,7 @@ struct LiveTVGuideView: View {
     private func timeRuler(gridWidth: CGFloat, ppm: CGFloat) -> some View {
         let marks = stride(from: 0, to: LiveGuideMetrics.windowMinutes, by: 30).map { $0 }
         return HStack(spacing: 0) {
-            Text(Self.dayFormatter.string(from: now).uppercased())
-                .font(.system(size: 18, weight: .heavy))
-                .tracking(0.8)
-                .foregroundColor(.white.opacity(0.5))
+            timeButton(ppm: ppm)
                 .frame(width: LiveGuideMetrics.channelColumn, alignment: .leading)
             ZStack(alignment: .leading) {
                 Rectangle().fill(Color.white.opacity(0.12)).frame(height: 1).offset(y: 18)
@@ -1200,12 +1468,14 @@ struct LiveTVGuideView: View {
     /// Red line at the current time, drawn over the ruler and the grid.
     private func nowLine(gridWidth: CGFloat, ppm: CGFloat, height: CGFloat) -> some View {
         let minutes = now.timeIntervalSince(windowStart) / 60
-        let x = LiveGuideMetrics.sideInset + LiveGuideMetrics.channelColumn + CGFloat(minutes) * ppm
+        let visible = minutes >= 0 && minutes <= Double(LiveGuideMetrics.windowMinutes)
+        let x = LiveGuideMetrics.sideInset + LiveGuideMetrics.channelColumn + CGFloat(max(0, minutes)) * ppm
         let top = LiveGuideMetrics.heroHeight + 74 + 20 + (store.prefs.configured ? 0 : 98)
         return Rectangle()
             .fill(Color(red: 1, green: 0.32, blue: 0.32))
             .frame(width: 3, height: max(0, height - top))
             .offset(x: x, y: top)
+            .opacity(visible ? 1 : 0)
             .allowsHitTesting(false)
     }
 
@@ -1221,7 +1491,7 @@ struct LiveTVGuideView: View {
         let end = start.addingTimeInterval(TimeInterval(LiveGuideMetrics.windowMinutes * 60))
         var cursor = start
         var result: [Segment] = []
-        for program in store.programs[channel.id] ?? [] {
+        for program in store.guidePrograms(on: channel.id, viewStart: viewStart) {
             guard program.end > cursor else { continue }
             guard program.start < end else { break }
             let from = max(program.start, cursor)
@@ -1251,23 +1521,31 @@ struct LiveTVGuideView: View {
                 .frame(width: LiveGuideMetrics.channelColumn, height: LiveGuideMetrics.rowHeight)
             HStack(spacing: 0) {
                 if parts.contains(where: { if case .program = $0 { return true }; return false }) {
-                    ForEach(Array(parts.enumerated()), id: \.offset) { _, part in
+                    let lastProgram = parts.lastIndex(where: { if case .program = $0 { return true }; return false })
+                    ForEach(Array(parts.enumerated()), id: \.offset) { index, part in
                         switch part {
                         case .gap(let width):
                             Color.clear.frame(width: width)
                         case .program(let program, let width, let earlier):
-                            programCell(program, channel: channel, lineup: lineup, width: width, startsEarlier: earlier)
+                            programCell(program, channel: channel, lineup: lineup, width: width, startsEarlier: earlier,
+                                        isLast: index == lastProgram, ppm: ppm)
                         }
                     }
                 } else {
-                    noGuideCell(channel, lineup: lineup, width: gridWidth)
+                    noGuideCell(channel, lineup: lineup, width: gridWidth, ppm: ppm)
                 }
             }
             .frame(width: gridWidth, height: LiveGuideMetrics.rowHeight, alignment: .leading)
             .clipped()
         }
         .opacity(row.dimmed && !isRowFocused ? 0.45 : 1)
-        .onAppear { store.requestGuide([channel.id]) }
+        .onAppear {
+            if let viewStart {
+                store.requestLaterGuide([channel.id], viewStart: viewStart)
+            } else {
+                store.requestGuide([channel.id])
+            }
+        }
     }
 
     private func channelCell(_ channel: LiveTVChannel, dimmed: Bool, isRowFocused: Bool) -> some View {
@@ -1279,19 +1557,29 @@ struct LiveTVGuideView: View {
             .padding(.trailing, LiveGuideMetrics.cellGap)
     }
 
-    private func programCell(_ program: LiveTVProgram, channel: LiveTVChannel, lineup: [LiveTVChannel], width: CGFloat, startsEarlier: Bool) -> some View {
+    private func programCell(_ program: LiveTVProgram, channel: LiveTVChannel, lineup: [LiveTVChannel], width: CGFloat,
+                             startsEarlier: Bool, isLast: Bool, ppm: CGFloat) -> some View {
         let key = "\(channel.id)#\(program.id)"
         let isFocused = focusedCell == key
         let isNow = program.isOn(at: now)
         let cellWidth = max(4, width - LiveGuideMetrics.cellGap)
+        let reminded = reminders.isSet(channelID: channel.id, start: program.start)
         return Button {
-            store.watch(channel, lineup: lineup)
+            if program.start > now.addingTimeInterval(60) {
+                // A future show: its details, with Remind Me, instead of tuning.
+                detail = LiveProgramDetail(channel: channel, program: program, lineup: lineup)
+            } else {
+                store.watch(channel, lineup: lineup)
+            }
         } label: {
             VStack(alignment: .leading, spacing: 4) {
                 if cellWidth >= 110 {
                     HStack(spacing: 6) {
                         if startsEarlier {
                             Image(systemName: "chevron.left").font(.system(size: 14, weight: .bold)).opacity(0.6)
+                        }
+                        if reminded {
+                            Image(systemName: "bell.fill").font(.system(size: 15, weight: .bold)).opacity(0.8)
                         }
                         Text(program.title)
                             .font(.system(size: 21, weight: .bold))
@@ -1326,6 +1614,9 @@ struct LiveTVGuideView: View {
             focusedChannel = channel
             focusedProgram = program
         }
+        .onMoveCommand { direction in
+            if direction == .right, isLast { moveLater(row: channel, after: program.end, ppm: ppm) }
+        }
         .padding(.trailing, LiveGuideMetrics.cellGap)
     }
 
@@ -1337,7 +1628,7 @@ struct LiveTVGuideView: View {
         }
     }
 
-    private func noGuideCell(_ channel: LiveTVChannel, lineup: [LiveTVChannel], width: CGFloat) -> some View {
+    private func noGuideCell(_ channel: LiveTVChannel, lineup: [LiveTVChannel], width: CGFloat, ppm: CGFloat) -> some View {
         let key = "\(channel.id)#none"
         let isFocused = focusedCell == key
         return Button {
@@ -1345,7 +1636,9 @@ struct LiveTVGuideView: View {
         } label: {
             HStack(spacing: 10) {
                 Circle().fill(Color(red: 1, green: 0.32, blue: 0.32)).frame(width: 9, height: 9)
-                Text(noGuideText(for: channel))
+                Text(viewStart == nil
+                     ? noGuideText(for: channel)
+                     : L10n.string("live_guide_later_none", fallback: "No listings for this time"))
                     .font(.system(size: 20, weight: .semibold))
                 if store.guideState[channel.id] == .loading {
                     ProgressView().scaleEffect(0.6)
@@ -1368,6 +1661,11 @@ struct LiveTVGuideView: View {
             guard focused else { return }
             focusedChannel = channel
             focusedProgram = nil
+        }
+        .onMoveCommand { direction in
+            if direction == .right {
+                moveLater(row: channel, after: windowStart.addingTimeInterval(TimeInterval(LiveGuideMetrics.windowMinutes * 60)), ppm: ppm)
+            }
         }
     }
 
@@ -1424,10 +1722,22 @@ struct LiveTVGuideView: View {
 /// notices ("Switched to a backup feed") over the player.
 struct LiveTVOverlay: View {
     @ObservedObject private var store = LiveTVStore.shared
+    @ObservedObject private var overlayState = LiveOverlayState.shared
+    @ObservedObject private var reminders = LiveReminders.shared
     @FocusState private var buttonFocused: Bool
+    @FocusState private var reminderFocus: String?
 
     var body: some View {
         ZStack {
+            if let due = reminders.due {
+                reminderCard(due)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+                    .zIndex(5)
+            }
+            if overlayState.miniGuideOpen, store.isWatching, store.overlay == nil {
+                LiveMiniGuide()
+                    .transition(.move(edge: .leading).combined(with: .opacity))
+            }
             if let overlay = store.overlay {
                 card(overlay)
                     .transition(.opacity)
@@ -1476,9 +1786,94 @@ struct LiveTVOverlay: View {
             }
         }
         .animation(.easeInOut(duration: 0.3), value: store.overlay)
+        .animation(.easeOut(duration: 0.25), value: overlayState.miniGuideOpen)
+        .animation(.easeOut(duration: 0.25), value: reminders.due)
+        .onAppear { reminders.startChecking() }
         .animation(.easeInOut(duration: 0.25), value: store.playbackNote)
         .animation(.easeInOut(duration: 0.35), value: store.banner)
         .animation(.easeInOut(duration: 0.25), value: store.toast)
+    }
+
+    /// "Starting now" for a show the viewer asked to be reminded about, in
+    /// the top corner over whatever is on screen.
+    private func reminderCard(_ due: LiveReminder) -> some View {
+        let channel = store.anyChannel(id: due.channelID)
+        return VStack {
+            HStack {
+                Spacer()
+                VStack(alignment: .leading, spacing: 14) {
+                    Text(L10n.string("live_starting_now", fallback: "Starting now").uppercased())
+                        .font(LiveStyle.sectionFont)
+                        .tracking(LiveStyle.sectionTracking)
+                        .foregroundColor(LiveStyle.watching)
+                    HStack(spacing: 16) {
+                        if let channel {
+                            ChannelLogoView(urls: store.logoSpec(for: channel).urls, width: 100, height: 44) { EmptyView() }
+                        }
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(due.title)
+                                .font(.system(size: 30, weight: .bold))
+                                .foregroundColor(.white)
+                                .lineLimit(1)
+                            Text(due.channelName)
+                                .font(LiveStyle.rowDetail)
+                                .foregroundColor(.white.opacity(0.6))
+                                .lineLimit(1)
+                        }
+                    }
+                    HStack(spacing: 14) {
+                        if let channel {
+                            reminderButton(L10n.format("live_watch_on", fallback: "Watch on %@", channel.name), id: "watch") {
+                                reminders.dismiss()
+                                if store.isWatching {
+                                    store.watchFromMiniGuide(channel)
+                                } else {
+                                    store.watch(channel)
+                                }
+                            }
+                        }
+                        reminderButton(L10n.string("live_dismiss", fallback: "Dismiss"), id: "dismiss") {
+                            reminders.dismiss()
+                        }
+                    }
+                }
+                .padding(28)
+                .frame(maxWidth: 760, alignment: .leading)
+                .background(
+                    RoundedRectangle(cornerRadius: LiveStyle.panelRadius, style: .continuous)
+                        .fill(.regularMaterial)
+                        .overlay(RoundedRectangle(cornerRadius: LiveStyle.panelRadius, style: .continuous).fill(Color.black.opacity(0.55)))
+                        .shadow(color: .black.opacity(0.5), radius: 24, y: 8)
+                )
+                .focusSection()
+                .onExitCommand { reminders.dismiss() }
+            }
+            .padding(.top, 50)
+            .padding(.trailing, 60)
+            Spacer()
+        }
+        .onAppear {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                reminderFocus = channel != nil ? "watch" : "dismiss"
+            }
+        }
+    }
+
+    private func reminderButton(_ title: String, id: String, action: @escaping () -> Void) -> some View {
+        let focused = reminderFocus == id
+        return Button(action: action) {
+            Text(title)
+                .font(.system(size: 22, weight: .bold))
+                .foregroundColor(focused ? .black : .white)
+                .lineLimit(1)
+                .padding(.horizontal, 24)
+                .frame(height: 52)
+                .background(Capsule().fill(focused ? Color.white : Color.white.opacity(0.16)))
+        }
+        .buttonStyle(PosterCardButtonStyle())
+        .focused($reminderFocus, equals: id)
+        .focusEffectDisabledIfAvailable()
+        .animation(.easeOut(duration: 0.12), value: focused)
     }
 
     private func card(_ overlay: LiveTVStore.Overlay) -> some View {
@@ -1588,6 +1983,30 @@ struct LiveTVOverlay: View {
                             .lineLimit(1)
                     }
                     .frame(maxWidth: 520, alignment: .trailing)
+                }
+                if let previous = banner.previous {
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack(spacing: 6) {
+                            Image(systemName: "arrow.right").font(.system(size: 13, weight: .heavy))
+                            Text(L10n.string("live_previous", fallback: "PREVIOUS"))
+                                .font(.system(size: 15, weight: .heavy))
+                                .tracking(1)
+                        }
+                        .foregroundColor(.white.opacity(0.55))
+                        HStack(spacing: 12) {
+                            ChannelLogoView(urls: store.logoSpec(for: previous).urls, width: 76, height: 32) {
+                                EmptyView()
+                            }
+                            Text(previous.displayName)
+                                .font(.system(size: 21, weight: .bold))
+                                .foregroundColor(.white)
+                                .lineLimit(1)
+                        }
+                    }
+                    .padding(.horizontal, 18)
+                    .padding(.vertical, 12)
+                    .frame(maxWidth: 320, alignment: .leading)
+                    .overlay(RoundedRectangle(cornerRadius: LiveStyle.rowRadius, style: .continuous).strokeBorder(Color.white.opacity(0.25), lineWidth: 2))
                 }
                 VStack(spacing: 4) {
                     Image(systemName: "chevron.up")
