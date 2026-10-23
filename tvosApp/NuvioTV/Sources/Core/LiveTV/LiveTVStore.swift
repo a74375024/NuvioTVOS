@@ -2566,7 +2566,7 @@ final class LiveTVStore: ObservableObject {
             self.sportsRebuildRunning = false
             if self.sportsRebuildAgain {
                 self.sportsRebuildAgain = false
-                self.scheduleSportsRebuild(delay: 3)
+                self.scheduleSportsRebuild(delay: 8)
             }
         }
     }
@@ -2574,37 +2574,46 @@ final class LiveTVStore: ObservableObject {
     private func rebuildSportsEvents() async {
         let now = Date()
         let games = SportsData.shared.games
-        let spanishWords = "\\b(spanish|espanol|español|deportes|telemundo|univision|tudn|unimas)\\b"
-        let providerEvents = events.map { event in
-            SportsMatcher.ProviderEvent(
-                id: event.id, title: event.title, league: event.league, start: event.start, feeds: event.feeds,
-                family: event.family, spanish: event.market == "US-ES" || RX.test(spanishWords, event.title, caseInsensitive: true)
-            )
-        }
+        let started = Date()
+        CrashRecorder.note("sports rebuild: start (\(games.count) games, \(events.count) provider events)")
+        // Copies are cheap (copy-on-write); all the scanning happens off
+        // the main thread.
+        let rawEvents = events
+        let programs = games.isEmpty ? [:] : self.programs
+        let entryInfo = self.entryInfo
         let lineup = Set(lineupIDs)
         let eligible = Set(browseEntries.map(\.id)).union(lineup)
-        let low = now.addingTimeInterval(-5 * 3600), high = now.addingTimeInterval(16 * 3600)
-        let sportsWords = "\\b(nfl|nba|wnba|mlb|nhl|mls|ncaa|football|basketball|baseball|hockey|soccer|futbol|fútbol|premier league|champions league|liga|serie a|bundesliga)\\b"
-        var listings: [SportsMatcher.GuideListing] = []
-        if !games.isEmpty {
+        let preferSpanish = prefs.countries.contains("US-ES")
+        let channelSources = networkSources(for: games)
+        let built = await Task.detached(priority: .utility) { () -> [SportsEvent] in
+            let spanishWords = "\\b(spanish|espanol|español|deportes|telemundo|univision|tudn|unimas)\\b"
+            let providerEvents = rawEvents.map { event in
+                SportsMatcher.ProviderEvent(
+                    id: event.id, title: event.title, league: event.league, start: event.start, feeds: event.feeds,
+                    family: event.family, spanish: event.market == "US-ES" || RX.test(spanishWords, event.title, caseInsensitive: true)
+                )
+            }
+            // Guide listings of games: only on sports, local and Spanish
+            // channels, and only titles that name two sides.
+            let low = now.addingTimeInterval(-5 * 3600), high = now.addingTimeInterval(16 * 3600)
+            var listings: [SportsMatcher.GuideListing] = []
+            let kinds: Set<LineupCategory> = [.sports, .local, .spanish]
             for (id, list) in programs where id.hasPrefix("e|") && eligible.contains(id) {
-                let info = entryInfo[id]
-                let spanish = info?.category == .spanish || info?.market == "US-ES"
+                guard let info = entryInfo[id], kinds.contains(info.category) else { continue }
+                let spanish = info.category == .spanish || info.market == "US-ES"
                 for program in list where program.end > low && program.start < high {
                     let title = program.episodeTitle.map { "\(program.title) \($0)" } ?? program.title
-                    guard program.isSports || RX.test(sportsWords, title, caseInsensitive: true) else { continue }
+                    let lower = title.lowercased()
+                    guard lower.contains(" vs") || lower.contains(" at ") || lower.contains("@") || lower.contains(" v ") else { continue }
                     listings.append(SportsMatcher.GuideListing(entryID: id, inLineup: lineup.contains(id), spanish: spanish,
                                                                title: title, start: program.start, end: program.end))
                 }
             }
-        }
-        let preferSpanish = prefs.countries.contains("US-ES")
-        let channelSources = networkSources(for: games)
-        let built = await Task.detached(priority: .utility) {
-            SportsMatcher.build(games: games, channelSources: channelSources, events: providerEvents, listings: listings,
-                                preferSpanish: preferSpanish, now: now)
+            return SportsMatcher.build(games: games, channelSources: channelSources, events: providerEvents, listings: listings,
+                                       preferSpanish: preferSpanish, now: now)
         }.value
-        CrashRecorder.note("sports rebuild: \(games.count) games, \(providerEvents.count) provider events, \(built.count) shown")
+        CrashRecorder.note("sports rebuild: \(built.count) shown, \(built.filter { !$0.sources.isEmpty }.count) watchable, "
+                           + "\(Int(Date().timeIntervalSince(started) * 1000)) ms")
         if built != sportsEvents { sportsEvents = built }
         SportsData.shared.noteWatchable(Set(built.filter { !$0.sources.isEmpty && $0.game != nil }.map(\.leagueShort)))
     }

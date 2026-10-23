@@ -428,6 +428,7 @@ struct LiveEventsBoard: View {
     @State private var columnReturn: String?
     @FocusState private var columnFocus: String?
     @State private var lastFocus: String?
+    @State private var lastRedirect = Date.distantPast
     @Environment(\.isEnabled) private var isEnabled
 
     let ticker = Timer.publish(every: 30, on: .main, in: .common).autoconnect()
@@ -675,12 +676,16 @@ struct LiveEventsBoard: View {
         guard let row = rows.first(where: { $0.id == rowID }) else { return }
         let first = row.events.first.map { key(row, $0.id) } ?? row.families.first.map { key(row, $0.id) }
         if let old, old.hasPrefix(rowID + "|"), rows.count > 1 {
+            CrashRecorder.note("events: sports column")
             columnReturn = old
             columnOrigin = rowID
             columnOpen = true
             columnFocus = rowID
             DispatchQueue.main.async { if columnOpen { columnFocus = rowID } }
         } else if let first {
+            // Never bounce focus back and forth.
+            guard Date().timeIntervalSince(lastRedirect) > 0.4 else { return }
+            lastRedirect = Date()
             DispatchQueue.main.async { focus = (old?.hasPrefix(rowID + "|") == true ? old : first) }
         }
     }

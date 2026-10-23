@@ -229,11 +229,27 @@ final class SportsData: ObservableObject {
         guard let url = URL(string: address) else { return nil }
         var request = URLRequest(url: url)
         request.timeoutInterval = 20
-        guard let result = try? await URLSession.shared.data(for: request),
-              (result.1 as? HTTPURLResponse)?.statusCode == 200,
-              let object = try? JSONSerialization.jsonObject(with: result.0) as? [String: Any],
-              let events = object["events"] as? [[String: Any]] else { return nil }
-        return events.compactMap { SportsParse.game($0, league: league) }
+        let result: (Data, URLResponse)
+        do {
+            result = try await URLSession.shared.data(for: request)
+        } catch {
+            CrashRecorder.note("schedule \(league.short): failed (\((error as NSError).code))")
+            return nil
+        }
+        let status = (result.1 as? HTTPURLResponse)?.statusCode ?? 0
+        guard status == 200 else {
+            CrashRecorder.note("schedule \(league.short): HTTP \(status)")
+            return nil
+        }
+        let data = result.0
+        // Parsed off the main thread (a week of college football is a few MB).
+        let games = await Task.detached(priority: .utility) { () -> [SportsGame]? in
+            guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let events = object["events"] as? [[String: Any]] else { return nil }
+            return events.compactMap { SportsParse.game($0, league: league) }
+        }.value
+        CrashRecorder.note("schedule \(league.short): \(data.count / 1024) KB, \(games.map { String($0.count) } ?? "unreadable") games")
+        return games
     }
 }
 

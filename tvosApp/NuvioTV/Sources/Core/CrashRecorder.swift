@@ -15,6 +15,7 @@ enum CrashRecorder {
     }
     private static var sessionFile: URL { folder.appendingPathComponent("session.log") }
     private static var crashFile: URL { folder.appendingPathComponent("crash-last.log") }
+    private static var previousFile: URL { folder.appendingPathComponent("session-previous.log") }
     private static var started = false
     private static var trimTimer: DispatchSourceTimer?
 
@@ -33,7 +34,10 @@ enum CrashRecorder {
             try? manager.removeItem(at: crashFile)
             try? data.write(to: crashFile, options: .atomic)
         }
-        try? manager.removeItem(at: sessionFile)
+        // Ended some other way (killed for memory or for being stuck, which
+        // can't be caught): keep it as the previous session.
+        try? manager.removeItem(at: previousFile)
+        try? manager.moveItem(at: sessionFile, to: previousFile)
         manager.createFile(atPath: sessionFile.path, contents: nil)
         let fd = open(sessionFile.path, O_WRONLY | O_APPEND)
         guard fd >= 0 else { return }
@@ -66,7 +70,53 @@ enum CrashRecorder {
         }
         timer.resume()
         trimTimer = timer
+        startWatchdog()
         #endif
+    }
+
+    /// Notes when the main thread stops responding (stuck work gets the app
+    /// killed without a crash), and memory every so often.
+    private static func startWatchdog() {
+        let thread = Thread {
+            var lastMemory = 0
+            var tick = 0
+            while true {
+                let sent = Date()
+                let answered = DispatchSemaphore(value: 0)
+                DispatchQueue.main.async { answered.signal() }
+                var waited = 0
+                while answered.wait(timeout: .now() + 1) == .timedOut {
+                    waited += 1
+                    if waited == 2 || waited % 5 == 0 { note("main thread stuck \(waited) s (\(memoryMB()) MB)") }
+                }
+                if waited >= 2 { note("main thread back after \(Int(Date().timeIntervalSince(sent))) s") }
+                tick += 1
+                if tick % 10 == 0 {
+                    let memory = memoryMB()
+                    if abs(memory - lastMemory) >= 75 {
+                        note("memory \(memory) MB")
+                        lastMemory = memory
+                    }
+                }
+                Thread.sleep(forTimeInterval: 1)
+            }
+        }
+        thread.name = "CrashRecorder.watchdog"
+        thread.qualityOfService = .utility
+        thread.start()
+    }
+
+    /// The app's memory footprint in MB.
+    static func memoryMB() -> Int {
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<natural_t>.size)
+        let result = withUnsafeMutablePointer(to: &info) { pointer in
+            pointer.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+            }
+        }
+        guard result == KERN_SUCCESS else { return 0 }
+        return Int(info.phys_footprint / 1_048_576)
     }
 
     private static let clock: DateFormatter = {
@@ -93,6 +143,10 @@ enum CrashRecorder {
             sections.append(contentsOf: tail(text, lines: 400))
         } else {
             sections.append("LAST CRASH: none recorded")
+        }
+        if let text = try? String(contentsOf: previousFile, encoding: .utf8) {
+            sections.append("PREVIOUS SESSION (end)")
+            sections.append(contentsOf: tail(text, lines: 200))
         }
         if let text = try? String(contentsOf: sessionFile, encoding: .utf8) {
             sections.append("THIS SESSION (end)")
