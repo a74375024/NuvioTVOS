@@ -129,7 +129,7 @@ enum ChannelKind: String, Codable {
 }
 
 /// Everything learned from one channel's name and provider group.
-struct ChannelTraits {
+struct ChannelTraits: Codable {
     var clusterKey: String
     var displayName: String
     var quality: Int            // 0 SD, 1 HD, 2 FHD, 3 UHD
@@ -152,7 +152,7 @@ struct ChannelTraits {
 }
 
 /// A real-world channel: one guide entry with its variants as backups.
-struct LiveTVEntryInfo {
+struct LiveTVEntryInfo: Codable {
     let id: String              // "e|<cluster key>"
     let name: String
     var members: [String]       // raw channel ids, best first
@@ -167,7 +167,7 @@ struct LiveTVEntryInfo {
 }
 
 /// One live event, deduplicated across event families.
-struct LiveEvent: Identifiable, Hashable {
+struct LiveEvent: Identifiable, Hashable, Codable {
     let id: String
     let title: String
     let league: String
@@ -198,7 +198,7 @@ struct LiveEvent: Identifiable, Hashable {
 }
 
 /// A numbered family of event feeds ("ESPN PLUS 00–110").
-struct EventFamily: Identifiable, Hashable {
+struct EventFamily: Identifiable, Hashable, Codable {
     let id: String
     let name: String
     var feeds: [String]         // raw channel ids, by feed number
@@ -211,7 +211,7 @@ struct EventFamily: Identifiable, Hashable {
 /// from naming conventions common to IPTV lineups rather than any one
 /// provider's exact format.
 enum ChannelCatalog {
-    struct Result {
+    struct Result: Codable {
         var traits: [String: ChannelTraits] = [:]
         var entries: [LiveTVEntryInfo] = []
         var entryOf: [String: String] = [:]
@@ -271,15 +271,9 @@ enum ChannelCatalog {
         // Pass 2: entries (clusters of variants).
         var clusters: [String: [LiveTVChannel]] = [:]
         var order: [String] = []
-        var familyMembers: [String: [LiveTVChannel]] = [:]
-        var familyOrder: [String] = []
         for channel in channels {
             guard let traits = result.traits[channel.id] else { continue }
-            if let family = traits.familyKey {
-                if familyMembers[family] == nil { familyOrder.append(family) }
-                familyMembers[family, default: []].append(channel)
-                continue
-            }
+            if traits.familyKey != nil { continue }
             // Placeholders and headings outside event groups are hidden.
             if traits.kind == .placeholder || traits.kind == .separator || traits.kind == .event { continue }
             if clusters[traits.clusterKey] == nil { order.append(traits.clusterKey) }
@@ -314,18 +308,33 @@ enum ChannelCatalog {
         }
 
         // Pass 3: event families and events.
+        (result.families, result.events) = buildEvents(channels, traits: result.traits, now: now)
+        return result
+    }
+
+    /// Event families (numbered event feeds and event-slot groups) and the
+    /// events they carry, from channels whose traits name a family.
+    static func buildEvents(_ channels: [LiveTVChannel], traits: [String: ChannelTraits], now: Date) -> (families: [EventFamily], events: [LiveEvent]) {
+        var familyMembers: [String: [LiveTVChannel]] = [:]
+        var familyOrder: [String] = []
+        for channel in channels {
+            guard let family = traits[channel.id]?.familyKey else { continue }
+            if familyMembers[family] == nil { familyOrder.append(family) }
+            familyMembers[family, default: []].append(channel)
+        }
+        var families: [EventFamily] = []
         var eventsByKey: [String: LiveEvent] = [:]
         for family in familyOrder {
             guard let members = familyMembers[family] else { continue }
             let sorted = members.sorted {
-                (result.traits[$0.id]?.familyNumber ?? 0) < (result.traits[$1.id]?.familyNumber ?? 0)
+                (traits[$0.id]?.familyNumber ?? 0) < (traits[$1.id]?.familyNumber ?? 0)
             }
-            let market = sorted.lazy.compactMap { result.traits[$0.id]?.market }.first
+            let market = sorted.lazy.compactMap { traits[$0.id]?.market }.first
             var named = 0
             let league = leagueFor(family: family, group: sorted.first?.group ?? "", title: "")
             for channel in sorted {
-                guard let text = result.traits[channel.id]?.eventText, !isPlaceholder(text),
-                      result.traits[channel.id]?.kind != .placeholder,
+                guard let text = traits[channel.id]?.eventText, !isPlaceholder(text),
+                      traits[channel.id]?.kind != .placeholder,
                       !RX.test("^\\W*(ended|end)\\b", text, caseInsensitive: true) else { continue }
                 named += 1
                 let (title, start) = parseEvent(text, now: now)
@@ -344,12 +353,12 @@ enum ChannelCatalog {
                     )
                 }
             }
-            result.families.append(EventFamily(
+            families.append(EventFamily(
                 id: "fam|\(family)", name: familyDisplayName(sorted.first, family: family),
                 feeds: sorted.map(\.id), hasNames: named * 4 >= sorted.count, league: league, market: market
             ))
         }
-        result.events = eventsByKey.values.sorted {
+        let events = eventsByKey.values.sorted {
             switch ($0.start, $1.start) {
             case let (a?, b?): return a < b
             case (_?, nil): return true
@@ -357,7 +366,34 @@ enum ChannelCatalog {
             default: return $0.title < $1.title
             }
         }
-        return result
+        return (families, events)
+    }
+
+    /// After a refresh in which only event slots were renamed (the same
+    /// channels, regular channels unchanged): re-reads those slots and
+    /// rebuilds Live Events, without classifying everything again.
+    static func refreshEvents(_ result: inout Result, channels: [LiveTVChannel], renamed: [LiveTVChannel], now: Date = Date()) {
+        for channel in renamed {
+            guard var traits = result.traits[channel.id], let family = traits.familyKey else { continue }
+            let fresh = traitsFor(channel, context: .empty)
+            if family.hasPrefix("grp:") {
+                traits.eventText = channel.name
+                traits.familyNumber = trailingNumber(channel.name)
+            } else if fresh.familyKey == family {
+                traits.eventText = fresh.eventText
+                traits.familyNumber = fresh.familyNumber
+            } else {
+                traits.eventText = channel.name
+            }
+            switch fresh.kind {
+            case .placeholder: traits.kind = .placeholder
+            case .channel, .event: traits.kind = .event
+            default: traits.kind = fresh.kind
+            }
+            traits.displayName = fresh.displayName
+            result.traits[channel.id] = traits
+        }
+        (result.families, result.events) = buildEvents(channels, traits: result.traits, now: now)
     }
 
     // MARK: Traits

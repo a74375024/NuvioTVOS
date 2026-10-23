@@ -2041,6 +2041,11 @@ struct ContentView: View {
                 activeScreen = .main
             }
         }
+        // Read the saved channel list (and refresh it) shortly after launch,
+        // so Live TV is ready when it's opened.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+            LiveTVStore.shared.prewarm()
+        }
     }
 
     private func setupPictureInPicture() {

@@ -185,10 +185,12 @@ struct XtreamClient {
             let title = Self.decode(item["title"]) ?? ""
             guard !title.isEmpty else { return nil }
             let description = Self.decode(item["description"])
+            let genre = ProgramGenre.flags(title: title)
             return LiveTVProgram(
                 id: "\(channelID)|\(Int(start.timeIntervalSince1970))", channelID: channelID, title: title,
                 episodeTitle: nil, overview: description, start: start, end: end,
-                isMovie: false, isSports: false, isNews: false, isKids: false, isLive: false, isPremiere: false,
+                isMovie: false, isSports: genre & ProgramGenre.sports != 0, isNews: genre & ProgramGenre.news != 0,
+                isKids: false, isLive: false, isPremiere: false,
                 imageURL: nil
             )
         }

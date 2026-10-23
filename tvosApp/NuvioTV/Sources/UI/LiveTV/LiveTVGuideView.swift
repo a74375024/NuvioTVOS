@@ -31,19 +31,41 @@ enum LiveView: Equatable {
     }
 }
 
-/// Optional genre filter, from the guide's program flags.
-enum LiveGenre: String, CaseIterable, Identifiable {
+/// What's on now, from the guide's program tags (with the channel's own
+/// kind standing in when the program isn't tagged).
+enum LiveNowGenre: String, CaseIterable, Identifiable {
     case sports, news, movies, kids
     var id: String { rawValue }
+
     var title: String {
         switch self {
-        case .sports: return L10n.string("live_filter_sports", fallback: "Sports")
-        case .news: return L10n.string("live_filter_news", fallback: "News")
-        case .movies: return L10n.string("live_filter_movies", fallback: "Movies")
-        case .kids: return L10n.string("live_filter_kids", fallback: "Kids")
+        case .sports: return L10n.string("live_now_sports", fallback: "Sports on now")
+        case .news: return L10n.string("live_now_news", fallback: "News on now")
+        case .movies: return L10n.string("live_now_movies", fallback: "Movies on now")
+        case .kids: return L10n.string("live_now_kids", fallback: "Kids on now")
         }
     }
-    func matches(_ program: LiveTVProgram) -> Bool {
+
+    var symbol: String {
+        switch self {
+        case .sports: return "sportscourt"
+        case .news: return "newspaper"
+        case .movies: return "film"
+        case .kids: return "figure.and.child.holdinghands"
+        }
+    }
+
+    /// The channel kind that counts when a program carries no tags.
+    var category: LineupCategory {
+        switch self {
+        case .sports: return .sports
+        case .news: return .news
+        case .movies: return .movies
+        case .kids: return .kids
+        }
+    }
+
+    func tagged(_ program: LiveTVProgram) -> Bool {
         switch self {
         case .sports: return program.isSports
         case .news: return program.isNews
@@ -51,6 +73,72 @@ enum LiveGenre: String, CaseIterable, Identifiable {
         case .kids: return program.isKids
         }
     }
+}
+
+/// The guide's genre filter: a kind of channel, or what's on now.
+enum LiveGenre: Hashable, Identifiable {
+    case channels(LineupCategory)
+    case onNow(LiveNowGenre)
+
+    var id: String {
+        switch self {
+        case .channels(let category): return "c:" + category.rawValue
+        case .onNow(let kind): return "n:" + kind.rawValue
+        }
+    }
+
+    var title: String {
+        switch self {
+        case .channels(let category): return category.genreTitle
+        case .onNow(let kind): return kind.title
+        }
+    }
+
+    var needsPrograms: Bool {
+        if case .onNow = self { return true }
+        return false
+    }
+}
+
+extension LineupCategory {
+    /// Short name for the genre filter.
+    var genreTitle: String {
+        switch self {
+        case .local: return "Local"
+        case .news: return "News"
+        case .sports: return "Sports"
+        case .entertainment: return "Entertainment"
+        case .movies: return "Movies & Premium"
+        case .kids: return "Kids & Family"
+        case .music: return "Music"
+        case .spanish: return "Spanish"
+        case .free: return "Free Streaming"
+        case .international: return "International"
+        case .radio: return "Radio"
+        }
+    }
+
+    var genreSymbol: String {
+        switch self {
+        case .local: return "antenna.radiowaves.left.and.right"
+        case .news: return "newspaper"
+        case .sports: return "sportscourt"
+        case .entertainment: return "tv"
+        case .movies: return "film"
+        case .kids: return "figure.and.child.holdinghands"
+        case .music: return "music.note"
+        case .spanish: return "globe.americas"
+        case .free: return "play.tv"
+        case .international: return "globe"
+        case .radio: return "radio"
+        }
+    }
+}
+
+/// Rows of the guide, worked out once per change (not on every redraw).
+final class LiveRowsMemo {
+    var key = ""
+    var rows: [LiveGuideRow] = []
 }
 
 /// A row in the guide; hidden rows (not in My Lineup) show dimmed when
@@ -89,6 +177,8 @@ struct LiveTVGuideView: View {
     @State private var showSearch = false
     @State private var showViewPicker = false
     @State private var showGenres = false
+    @State private var genreCounts: (channels: [LineupCategory: Int], now: [LiveNowGenre: Int])?
+    @State private var rowsMemo = LiveRowsMemo()
     @State private var showOptions = false
     @State private var showSetup = false
     @State private var feedPicker: LiveFeedPicker?
@@ -151,8 +241,8 @@ struct LiveTVGuideView: View {
             showSetup = true
         }
         .onChange(of: genre) { _, newGenre in
-            // Genre filtering needs guide data for the whole list.
-            guard newGenre != nil else { return }
+            // "On now" filtering needs guide data for the whole list.
+            guard newGenre?.needsPrograms == true else { return }
             store.requestGuide(baseRows.prefix(1500).map(\.channel.id))
         }
         .fullScreenCover(isPresented: $showSearch) {
@@ -187,13 +277,10 @@ struct LiveTVGuideView: View {
         .sheet(item: $feedPicker) { picker in
             LiveFeedPickerView(picker: picker) { feedPicker = nil }
         }
-        .confirmationDialog(
-            L10n.string("live_genre_title", fallback: "Show channels airing"),
-            isPresented: $showGenres
-        ) {
-            Button(L10n.string("live_genre_any", fallback: "Anything")) { genre = nil }
-            ForEach(LiveGenre.allCases) { option in
-                Button(option.title) { genre = option }
+        .sheet(isPresented: $showGenres) {
+            LiveTVGenrePicker(current: genre, counts: genreCounts ?? ([:], [:])) { picked in
+                genre = picked
+                showGenres = false
             }
         }
     }
@@ -226,6 +313,7 @@ struct LiveTVGuideView: View {
             case "live-demo-events": showingEvents = true
             case "live-demo-all": chosenView = .all; store.setShowHidden(true)
             case "live-demo-setup": showSetup = true
+            case "live-demo-genres": genreCounts = countGenres(); showGenres = true
             default: break
             }
         }
@@ -294,9 +382,47 @@ struct LiveTVGuideView: View {
     }
 
     private var rows: [LiveGuideRow] {
+        var key = "\(currentView)|\(genre?.id ?? "")|\(store.prefs.showHidden)|\(store.entriesRevision)|\(store.hiddenGroups.hashValue)"
+        if currentView == .recent { key += "|\(store.recentIDs.hashValue)" }
+        if genre?.needsPrograms == true {
+            key += "|\(store.programsRevision)|\(Int(now.timeIntervalSince1970 / 60))"
+        }
+        if key == rowsMemo.key { return rowsMemo.rows }
         let base = baseRows
-        guard let genre else { return base }
-        return base.filter { row in (store.programs[row.channel.id] ?? []).contains(where: genre.matches) }
+        let value: [LiveGuideRow]
+        switch genre {
+        case nil:
+            value = base
+        case .channels(let category)?:
+            value = base.filter { store.category(of: $0.channel.id) == category }
+        case .onNow(let kind)?:
+            value = base.filter { matchesNow($0.channel.id, kind) }
+        }
+        rowsMemo.key = key
+        rowsMemo.rows = value
+        return value
+    }
+
+    /// On now (or starting within half an hour): a program tagged with the
+    /// genre, or an untagged one on a channel of that kind.
+    private func matchesNow(_ id: String, _ kind: LiveNowGenre) -> Bool {
+        let soon = now.addingTimeInterval(30 * 60)
+        let program = (store.programs[id] ?? []).first { $0.end > now && $0.start < soon }
+        if let program, program.isMovie || program.isSports || program.isNews || program.isKids {
+            return kind.tagged(program)
+        }
+        return store.category(of: id) == kind.category
+    }
+
+    /// Counts for the genre picker, from the current view's rows.
+    private func countGenres() -> (channels: [LineupCategory: Int], now: [LiveNowGenre: Int]) {
+        var channels: [LineupCategory: Int] = [:]
+        var current: [LiveNowGenre: Int] = [:]
+        for row in baseRows {
+            if let category = store.category(of: row.channel.id) { channels[category, default: 0] += 1 }
+            for kind in LiveNowGenre.allCases where matchesNow(row.channel.id, kind) { current[kind, default: 0] += 1 }
+        }
+        return (channels, current)
     }
 
     private var emptyMessage: String {
@@ -557,7 +683,7 @@ struct LiveTVGuideView: View {
     private var previewTarget: String {
         if ScreenTour.requested == "live-demo-preview" { return rows.first?.channel.id ?? "" }
         guard focusedCell != nil, let channel = focusedChannel, !showingEvents, !showSearch, !showSetup,
-              !showOptions, !showViewPicker, feedPicker == nil, !store.isWatching, store.overlay == nil,
+              !showOptions, !showViewPicker, !showGenres, feedPicker == nil, !store.isWatching, store.overlay == nil,
               !multiview.isPresented, scenePhase == .active else { return "" }
         return channel.id
     }
@@ -637,6 +763,7 @@ struct LiveTVGuideView: View {
             }
             if !showingEvents {
                 SourceModeChip(title: (genre?.title ?? L10n.string("live_genre", fallback: "Genre")) + " ▾", isSelected: genre != nil) {
+                    genreCounts = countGenres()
                     showGenres = true
                 }
             }

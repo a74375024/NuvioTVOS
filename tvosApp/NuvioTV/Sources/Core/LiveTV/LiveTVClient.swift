@@ -1,7 +1,7 @@
 import Foundation
 
 /// One Live TV channel on an Emby / Jellyfin server.
-struct LiveTVChannel: Identifiable, Hashable {
+struct LiveTVChannel: Identifiable, Hashable, Codable {
     /// `serverID|itemID`, unique across servers.
     let id: String
     let serverID: String
@@ -35,10 +35,10 @@ struct LiveTVProgram: Identifiable, Hashable {
     let overview: String?
     let start: Date
     let end: Date
-    let isMovie: Bool
-    let isSports: Bool
-    let isNews: Bool
-    let isKids: Bool
+    var isMovie: Bool
+    var isSports: Bool
+    var isNews: Bool
+    var isKids: Bool
     let isLive: Bool
     let isPremiere: Bool
     let imageURL: URL?
@@ -207,7 +207,7 @@ struct LiveTVClient {
                 if let tag = item.ImageTags?.Primary { return imageURL(itemID: item.Id, tag: tag) }
                 return nil
             }()
-            return LiveTVProgram(
+            return ProgramGenre.withTitleFlags(LiveTVProgram(
                 id: "\(serverID)|\(item.Id)",
                 channelID: "\(serverID)|\(channel)",
                 title: item.Name?.liveNonEmpty ?? "",
@@ -222,7 +222,7 @@ struct LiveTVClient {
                 isLive: item.IsLive ?? false,
                 isPremiere: item.IsPremiere ?? false,
                 imageURL: image
-            )
+            ))
         }
     }
 

@@ -89,7 +89,9 @@ final class LiveTVStore: ObservableObject {
     @Published private(set) var events: [LiveEvent] = []
     @Published private(set) var families: [EventFamily] = []
     @Published private(set) var prefs = LineupPrefs()
-    @Published private(set) var programs: [String: [LiveTVProgram]] = [:]
+    @Published private(set) var programs: [String: [LiveTVProgram]] = [:] {
+        didSet { programsRevision &+= 1 }
+    }
     @Published private(set) var state: LoadState = .idle
     @Published private(set) var isLoadingGuide = false
     /// Where each channel's guide stands, so a row can say "loading" vs "none".
@@ -208,6 +210,29 @@ final class LiveTVStore: ObservableObject {
     private var previewStream: LiveTVStream?
     private var lastPreviewOpen = Date.distantPast
 
+    // Saved channel list, load timing and background rebuilds.
+    /// The channels on screen came from the small first-screen file; the
+    /// full list is still being read.
+    private var catalogPartial = false
+    /// Entries in the order the catalog built them.
+    private var catalogEntries: [LiveTVEntryInfo] = []
+    private var loadStartedAt = Date()
+    private var rebuildGeneration = 0
+    private var listingsGeneration = 0
+    /// Channels a guide fetch updated while listings were being merged in the
+    /// background (they're redone on top of that result).
+    private var touchedListings: Set<String> = []
+    /// Per entry: which version's listing it shows, so unchanged entries
+    /// aren't rebuilt each time any guide data lands.
+    private var entryGuideKeys: [String: String] = [:]
+    private var providerSavedCache: [String: ProviderGuide.Saved] = [:]
+    private var providerSavedTried: Set<String> = []
+    private var outsideSavedCache: [String: OutsideGuide.Saved] = [:]
+    private var outsideSavedTried: Set<String> = []
+    /// Bumped when the entry lists / listings change (the guide memoizes its rows on these).
+    @Published private(set) var entriesRevision = 0
+    @Published private(set) var programsRevision = 0
+
     // MARK: Servers
 
     private struct Server {
@@ -287,9 +312,17 @@ final class LiveTVStore: ObservableObject {
             recentIDs = Self.loadList(Self.recentKey)
             prefs = LineupPrefs.load()
             ProviderGuide.countries = prefs.guideCountries
+            catalogPartial = false
+            catalogEntries = []
+            entryGuideKeys = [:]
+            touchedListings = []
+            providerSavedCache = [:]
+            providerSavedTried = []
+            outsideSavedCache = [:]
+            outsideSavedTried = []
         }
         let channelsFresh = channelsLoadedAt.map { Date().timeIntervalSince($0) < Self.channelLifetime } ?? false
-        if !force, channelsFresh, signature == loadedSignature, !channels.isEmpty {
+        if !force, channelsFresh, signature == loadedSignature, !channels.isEmpty, !catalogPartial {
             refreshGuideIfNeeded()
             return
         }
@@ -304,89 +337,310 @@ final class LiveTVStore: ObservableObject {
             return
         }
         if channels.isEmpty { state = .loading }
+        loadStartedAt = Date()
         loadTask = Task { [weak self] in
             guard let self else { return }
             defer { self.loadTask = nil }
-            var all: [LiveTVChannel] = []
-            var problems: [String] = []
-            for server in configured {
-                var client = server.client
-                do {
-                    if client.userID.isEmpty, let base = server.config.baseURL {
-                        let resolved = try await JellyfinClient.currentUserId(
-                            baseURL: base, apiKey: client.token, username: server.config.username
-                        )
-                        var updated = server.config
-                        updated.userId = resolved
-                        JellyfinServerStore.shared.upsert(updated)
-                        client = LiveTVClient(serverID: client.serverID, baseURL: client.baseURL, token: client.token, userID: resolved)
-                    }
-                    all += try await client.channels()
-                } catch {
-                    problems.append("\(server.config.displayName): \(error.localizedDescription)")
-                }
+            // 1. The list saved on this Apple TV: on screen right away.
+            if self.channels.isEmpty, !force {
+                await self.loadSavedCatalog(signature: signature)
             }
-            for client in xtream {
-                do {
-                    if let info = try? await client.accountInfo() {
-                        self.xtreamFormats[client.account.sourceID] = info.formats
-                    }
-                    let list = try await client.channels()
-                    all += list
-                    var updated = client.account
-                    updated.lastChannelCount = list.count
-                    XtreamStore.shared.upsert(updated)
-                } catch {
-                    problems.append("\(client.account.displayName): \(error.localizedDescription)")
-                }
-            }
-            // Favorites kept on this Apple TV (Xtream has no favorites API).
-            let localFavorites = Set(Self.loadList(Self.localFavoritesKey))
-            for index in all.indices where localFavorites.contains(all[index].id) { all[index].isFavorite = true }
-            guard !Task.isCancelled else { return }
-            if all.isEmpty {
-                self.channelsLoadedAt = Date()
-                if self.channels.isEmpty {
-                    self.state = problems.isEmpty
-                        ? .empty("Your server didn't list any live channels for this account.")
-                        : .failed(problems.joined(separator: "\n"))
-                }
-                return
-            }
-            let isFirstLoad = self.channels.isEmpty
-            let annotated = Self.annotated(all)
-            let catalog = await Task.detached(priority: .userInitiated) {
-                ChannelCatalog.build(annotated, stations: StationDirectory.cached())
-            }.value
-            guard !Task.isCancelled else { return }
-            self.channelsLoadedAt = Date()
-            self.apply(channels: annotated, catalog: catalog)
-            self.state = .loaded
-            if isFirstLoad {
-                self.loadProviderGuide()
-                self.loadOutsideGuide()
-                let first = self.visibleEntries().prefix(60).map(\.id)
-                let favorites = self.entries.filter(\.isFavorite).prefix(40).map(\.id)
-                self.requestGuide(Array(favorites) + self.recentIDs.prefix(20) + first)
-            } else {
-                // New channels may need the provider's guide; cheap if not.
-                self.loadProviderGuide()
-                self.rebuildOutsidePrograms()
+            guard self.loadedSignature == signature, !Task.isCancelled else { return }
+            // 2. The servers' current list, in the background when a saved
+            // one is showing, once that one is older than `channelLifetime`
+            // (event names change through the day).
+            let fresh = self.channelsLoadedAt.map { Date().timeIntervalSince($0) < Self.channelLifetime } ?? false
+            if force || !fresh || self.channels.isEmpty || self.catalogPartial {
+                await self.downloadChannels(configured: configured, xtream: xtream, signature: signature)
             }
         }
     }
 
-    /// Installs a freshly built catalog: raw channels, entries, events.
-    private func apply(channels list: [LiveTVChannel], catalog: ChannelCatalog.Result) {
+    /// Called at app start: reads the saved list and refreshes it in the
+    /// background, so Live TV is ready by the time it's opened.
+    func prewarm() {
+        guard hasServers, channels.isEmpty, loadTask == nil, !ScreenTour.isActive else { return }
+        logLoad("started at app launch", detail: "")
+        loadIfNeeded()
+    }
+
+    // MARK: Saved channel list
+
+    /// Puts the list saved on this Apple TV on screen: the small first-screen
+    /// file, then the full one (both read off the main thread).
+    private func loadSavedCatalog(signature: String) async {
+        let started = Date()
+        guard let first = await Task.detached(priority: .userInitiated, operation: {
+            LiveTVCatalogCache.load(signature: signature, part: .first)
+        }).value else {
+            logLoad("no saved channel list", detail: "loading from the servers")
+            return
+        }
+        guard loadedSignature == signature, channels.isEmpty else { return }
+        xtreamFormats.merge(first.saved.xtreamFormats) { current, _ in current }
+        await apply(channels: withLocalFavorites(first.saved.channels), catalog: first.saved.catalog, partial: true)
+        channelsLoadedAt = first.saved.savedAt
+        state = .loaded
+        logLoad("first screen from saved list", detail: "\(first.saved.channels.count) channels, \(LiveTVWork.size(first.bytes)); "
+                + "\(LiveTVWork.ms(since: started)) (\(LiveTVWork.ms(since: loadStartedAt)) after opening); saved \(LiveTVWork.age(first.saved.savedAt)) ago")
+        await startGuides(requestRows: true)
+        let fullStarted = Date()
+        guard let full = await Task.detached(priority: .utility, operation: {
+            LiveTVCatalogCache.load(signature: signature, part: .full)
+        }).value, loadedSignature == signature, catalogPartial else { return }
+        await apply(channels: withLocalFavorites(full.saved.channels), catalog: full.saved.catalog, partial: false)
+        logLoad("full saved list", detail: "\(full.saved.channels.count) channels, \(LiveTVWork.size(full.bytes)); \(LiveTVWork.ms(since: fullStarted))")
+        await startGuides(requestRows: false)
+    }
+
+    /// Favorites kept on this Apple TV (Xtream has no favorites API).
+    private func withLocalFavorites(_ list: [LiveTVChannel]) -> [LiveTVChannel] {
+        let local = Set(Self.loadList(Self.localFavoritesKey))
+        var updated = list
+        for index in updated.indices where updated[index].serverID.hasPrefix("xt:") {
+            updated[index].isFavorite = local.contains(updated[index].id)
+        }
+        return updated
+    }
+
+    /// Saves the finished list (off the main thread) for the next launch.
+    private func saveCatalog(signature: String) {
+        guard !catalogPartial, !channels.isEmpty, !ScreenTour.isActive else { return }
+        let saved = LiveTVCatalogCache.Saved(
+            version: LiveTVCatalogCache.version, signature: signature, savedAt: channelsLoadedAt ?? Date(),
+            channels: channels,
+            catalog: ChannelCatalog.Result(traits: traits, entries: catalogEntries, entryOf: entryOf,
+                                           families: allFamilies, events: allEvents),
+            xtreamFormats: xtreamFormats
+        )
+        var firstEntries = Set(browseEntries.map(\.id))
+        firstEntries.formUnion(lineupIDs)
+        firstEntries.formUnion(entries.filter(\.isFavorite).map(\.id))
+        firstEntries.formUnion(recentIDs.filter { entryInfo[$0] != nil })
+        let firstFamilies = Set(families.map(\.id))
+        let started = Date()
+        Task.detached(priority: .background) {
+            let sizes = LiveTVCatalogCache.save(saved, firstEntryIDs: firstEntries, firstFamilyIDs: firstFamilies)
+            let detail = "first screen \(LiveTVWork.size(sizes.first)), full \(LiveTVWork.size(sizes.full)); \(LiveTVWork.ms(since: started))"
+            await MainActor.run { LiveTVStore.shared.logLoad("saved channel list", detail: detail) }
+        }
+    }
+
+    /// Starts the guide sources for the current list: saved listings (read
+    /// off the main thread) first, then the rows on screen, then any
+    /// background rebuild of the listings.
+    private func startGuides(requestRows: Bool) async {
+        await preloadSavedListings()
+        loadProviderGuide()
+        loadOutsideGuide()
+        if requestRows {
+            let first = visibleEntries().prefix(60).map(\.id)
+            let favorites = entries.filter(\.isFavorite).prefix(40).map(\.id)
+            requestGuide(Array(favorites) + recentIDs.prefix(20) + first)
+        }
+    }
+
+    /// Reads saved provider / outside listings into memory off the main thread.
+    private func preloadSavedListings() async {
+        let profile = ProfileSettings.activeProfileScope
+        let keys = xtreamClients().map { ProviderGuide.cacheKey(profile: profile, sourceID: $0.account.sourceID) }
+            .filter { providerSavedCache[$0] == nil && !providerSavedTried.contains($0) }
+        let signature = loadedSignature ?? "default"
+        let needOutside = OutsideGuide.isEnabled && outsideSavedCache[signature] == nil && !outsideSavedTried.contains(signature)
+        guard !keys.isEmpty || needOutside else { return }
+        let started = Date()
+        let loaded = await Task.detached(priority: .userInitiated) { () -> ([String: ProviderGuide.Saved], OutsideGuide.Saved?) in
+            var found: [String: ProviderGuide.Saved] = [:]
+            for key in keys { if let saved = ProviderGuide.loadSaved(key) { found[key] = saved } }
+            return (found, needOutside ? OutsideGuide.loadSaved(signature: signature) : nil)
+        }.value
+        for key in keys {
+            providerSavedTried.insert(key)
+            if let saved = loaded.0[key] { providerSavedCache[key] = saved }
+        }
+        if needOutside {
+            outsideSavedTried.insert(signature)
+            if let saved = loaded.1 { outsideSavedCache[signature] = saved }
+        }
+        logLoad("saved listings read", detail: "\(loaded.0.count) provider guide(s)\(loaded.1 == nil ? "" : " + outside listings"); \(LiveTVWork.ms(since: started))")
+    }
+
+    private func savedProviderGuide(_ key: String) -> ProviderGuide.Saved? {
+        if let saved = providerSavedCache[key] { return saved }
+        guard !providerSavedTried.contains(key) else { return nil }
+        providerSavedTried.insert(key)
+        let saved = ProviderGuide.loadSaved(key)
+        providerSavedCache[key] = saved
+        return saved
+    }
+
+    private func savedOutsideGuide(_ signature: String) -> OutsideGuide.Saved? {
+        if let saved = outsideSavedCache[signature] { return saved }
+        guard !outsideSavedTried.contains(signature) else { return nil }
+        outsideSavedTried.insert(signature)
+        let saved = OutsideGuide.loadSaved(signature: signature)
+        outsideSavedCache[signature] = saved
+        return saved
+    }
+
+    /// A load-timing line in the exportable log.
+    func logLoad(_ event: String, detail: String) {
+        LiveTVPlaybackLog.shared.add("load: " + event, session: 0, detail: detail)
+    }
+
+    // MARK: Downloading the channel list
+
+    private struct Fetched {
+        var index: Int
+        var name: String
+        var channels: [LiveTVChannel] = []
+        var problem: String?
+        var config: JellyfinServerConfig?
+        var account: XtreamAccount?
+        var formats: [String]?
+        var milliseconds = 0
+    }
+
+    /// Downloads every account's channel list at once, then either refreshes
+    /// Live Events alone (when only event slots were renamed) or rebuilds the
+    /// catalog, off the main thread, and saves the result.
+    private func downloadChannels(configured: [Server], xtream: [XtreamClient], signature: String) async {
+        let started = Date()
+        let showing = !channels.isEmpty && !catalogPartial
+        var parts = [[LiveTVChannel]](repeating: [], count: configured.count + xtream.count)
+        var problems: [String] = []
+        var timings: [String] = []
+        await withTaskGroup(of: Fetched.self) { group in
+            for (index, server) in configured.enumerated() {
+                group.addTask {
+                    var fetched = Fetched(index: index, name: server.config.displayName)
+                    let began = Date()
+                    var client = server.client
+                    do {
+                        if client.userID.isEmpty, let base = server.config.baseURL {
+                            let resolved = try await JellyfinClient.currentUserId(
+                                baseURL: base, apiKey: client.token, username: server.config.username
+                            )
+                            var updated = server.config
+                            updated.userId = resolved
+                            fetched.config = updated
+                            client = LiveTVClient(serverID: client.serverID, baseURL: client.baseURL, token: client.token, userID: resolved)
+                        }
+                        fetched.channels = try await client.channels()
+                    } catch {
+                        fetched.problem = "\(server.config.displayName): \(error.localizedDescription)"
+                    }
+                    fetched.milliseconds = Int(Date().timeIntervalSince(began) * 1000)
+                    return fetched
+                }
+            }
+            for (offset, client) in xtream.enumerated() {
+                group.addTask {
+                    var fetched = Fetched(index: configured.count + offset, name: client.account.displayName)
+                    let began = Date()
+                    async let info = try? client.accountInfo()
+                    do {
+                        let list = try await client.channels()
+                        fetched.channels = list
+                        var updated = client.account
+                        updated.lastChannelCount = list.count
+                        fetched.account = updated
+                    } catch {
+                        fetched.problem = "\(client.account.displayName): \(error.localizedDescription)"
+                    }
+                    fetched.formats = (await info)?.formats
+                    fetched.milliseconds = Int(Date().timeIntervalSince(began) * 1000)
+                    return fetched
+                }
+            }
+            for await fetched in group {
+                parts[fetched.index] = fetched.channels
+                timings.append("\(fetched.name) \(fetched.channels.count) in \(fetched.milliseconds) ms")
+                if let problem = fetched.problem { problems.append(problem) }
+                if let config = fetched.config { JellyfinServerStore.shared.upsert(config) }
+                if let account = fetched.account {
+                    XtreamStore.shared.upsert(account)
+                    if let formats = fetched.formats { xtreamFormats[account.sourceID] = formats }
+                }
+            }
+        }
+        let downloaded = LiveTVWork.ms(since: started)
+        let all = withLocalFavorites(parts.flatMap { $0 })
+        guard loadedSignature == signature, !Task.isCancelled else { return }
+        logLoad("downloaded channel lists", detail: timings.joined(separator: "; ") + " (all at once: \(downloaded))")
+        if !problems.isEmpty { logLoad("some sources failed", detail: problems.joined(separator: "; ")) }
+        if all.isEmpty {
+            channelsLoadedAt = Date()
+            if channels.isEmpty {
+                state = problems.isEmpty
+                    ? .empty("Your server didn't list any live channels for this account.")
+                    : .failed(problems.joined(separator: "\n"))
+            }
+            return
+        }
+        let wasEmpty = channels.isEmpty
+        let oldChannels = showing ? channels : []
+        let oldResult: ChannelCatalog.Result? = showing
+            ? ChannelCatalog.Result(traits: traits, entries: catalogEntries, entryOf: entryOf, families: allFamilies, events: allEvents)
+            : nil
+        let processStarted = Date()
+        let work = await Task.detached(priority: showing ? .utility : .userInitiated) {
+            () -> (channels: [LiveTVChannel], catalog: ChannelCatalog.Result, renamed: Int?) in
+            let annotated = LiveTVWork.annotated(all)
+            // Same channels, only event slots renamed: refresh Live Events
+            // alone instead of classifying everything again.
+            if let oldResult, let renamed = LiveTVWork.renamedEventSlots(old: oldChannels, new: annotated, traits: oldResult.traits) {
+                var result = oldResult
+                if !renamed.isEmpty { ChannelCatalog.refreshEvents(&result, channels: annotated, renamed: renamed) }
+                return (annotated, result, renamed.count)
+            }
+            return (annotated, ChannelCatalog.build(annotated, stations: StationDirectory.cached()), nil)
+        }.value
+        guard loadedSignature == signature, !Task.isCancelled else { return }
+        channelsLoadedAt = Date()
+        await apply(channels: work.channels, catalog: work.catalog, partial: false)
+        state = .loaded
+        if let renamed = work.renamed {
+            logLoad("refresh: only event names changed", detail: "\(renamed) renamed; events updated in \(LiveTVWork.ms(since: processStarted)), no full rebuild")
+        } else {
+            logLoad(wasEmpty ? "built channel list" : "rebuilt channel list",
+                    detail: "\(work.channels.count) channels, \(entryInfo.count) entries; processed in \(LiveTVWork.ms(since: processStarted))")
+        }
+        if wasEmpty { logLoad("first screen", detail: "\(LiveTVWork.ms(since: loadStartedAt)) after opening (nothing saved)") }
+        if showing {
+            // New channels may need the provider's guide; cheap if not.
+            loadProviderGuide()
+            rebuildOutsidePrograms()
+        } else {
+            await startGuides(requestRows: wasEmpty)
+        }
+        saveCatalog(signature: signature)
+    }
+
+    /// Installs a freshly built catalog (raw channels, entries, events),
+    /// then works out My Lineup in the background.
+    private func apply(channels list: [LiveTVChannel], catalog: ChannelCatalog.Result, partial: Bool = false) async {
+        installCatalog(list, catalog, partial: partial)
+        await rebuildEntries()
+    }
+
+    /// The same, all on the main thread (small demo lineups).
+    private func applyNow(channels list: [LiveTVChannel], catalog: ChannelCatalog.Result) {
+        installCatalog(list, catalog, partial: false)
+        rebuildEntriesNow()
+    }
+
+    private func installCatalog(_ list: [LiveTVChannel], _ catalog: ChannelCatalog.Result, partial: Bool) {
         channels = list
         indexByID = Dictionary(list.enumerated().map { ($1.id, $0) }, uniquingKeysWith: { first, _ in first })
         traits = catalog.traits
         entryOf = catalog.entryOf
-        entryInfo = Dictionary(uniqueKeysWithValues: catalog.entries.map { ($0.id, $0) })
+        catalogEntries = catalog.entries
+        entryInfo = Dictionary(catalog.entries.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         allEvents = catalog.events
         allFamilies = catalog.families
+        catalogPartial = partial
         applyEventFilter()
-        rebuildEntries()
     }
 
     /// Live Events for the chosen countries (events with no known country stay).
@@ -408,59 +662,51 @@ final class LiveTVStore: ObservableObject {
         lineupRefreshTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: 600_000_000)
             guard let self, !Task.isCancelled else { return }
-            self.rebuildEntries()
+            await self.rebuildEntries()
         }
     }
 
-    /// Recomputes lineup membership, numbering and the entry list.
-    private func rebuildEntries() {
-        let infos = Array(entryInfo.values)
-        var lineup = Set<String>()
-        for info in infos {
-            let favorite = info.members.contains { indexByID[$0].map { channels[$0].isFavorite } ?? false }
-            if prefs.removed.contains(info.id) { continue }
-            if favorite || prefs.added.contains(info.id) {
-                lineup.insert(info.id)
-            } else if prefs.configured,
-                      LineupEngine.suggests(info, prefs: prefs, hasGuide: entryHasGuide(info.id), name: info.name) {
-                // Suggestions are worked out live, so channels join as their
-                // listings load (and core networks / market locals always).
-                lineup.insert(info.id)
-            }
-        }
-        lineupIDs = lineup
-        lineupNumbers = LineupEngine.numbers(for: infos.filter { lineup.contains($0.id) })
-        // Everything else gets numbers after the lineup, by category.
-        var allNumbers = lineupNumbers
-        let rest = infos.filter { !lineup.contains($0.id) }
-        var next = (lineupNumbers.values.max() ?? 0) / 1000 * 1000 + 5000
-        for category in LineupCategory.allCases {
-            for info in rest.filter({ $0.category == category }).sorted(by: { $0.name.localizedStandardCompare($1.name) == .orderedAscending }) {
-                allNumbers[info.id] = next
-                next += 1
-            }
-        }
-        let built: [LiveTVChannel] = infos.compactMap { info in
-            let members = info.members.compactMap { indexByID[$0].map { channels[$0] } }
-            guard let primary = members.first else { return nil }
-            return LiveTVChannel(
-                id: info.id, serverID: primary.serverID, itemID: primary.itemID, name: info.name,
-                number: allNumbers[info.id].map(String.init),
-                imageURL: members.lazy.compactMap(\.imageURL).first,
-                isFavorite: members.contains(where: \.isFavorite),
-                tags: primary.tags, isRadio: primary.isRadio, group: primary.group, shortName: info.name
-            )
-        }.sorted { (Int($0.number ?? "") ?? Int.max) < (Int($1.number ?? "") ?? Int.max) }
-        entries = built
-        entryIndex = Dictionary(built.enumerated().map { ($1.id, $0) }, uniquingKeysWith: { first, _ in first })
-        lineupEntries = built.filter { lineup.contains($0.id) }
-        browseEntries = built.filter { entry in
-            lineup.contains(entry.id) || entry.isFavorite || prefs.includes(market: entryInfo[entry.id]?.market)
-        }
-        var counts: [String: Int] = [:]
-        for entry in browseEntries { counts[entry.group ?? Self.otherGroup, default: 0] += 1 }
-        groups = counts.map { ChannelGroup(name: $0.key, count: $0.value) }
-            .sorted { $0.count != $1.count ? $0.count > $1.count : $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+    /// Recomputes lineup membership, numbering and the entry lists on a
+    /// background thread (tens of thousands of entries on big provider
+    /// lists), then installs them. The newest call wins.
+    private func rebuildEntries() async {
+        rebuildGeneration &+= 1
+        let generation = rebuildGeneration
+        let input = lineupInput()
+        let output = await Task.detached(priority: .userInitiated) { LiveTVWork.lineup(input) }.value
+        guard generation == rebuildGeneration else { return }
+        install(output)
+    }
+
+    private func scheduleRebuild() {
+        Task { [weak self] in await self?.rebuildEntries() }
+    }
+
+    /// The same on the main thread (small demo lineups).
+    private func rebuildEntriesNow() {
+        rebuildGeneration &+= 1
+        install(LiveTVWork.lineup(lineupInput()))
+    }
+
+    private func lineupInput() -> LiveTVWork.LineupInput {
+        var guideIDs = Set(outsideMatches.keys)
+        guideIDs.formUnion(providerMatches.keys)
+        for (id, list) in serverPrograms where !list.isEmpty { guideIDs.insert(id) }
+        return LiveTVWork.LineupInput(
+            infos: catalogEntries, channels: channels, indexByID: indexByID, prefs: prefs,
+            guideIDs: guideIDs, otherGroup: Self.otherGroup
+        )
+    }
+
+    private func install(_ output: LiveTVWork.LineupOutput) {
+        lineupIDs = output.lineupIDs
+        lineupNumbers = output.lineupNumbers
+        entries = output.entries
+        entryIndex = output.entryIndex
+        lineupEntries = output.lineupEntries
+        browseEntries = output.browseEntries
+        groups = output.groups.map { ChannelGroup(name: $0.name, count: $0.count) }
+        entriesRevision &+= 1
         // Entry guides from whatever member data is already here.
         var merged = programs
         var states = guideState
@@ -489,10 +735,7 @@ final class LiveTVStore: ObservableObject {
 
     /// The guide grid starts at the last half hour.
     static func windowStart(for date: Date = Date()) -> Date {
-        let calendar = Calendar.current
-        var components = calendar.dateComponents([.year, .month, .day, .hour, .minute], from: date)
-        components.minute = (components.minute ?? 0) < 30 ? 0 : 30
-        return calendar.date(from: components) ?? date
+        LiveTVWork.windowStart(for: date)
     }
 
     /// Called on a timer by the guide: when the half-hour window moves on,
@@ -608,6 +851,7 @@ final class LiveTVStore: ObservableObject {
                 for id in ids {
                     let server = (grouped[id] ?? []).sorted { $0.start < $1.start }
                     self.serverPrograms[id] = server
+                    self.touchedListings.insert(id)
                     merged[id] = self.bestListing(server: self.serverListing(for: id), outside: self.outsideListing(for: id))
                     states[id] = .loaded
                     self.guideWindowByChannel[id] = start
@@ -632,6 +876,7 @@ final class LiveTVStore: ObservableObject {
             var merged = programs
             var states = guideState
             for id in covered {
+                touchedListings.insert(id)
                 merged[id] = bestListing(server: serverListing(for: id), outside: outsideListing(for: id))
                 states[id] = .loaded
                 guideWindowByChannel[id] = start
@@ -670,6 +915,7 @@ final class LiveTVStore: ObservableObject {
             for id in ids {
                 let server = (results[id] ?? []).sorted { $0.start < $1.start }
                 self.serverPrograms[id] = server
+                self.touchedListings.insert(id)
                 merged[id] = self.bestListing(server: self.serverListing(for: id), outside: self.outsideListing(for: id))
                 states[id] = .loaded
                 self.guideWindowByChannel[id] = start
@@ -692,12 +938,13 @@ final class LiveTVStore: ObservableObject {
         for id in entryIDs {
             guard let info = entryInfo[id] else { continue }
             var best: [LiveTVProgram] = []
+            var bestMember = ""
             var bestCoverage: TimeInterval = -1
             var anyLoading = false, anyLoaded = false, anyFailed = false
             for member in info.members {
                 if let list = merged[member], !list.isEmpty {
                     let value = coverage(list)
-                    if value > bestCoverage { best = list; bestCoverage = value }
+                    if value > bestCoverage { best = list; bestCoverage = value; bestMember = member }
                 }
                 switch states[member] {
                 case .loading: anyLoading = true
@@ -706,13 +953,24 @@ final class LiveTVStore: ObservableObject {
                 case nil: break
                 }
             }
-            merged[id] = best.isEmpty ? nil : best.map { program in
+            // Unchanged since last time (same version, same programs and tags): keep it.
+            let key: String
+            if let first = best.first, let last = best.last {
+                let tagged = best.reduce(0) { $0 + ($1.isMovie || $1.isSports || $1.isNews || $1.isKids ? 1 : 0) }
+                key = "\(bestMember)|\(best.count)|\(first.id)|\(last.id)|\(tagged)"
+            } else {
+                key = ""
+            }
+            if key.isEmpty || entryGuideKeys[id] != key || merged[id] == nil {
+                entryGuideKeys[id] = key
+                merged[id] = best.isEmpty ? nil : best.map { program in
                 LiveTVProgram(
                     id: "\(id)|\(program.id)", channelID: id, title: program.title, episodeTitle: program.episodeTitle,
                     overview: program.overview, start: program.start, end: program.end, isMovie: program.isMovie,
                     isSports: program.isSports, isNews: program.isNews, isKids: program.isKids, isLive: program.isLive,
                     isPremiere: program.isPremiere, imageURL: program.imageURL, fromOutsideGuide: program.fromOutsideGuide
                 )
+                }
             }
             if !best.isEmpty || anyLoaded {
                 states[id] = .loaded
@@ -760,13 +1018,14 @@ final class LiveTVStore: ObservableObject {
                 continue
             }
             let key = ProviderGuide.cacheKey(profile: profile, sourceID: sourceID)
-            let saved = ProviderGuide.loadSaved(key)
+            let saved = savedProviderGuide(key)
             if let saved {
                 Self.replace(&matches, &notes, prefix: "\(sourceID)|", with: saved.programs, saved.notes)
                 states[sourceID] = ProviderGuide.State(name: name, status: .ready(
                     matched: saved.programs.count, total: scoped.count, guideChannels: saved.guideChannels, updated: saved.built))
             }
-            if force || ProviderGuide.needsRebuild(saved, channelCount: scoped.count) {
+            // Never rebuild from the partial first-screen list.
+            if !catalogPartial, force || ProviderGuide.needsRebuild(saved, channelCount: scoped.count) {
                 jobs.append((sourceID, name, url, scoped, key))
                 if saved == nil {
                     states[sourceID] = ProviderGuide.State(name: name, status: .updating("Waiting to start…"))
@@ -804,7 +1063,11 @@ final class LiveTVStore: ObservableObject {
         guard !Task.isCancelled else { return }
         switch outcome {
         case .built(let saved):
-            if let key { ProviderGuide.save(saved, key: key) }
+            if let key {
+                Task.detached(priority: .background) { ProviderGuide.save(saved, key: key) }
+                providerSavedCache[key] = saved
+                providerSavedTried.insert(key)
+            }
             var matches = providerMatches
             var notes = providerNotes
             Self.replace(&matches, &notes, prefix: "\(sourceID)|", with: saved.programs, saved.notes)
@@ -884,7 +1147,7 @@ final class LiveTVStore: ObservableObject {
             guard let market = trait.market else { return true }
             return countries.contains(market.components(separatedBy: "-").first ?? market)
         }
-        let saved = OutsideGuide.loadSaved(signature: signature)
+        let saved = savedOutsideGuide(signature)
         if let saved, Set(saved.shards) == shardIDs {
             outsideMatches = saved.programs
             outsideNotes = saved.notes ?? [:]
@@ -893,7 +1156,8 @@ final class LiveTVStore: ObservableObject {
             rebuildOutsidePrograms()
             scheduleLineupRefresh()
         }
-        guard force || OutsideGuide.needsRebuild(saved, shards: shardIDs, channelCount: snapshot.count) else { return }
+        // Never rebuild from the partial first-screen list.
+        guard !catalogPartial, force || OutsideGuide.needsRebuild(saved, shards: shardIDs, channelCount: snapshot.count) else { return }
         outsideStatus = .updating("Getting ready…")
         outsideTask = Task { [weak self] in
             // Give the app a moment to settle before starting background work.
@@ -915,11 +1179,11 @@ final class LiveTVStore: ObservableObject {
                 return
             }
             let now = Date()
-            OutsideGuide.save(
-                OutsideGuide.Saved(built: now, shards: Array(shardIDs), channelCount: snapshot.count,
-                                   programs: built.programs, notes: built.notes),
-                signature: signature
-            )
+            let saved = OutsideGuide.Saved(built: now, shards: Array(shardIDs), channelCount: snapshot.count,
+                                           programs: built.programs, notes: built.notes)
+            Task.detached(priority: .background) { OutsideGuide.save(saved, signature: signature) }
+            self.outsideSavedCache[signature] = saved
+            self.outsideSavedTried.insert(signature)
             self.outsideMatches = built.programs
             self.outsideNotes = built.notes
             self.outsideBuiltAt = now
@@ -937,41 +1201,41 @@ final class LiveTVStore: ObservableObject {
 
     /// Re-merges every channel's listing (after outside data loads or the
     /// window moves on), then the entries built from them.
+    /// The merging runs on a background thread (thousands of channels);
+    /// guide fetches that land meanwhile are redone on top of its result.
     private func rebuildOutsidePrograms() {
-        var merged = programs.filter { !$0.key.hasPrefix("e|") }
-        let ids = Set(outsideMatches.keys).union(providerMatches.keys).union(merged.keys)
-        for id in ids {
-            merged[id] = bestListing(server: serverListing(for: id), outside: outsideListing(for: id))
+        listingsGeneration &+= 1
+        let generation = listingsGeneration
+        let server = serverPrograms
+        let provider = providerMatches
+        let outside = outsideMatches
+        var ids = Set(outside.keys).union(provider.keys)
+        for key in programs.keys where !key.hasPrefix("e|") { ids.insert(key) }
+        let window = Self.windowStart()
+        touchedListings = []
+        Task { [weak self] in
+            let merged = await Task.detached(priority: .userInitiated) {
+                LiveTVWork.mergedListings(ids: ids, server: server, provider: provider, outside: outside, windowStart: window)
+            }.value
+            guard let self, generation == self.listingsGeneration else { return }
+            var result = merged
+            for id in self.touchedListings {
+                let list = self.bestListing(server: self.serverListing(for: id), outside: self.outsideListing(for: id))
+                result[id] = list.isEmpty ? nil : list
+            }
+            // Entry lists stay until applyEntryGuides decides they changed.
+            for (key, value) in self.programs where key.hasPrefix("e|") { result[key] = value }
+            var states = self.guideState
+            self.applyEntryGuides(&result, &states, entryIDs: Array(self.entryInfo.keys))
+            self.programs = result
+            self.guideState = states
         }
-        merged = merged.filter { !$0.value.isEmpty }
-        var states = guideState
-        applyEntryGuides(&merged, &states, entryIDs: Array(entryInfo.keys))
-        programs = merged
-        guideState = states
     }
 
     /// Picks whichever listing covers more of the next three hours; the
     /// server's wins ties and is topped up from outside where it has gaps.
     private func bestListing(server: [LiveTVProgram]?, outside: [LiveTVProgram]?) -> [LiveTVProgram] {
-        let server = server ?? []
-        guard let outside, !outside.isEmpty else { return server }
-        guard !server.isEmpty else { return outside }
-        let start = Self.windowStart()
-        let end = start.addingTimeInterval(Self.guideHours * 3600)
-        func coverage(_ list: [LiveTVProgram]) -> TimeInterval {
-            list.reduce(0) { total, p in total + max(0, min(p.end, end).timeIntervalSince(max(p.start, start))) }
-        }
-        let outsideWins = coverage(outside) > coverage(server) + 15 * 60
-        let primary = outsideWins ? outside : server
-        let secondary = outsideWins ? server : outside
-        var result = primary
-        for program in secondary {
-            let clashes = result.contains { other in
-                min(program.end, other.end).timeIntervalSince(max(program.start, other.start)) > 300
-            }
-            if !clashes { result.append(program) }
-        }
-        return result.sorted { $0.start < $1.start }
+        LiveTVWork.bestListing(server: server, outside: outside, windowStart: Self.windowStart())
     }
 
     /// Whether any version of an entry has guide data (server or outside).
@@ -986,6 +1250,11 @@ final class LiveTVStore: ObservableObject {
 
     func entry(id: String) -> LiveTVChannel? {
         entryIndex[id].map { entries[$0] }
+    }
+
+    /// The kind of channel an entry (or raw channel) is: News, Sports…
+    func category(of id: String) -> LineupCategory? {
+        entryInfo[id]?.category ?? traits[id]?.category
     }
 
     func isInLineup(_ channel: LiveTVChannel) -> Bool {
@@ -1003,6 +1272,8 @@ final class LiveTVStore: ObservableObject {
             updated.removed.insert(channel.id)
         }
         setPrefs(updated)
+        // Shown right away; the full lineup follows from the background rebuild.
+        if included { lineupIDs.insert(channel.id) } else { lineupIDs.remove(channel.id) }
         flash(included ? "Added \(channel.name) to My Lineup" : "Removed \(channel.name) from My Lineup")
     }
 
@@ -1021,7 +1292,7 @@ final class LiveTVStore: ObservableObject {
             ProviderGuide.countries = updated.guideCountries
             loadProviderGuide(force: true)
         }
-        rebuildEntries()
+        scheduleRebuild()
     }
 
     /// Channels per country / language, for the country picker: US English
@@ -1154,6 +1425,8 @@ final class LiveTVStore: ObservableObject {
         let market: String
         let core: String
         let scope: String
+        let serverTagged: Int
+        let nowGenres: String
     }
 
     /// One row per channel: what it is, what the server's guide has, and
@@ -1216,7 +1489,14 @@ final class LiveTVStore: ObservableObject {
                 outsideNote: outsideNotes[channel.id] ?? (outsideMatches[channel.id] == nil ? "no match" : "matched"),
                 outsideRaw: outsideMatches[channel.id],
                 providerGuide: providerGuide, providerRaw: isXtream ? providerMatches[channel.id] : nil,
-                kind: trait?.kind.rawValue ?? "", market: trait?.market ?? "", core: trait?.core ?? "", scope: trait?.scope ?? ""
+                kind: trait?.kind.rawValue ?? "", market: trait?.market ?? "", core: trait?.core ?? "", scope: trait?.scope ?? "",
+                serverTagged: serverList.filter {
+                    $0.end > start && $0.start < end && ($0.isMovie || $0.isSports || $0.isNews || $0.isKids)
+                }.count,
+                nowGenres: current.map { program in
+                    [program.isSports ? "sports" : nil, program.isNews ? "news" : nil,
+                     program.isMovie ? "movie" : nil, program.isKids ? "kids" : nil].compactMap { $0 }.joined(separator: " ")
+                } ?? ""
             ))
         }
         let low = Int(start.timeIntervalSince1970 / 60)
@@ -1228,6 +1508,9 @@ final class LiveTVStore: ObservableObject {
             }
             func count(_ raw: [OutsideGuide.RawProgram]?) -> Int {
                 (raw ?? []).reduce(0) { $0 + ($1.s < high && $1.s + $1.m > low ? 1 : 0) }
+            }
+            func tagged(_ raw: [OutsideGuide.RawProgram]?) -> Int {
+                (raw ?? []).reduce(0) { $0 + ($1.s < high && $1.s + $1.m > low && $1.f & ProgramGenre.genreBits != 0 ? 1 : 0) }
             }
             var stationsByNetwork: [String: [OutsideGuide.Station]] = [:]
             if let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first,
@@ -1241,7 +1524,8 @@ final class LiveTVStore: ObservableObject {
                 "server_guide", "server_programs_next_3h", "outside_listing", "outside_programs_next_3h",
                 "now_title", "now_source", "entry", "category", "in_my_lineup", "event_family", "event_text",
                 "provider", "country", "guide_id", "provider_guide", "provider_guide_programs_next_3h",
-                "kind", "market", "core_network", "scope"
+                "kind", "market", "core_network", "scope",
+                "server_genre_tagged_next_3h", "outside_genre_tagged_next_3h", "provider_guide_genre_tagged_next_3h", "now_genres"
             ].joined(separator: ",")]
             lines.reserveCapacity(total + 1)
             for (index, row) in rows.enumerated() {
@@ -1260,7 +1544,9 @@ final class LiveTVStore: ObservableObject {
                     cell(row.family), cell(row.eventText),
                     cell(row.provider), cell(ProviderGuide.countryPrefix(of: channel.group) ?? ""),
                     cell(channel.epgID ?? ""), cell(row.providerGuide), cell(isXtream ? String(count(row.providerRaw)) : ""),
-                    cell(row.kind), cell(row.market), cell(row.core), cell(row.scope)
+                    cell(row.kind), cell(row.market), cell(row.core), cell(row.scope),
+                    cell(String(row.serverTagged)), cell(String(tagged(row.outsideRaw))),
+                    cell(isXtream ? String(tagged(row.providerRaw)) : ""), cell(row.nowGenres)
                 ].joined(separator: ","))
                 if index % 2000 == 1999 {
                     let done = index + 1
@@ -1351,44 +1637,6 @@ final class LiveTVStore: ObservableObject {
     /// Works out each channel's group: the server's first tag when it has
     /// tags, otherwise an IPTV-style name prefix ("US: …", "UK | …", "[CA] …").
     /// Prefixes shared by fewer than three channels aren't treated as groups.
-    private static func annotated(_ list: [LiveTVChannel]) -> [LiveTVChannel] {
-        let pattern = try? NSRegularExpression(pattern: "^\\s*(?:\\[([^\\]]{1,24})\\]|\\(([^)]{1,24})\\)|([^:|\\[\\(]{1,24}?)\\s*[:|])\\s*(.+)$")
-        var parsed: [(prefix: String?, rest: String)] = []
-        var prefixCounts: [String: Int] = [:]
-        var display: [String: String] = [:]
-        for channel in list {
-            let name = channel.name
-            let range = NSRange(name.startIndex..<name.endIndex, in: name)
-            if let match = pattern?.firstMatch(in: name, range: range) {
-                var prefix: String?
-                for group in 1...3 {
-                    if let r = Range(match.range(at: group), in: name) {
-                        prefix = name[r].trimmingCharacters(in: .whitespaces)
-                        break
-                    }
-                }
-                let rest = Range(match.range(at: 4), in: name).map { String(name[$0]).trimmingCharacters(in: .whitespaces) } ?? name
-                if let prefix, !prefix.isEmpty, !rest.isEmpty {
-                    let key = prefix.lowercased()
-                    prefixCounts[key, default: 0] += 1
-                    if display[key] == nil { display[key] = prefix }
-                    parsed.append((key, rest))
-                    continue
-                }
-            }
-            parsed.append((nil, name))
-        }
-        return zip(list, parsed).map { channel, info in
-            var updated = channel
-            if let tag = channel.tags.first {
-                updated.group = tag
-            } else if let key = info.prefix, (prefixCounts[key] ?? 0) >= 3 {
-                updated.group = display[key]
-            }
-            updated.shortName = info.prefix != nil && updated.group != nil ? info.rest : ""
-            return updated
-        }
-    }
 
     func isHidden(_ channel: LiveTVChannel) -> Bool {
         hiddenGroups.contains(channel.group ?? Self.otherGroup)
@@ -2305,7 +2553,7 @@ final class LiveTVStore: ObservableObject {
         if !favorite, let info = entryInfo[channel.id] {
             for member in info.members { if let i = indexByID[member] { channels[i].isFavorite = false } }
         }
-        rebuildEntries()
+        scheduleRebuild()
         flash(favorite ? "Added \(channel.name) to Favorites" : "Removed \(channel.name) from Favorites")
         if target.serverID.hasPrefix("xt:") {
             var local = Set(Self.loadList(Self.localFavoritesKey))
@@ -2349,8 +2597,8 @@ final class LiveTVStore: ObservableObject {
         }
         loadedSignature = currentSignature
         channelsLoadedAt = Date()
-        let annotated = Self.annotated(demo)
-        apply(channels: annotated, catalog: ChannelCatalog.build(annotated))
+        let annotated = LiveTVWork.annotated(demo)
+        applyNow(channels: annotated, catalog: ChannelCatalog.build(annotated))
         programs = [:]
         serverPrograms = [:]
         guideState = Dictionary(uniqueKeysWithValues: demo.map { ($0.id, GuideState.loaded) })
@@ -2431,7 +2679,7 @@ final class LiveTVStore: ObservableObject {
         channelsLoadedAt = Date()
         guideLoadedAt = Date()
         guideWindowStart = Self.windowStart()
-        let annotated = Self.annotated(demo)
+        let annotated = LiveTVWork.annotated(demo)
         let catalog = ChannelCatalog.build(annotated)
         serverPrograms = demoPrograms
         programs = demoPrograms
@@ -2446,12 +2694,12 @@ final class LiveTVStore: ObservableObject {
         } else {
             prefs = LineupPrefs()
         }
-        apply(channels: annotated, catalog: catalog)
+        applyNow(channels: annotated, catalog: catalog)
         if configureLineup {
             prefs.suggested = Set(entryInfo.values.filter {
                 LineupEngine.suggests($0, prefs: prefs, hasGuide: entryHasGuide($0.id), name: $0.name)
             }.map(\.id))
-            rebuildEntries()
+            rebuildEntriesNow()
         }
         state = .loaded
     }
@@ -2484,8 +2732,8 @@ final class LiveTVStore: ObservableObject {
         }
         loadedSignature = currentSignature
         channelsLoadedAt = Date()
-        let annotated = Self.annotated(demo)
-        apply(channels: annotated, catalog: ChannelCatalog.build(annotated))
+        let annotated = LiveTVWork.annotated(demo)
+        applyNow(channels: annotated, catalog: ChannelCatalog.build(annotated))
         programs = [:]
         serverPrograms = [:]
         guideState = Dictionary(uniqueKeysWithValues: demo.map { ($0.id, GuideState.loaded) })

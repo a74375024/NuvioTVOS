@@ -255,6 +255,65 @@ struct LiveTVViewPicker: View {
     }
 }
 
+/// The guide's genre filter: kinds of channel (from the channel catalog,
+/// so it works with or without guide data) and what's on now (from guide
+/// tags, with the channel's kind standing in for untagged programs).
+struct LiveTVGenrePicker: View {
+    let current: LiveGenre?
+    let counts: (channels: [LineupCategory: Int], now: [LiveNowGenre: Int])
+    let onPick: (LiveGenre?) -> Void
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section {
+                    Button {
+                        onPick(nil)
+                    } label: {
+                        HStack(spacing: 16) {
+                            Image(systemName: "line.3.horizontal.decrease.circle").foregroundColor(.secondary).frame(width: 34)
+                            Text(L10n.string("live_genre_any", fallback: "Everything"))
+                            Spacer()
+                            if current == nil { Image(systemName: "checkmark") }
+                        }
+                    }
+                }
+                Section {
+                    ForEach(LiveNowGenre.allCases) { kind in
+                        row(.onNow(kind), symbol: kind.symbol, count: counts.now[kind] ?? 0)
+                    }
+                } header: {
+                    Text(L10n.string("live_genre_now", fallback: "On now"))
+                } footer: {
+                    Text(L10n.string("live_genre_now_hint", fallback: "What's airing now or in the next half hour, from the guide. Channels without guide data count by their kind (ESPN for sports, CNN for news)."))
+                }
+                Section {
+                    ForEach(LineupCategory.allCases.filter { (counts.channels[$0] ?? 0) > 0 }) { category in
+                        row(.channels(category), symbol: category.genreSymbol, count: counts.channels[category] ?? 0)
+                    }
+                } header: {
+                    Text(L10n.string("live_genre_channels", fallback: "Channels"))
+                }
+            }
+            .navigationTitle(L10n.string("live_genre_title", fallback: "Genre"))
+        }
+    }
+
+    private func row(_ genre: LiveGenre, symbol: String, count: Int) -> some View {
+        Button {
+            onPick(genre)
+        } label: {
+            HStack(spacing: 16) {
+                Image(systemName: symbol).foregroundColor(.secondary).frame(width: 34)
+                Text(genre.title)
+                Spacer()
+                Text("\(count)").foregroundColor(.secondary).monospacedDigit()
+                if current == genre { Image(systemName: "checkmark") }
+            }
+        }
+    }
+}
+
 /// Where guide listings come from: the server, plus free outside listings
 /// matched to channels the server has no (or a thin) guide for.
 struct LiveTVGuideSourcesView: View {

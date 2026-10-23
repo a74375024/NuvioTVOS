@@ -354,11 +354,8 @@ final class XMLTVReader: NSObject, XMLParserDelegate {
         case "programme":
             if let id = programmeChannel, let title {
                 let joined = categories.joined(separator: " ")
-                var f = flags
-                if joined.contains("movie") || joined.contains("film") { f |= 1 }
-                if joined.contains("sport") { f |= 2 }
-                if joined.contains("news") { f |= 4 }
-                if joined.contains("kids") || joined.contains("children") || joined.contains("animation") { f |= 8 }
+                var f = flags | ProgramGenre.flags(categories: joined)
+                if f & ProgramGenre.genreBits == 0 { f |= ProgramGenre.flags(title: title, episode: subtitle) }
                 found[id, default: []].append(OutsideGuide.RawProgram(
                     s: programmeStart, m: max(1, programmeEnd - programmeStart),
                     t: title, st: subtitle, d: desc, f: f

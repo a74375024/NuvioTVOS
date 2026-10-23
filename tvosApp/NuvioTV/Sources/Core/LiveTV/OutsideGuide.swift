@@ -210,7 +210,8 @@ enum OutsideGuide {
                 imageURL: nil
             )
             program.fromOutsideGuide = outside
-            return program
+            // Listings saved before titles were read for genres.
+            return item.f & ProgramGenre.genreBits == 0 ? ProgramGenre.withTitleFlags(program) : program
         }
     }
 
