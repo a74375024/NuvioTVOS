@@ -25,7 +25,7 @@ enum ScreenTour {
         switch parts.first?.lowercased() {
         case "channels": return .tab(.channels)
         case "calendar": return .tab(.calendar)
-        case "live", "live-demo", "live-demo-search", "live-demo-groups", "live-demo-sources", "live-demo-outside", "live-demo-events", "live-demo-all", "live-demo-setup", "live-demo-provider": return .tab(.live)
+        case "live", "live-demo", "live-demo-search", "live-demo-groups", "live-demo-sources", "live-demo-outside", "live-demo-events", "live-demo-all", "live-demo-setup", "live-demo-provider", "live-demo-preview": return .tab(.live)
         case "library": return .tab(.library)
         case "search": return .tab(.search)
         case "settings": return .tab(.settings)

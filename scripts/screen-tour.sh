@@ -43,6 +43,7 @@ shots=(
   "06-live-tv-empty|live|12"
   "07-live-tv-lineup|live-demo|12"
   "07a-live-tv-all-hidden|live-demo-all|12"
+  "07i-live-tv-preview|live-demo-preview|22"
   "07f-live-tv-events|live-demo-events|12"
   "07g-live-tv-setup|live-demo-setup|25"
   "07b-live-tv-search|live-demo-search|14"

@@ -5725,7 +5725,18 @@ class PlayerViewModel: ObservableObject {
     }
 
     var canShowSourcesPanel: Bool {
-        fetchPlaybackSources != nil && !isStandalonePlaybackSession
+        if isLiveTVFeedSession {
+            // Live TV lists the channel's versions (when it has more than one).
+            return !isStandalonePlaybackSession && watchPartyPlayerBridge == nil
+                && LiveTVStore.shared.playingFeedCount > 1
+        }
+        return fetchPlaybackSources != nil && !isStandalonePlaybackSession
+    }
+
+    /// A Live TV channel: its Sources panel lists the channel's versions
+    /// (from LiveTVStore), and picking one switches feed in place.
+    private var isLiveTVFeedSession: Bool {
+        activeMeta?.id.hasPrefix("live:") == true
     }
 
     var panelEpisodes: [NuvioVideo] {
@@ -5782,6 +5793,12 @@ class PlayerViewModel: ObservableObject {
     }
 
     func loadSourcesIfNeeded(force: Bool = false) {
+        if isLiveTVFeedSession {
+            // Always current: the versions change with every channel / switch.
+            cancelSourcesFetch()
+            availableSources = LiveTVStore.shared.playingFeedSources()
+            return
+        }
         guard let fetchPlaybackSources,
               let contentId = panelSourceContentId else { return }
         guard force || availableSources.isEmpty, !isLoadingSources else { return }
@@ -5815,6 +5832,9 @@ class PlayerViewModel: ObservableObject {
     }
 
     func isCurrentSource(_ stream: NuvioStream) -> Bool {
+        if isLiveTVFeedSession {
+            return stream.url != nil && stream.url == LiveTVStore.shared.playingFeedToken
+        }
         if let activeSourceID, !activeSourceID.isEmpty { return stream.id == activeSourceID }
         guard let active = activeStreamURL else { return false }
         if let url = stream.directURL, !url.isEmpty {
@@ -5829,6 +5849,15 @@ class PlayerViewModel: ObservableObject {
             return
         }
         PlaybackTimelineRecorder.record(.sourceSelectionRequested, engine: activeEngineKind)
+        if isLiveTVFeedSession {
+            // Live TV switches the feed itself (one stream at a time, Emby
+            // closed before the next opens) and swaps it into this player.
+            closeSidePanel()
+            if let token = stream.url, !isCurrentSource(stream) {
+                LiveTVStore.shared.switchToFeed(token: token)
+            }
+            return
+        }
         if let unavailableReason = stream.unavailabilityReason {
             showPlayerToast(unavailableReason)
             return

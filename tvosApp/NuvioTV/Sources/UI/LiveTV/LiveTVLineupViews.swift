@@ -13,6 +13,7 @@ struct LiveTVOptionsView: View {
     @State private var showLog = false
     @State private var showCountries = false
     @State private var preferTS = LiveTVStore.xtreamPrefersTS
+    @State private var guidePreview = LiveTVStore.guidePreviewEnabled
 
     var body: some View {
         NavigationStack {
@@ -58,8 +59,19 @@ struct LiveTVOptionsView: View {
                 } header: {
                     Text(L10n.string("live_guide", fallback: "Guide"))
                 }
-                if !XtreamStore.shared.accounts.isEmpty {
-                    Section {
+                Section {
+                    Toggle(isOn: $guidePreview) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(L10n.string("live_guide_preview", fallback: "Preview channels in the guide"))
+                            Text(L10n.string("live_guide_preview_detail", fallback: "Rest on a channel and it plays, with sound, in the top corner. Uses your one stream: it closes before any channel starts."))
+                                .font(.system(size: 20)).foregroundColor(.secondary)
+                        }
+                    }
+                    .onChange(of: guidePreview) { _, value in
+                        LiveTVStore.guidePreviewEnabled = value
+                        if !value { store.stopPreview() }
+                    }
+                    if !XtreamStore.shared.accounts.isEmpty {
                         Toggle(isOn: $preferTS) {
                             VStack(alignment: .leading, spacing: 4) {
                                 Text(L10n.string("live_xtream_ts", fallback: "Xtream: use MPEG-TS instead of HLS"))
@@ -68,9 +80,9 @@ struct LiveTVOptionsView: View {
                             }
                         }
                         .onChange(of: preferTS) { _, value in LiveTVStore.xtreamPrefersTS = value }
-                    } header: {
-                        Text(L10n.string("live_playback", fallback: "Playback"))
                     }
+                } header: {
+                    Text(L10n.string("live_playback", fallback: "Playback"))
                 }
             }
             .navigationTitle(L10n.string("live_options", fallback: "Options"))

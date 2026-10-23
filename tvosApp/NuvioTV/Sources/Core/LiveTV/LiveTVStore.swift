@@ -191,6 +191,22 @@ final class LiveTVStore: ObservableObject {
     private var announceBackup = false
     /// Small note over the player while recovering ("Reconnecting…").
     @Published private(set) var playbackNote: String?
+    /// The feed the viewer picked from the player's Sources panel: recovery
+    /// sticks with it (reconnects) and only leaves it once it's dead.
+    private var manualFeedID: String?
+
+    // Guide preview (see "Guide preview" below).
+    /// Entry shown in the guide's corner preview (being opened or playing).
+    @Published private(set) var previewChannelID: String?
+    let previewPlayer = LiveTVPreviewPlayer()
+    private var previewGeneration = 0
+    private var previewTask: Task<Void, Never>?
+    /// The version the preview plays, once it's chosen.
+    private var previewFeed: LiveTVChannel?
+    /// The Emby stream opened for the preview (also in `openStreams`), handed
+    /// to the player when that channel is picked.
+    private var previewStream: LiveTVStream?
+    private var lastPreviewOpen = Date.distantPast
 
     // MARK: Servers
 
@@ -1633,9 +1649,28 @@ final class LiveTVStore: ObservableObject {
         tuneGeneration &+= 1
         let generation = tuneGeneration
         let replacing = inPlace && playerOnScreen
+        // A channel starting takes the one stream slot from the guide preview.
+        // Picking the previewed channel keeps the Emby stream the preview
+        // opened (no second open on the server); an Xtream preview is closed
+        // a moment before the channel connects, so the provider sees it go.
+        var handoff: LiveTVStream?
+        var settle = delay
+        if !replacing, previewChannelID != nil || previewPlayer.isActive {
+            if let feed = previewFeed, list.indices.contains(startIndex), list[startIndex].id == feed.id,
+               let stream = previewStream {
+                handoff = stream
+                previewStream = nil
+            } else if previewFeed?.serverID.hasPrefix("xt:") == true, previewPlayer.isActive {
+                settle = max(settle, 1)
+            }
+            stopPreview()
+        }
+        let settleDelay = settle
+        let handed = handoff
         watching = display
         if !replacing {
             // A new channel: new log session and a fresh recovery budget.
+            manualFeedID = nil
             session = LiveTVPlaybackLog.shared.newSession()
             recoveries = []
             reconnectsOnFeed = 0
@@ -1661,8 +1696,15 @@ final class LiveTVStore: ObservableObject {
             guard let self else { return }
             // Let a burst of channel flips settle on the last one (plus any
             // requested pause before a retry).
-            try? await Task.sleep(nanoseconds: 350_000_000 + delay * 1_000_000_000)
+            try? await Task.sleep(nanoseconds: 350_000_000 + settleDelay * 1_000_000_000)
             guard generation == self.tuneGeneration else { return }
+            if let handoff = handed, list.indices.contains(startIndex),
+               self.openStreams.contains(where: { $0.stream.url == handoff.url }) {
+                self.log("from preview", list[startIndex], detail: "kept the stream the guide preview opened")
+                self.startFeed(display: display, feed: list[startIndex], url: handoff.url, index: startIndex, of: list.count,
+                               followFeed: followFeed, replacing: replacing, generation: generation)
+                return
+            }
             await self.closeAllStreams()
             var index = startIndex
             var lastError = "This channel couldn't be opened right now."
@@ -1906,7 +1948,9 @@ final class LiveTVStore: ObservableObject {
         if played > 120 { reconnectsOnFeed = 0 }
         // Xtream links are cheap to reopen and usually come straight back.
         let isXtream = feed.serverID.hasPrefix("xt:")
-        let allowance = (isXtream ? 2 : 1) + (played > 60 ? 1 : 0)
+        // A feed picked in the Sources panel gets more reconnects before
+        // anything else is tried.
+        let allowance = (isXtream ? 2 : 1) + (played > 60 ? 1 : 0) + (manualFeedID == feed.id ? 2 : 0)
         if reconnectsOnFeed < allowance {
             guard allowRecovery() else {
                 giveUp(display, message: "This channel keeps dropping. Try another version from Choose Feed, or try again later.")
@@ -1938,6 +1982,10 @@ final class LiveTVStore: ObservableObject {
         reconnectsOnFeed = 0
         announceBackup = surfStep == 0
         playbackNote = surfStep != 0 ? "Skipping to the next feed…" : "Switching to a backup feed…"
+        if candidateIndex < candidates.count, manualFeedID == candidates[candidateIndex].id {
+            manualFeedID = nil
+            playbackNote = "The feed you picked stopped working. Trying another…"
+        }
         log("switch", candidates[next], detail: "to version \(next + 1) of \(candidates.count); \(reason)")
         tune(display, candidates: candidates, from: next, followFeed: surfStep != 0, inPlace: true, reason: reason)
     }
@@ -1999,6 +2047,9 @@ final class LiveTVStore: ObservableObject {
 
     /// Leaving the player or the tuning card.
     func stopWatching() {
+        // The provider may take a moment to let go of the stream: the guide
+        // preview waits at least `previewMinGap` before opening another.
+        lastPreviewOpen = Date()
         if isWatching {
             let watched = feedFirstFrameAt.map { "watched \(Int(Date().timeIntervalSince($0)))s" } ?? "before a picture"
             log("stop", detail: watched)
@@ -2039,12 +2090,177 @@ final class LiveTVStore: ObservableObject {
     }
 
     private func appDidEnterBackground() {
+        stopPreview()
         // Don't keep a server stream (and the provider's single slot) busy
         // while the app is in the background, unless it's playing in PiP.
         guard isWatching || !openStreams.isEmpty,
               !PictureInPictureManager.shared.isPictureInPictureActive else { return }
         leavePlayer?()
         stopWatching()
+    }
+
+    // MARK: Sources panel (player)
+
+    /// Marks a Live TV feed in the player's Sources panel. Never a real link:
+    /// Xtream links carry the password, and Emby links only exist once open.
+    nonisolated static let feedScheme = "nuvio-livefeed"
+
+    /// Every version of what's playing, for the player's Sources panel (none
+    /// while surfing an event family, whose feeds are different events).
+    func playingFeedSources() -> [NuvioStream] {
+        guard isWatching, surfStep == 0, candidates.count > 1 else { return [] }
+        return candidates.map { feed in
+            var parts: [String] = []
+            if let trait = traits[feed.id] {
+                let label = ["", "720p", "1080p", "4K"][max(0, min(3, trait.quality))]
+                if !label.isEmpty { parts.append(label) }
+                if trait.isWest { parts.append("West feed") }
+            }
+            if let group = feed.group { parts.append(group) }
+            if feed.id == pinnedFeeds[watching?.id ?? ""] { parts.append("Always starts first") }
+            return NuvioStream(
+                url: Self.feedToken(feed.id), name: feed.name,
+                description: parts.joined(separator: " · "),
+                addonName: providerName(for: feed.serverID) ?? (feed.serverID.hasPrefix("xt:") ? "Xtream" : "Emby")
+            )
+        }
+    }
+
+    /// How many versions the Sources panel would list (0 when it has none).
+    var playingFeedCount: Int {
+        guard isWatching, surfStep == 0, candidates.count > 1 else { return 0 }
+        return candidates.count
+    }
+
+    nonisolated static func feedToken(_ feedID: String) -> String {
+        "\(feedScheme)://" + (feedID.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? feedID)
+    }
+
+    /// The Sources-panel token of the version playing now.
+    var playingFeedToken: String? {
+        guard isWatching, candidateIndex < candidates.count else { return nil }
+        return Self.feedToken(candidates[candidateIndex].id)
+    }
+
+    /// The viewer picked a version in the Sources panel: switch to it in the
+    /// open player. Recovery then sticks with it (reconnects first) and only
+    /// leaves it if it stops working altogether.
+    func switchToFeed(token: String) {
+        guard let display = watching,
+              let index = candidates.firstIndex(where: { Self.feedToken($0.id) == token }) else { return }
+        if index == candidateIndex, sawFirstFrame { return }
+        let feed = candidates[index]
+        manualFeedID = feed.id
+        reconnectsOnFeed = 0
+        startupRetries[feed.id] = 0
+        announceBackup = false
+        playbackNote = "Switching…"
+        log("you picked", feed, detail: "version \(index + 1) of \(candidates.count)")
+        tune(display, candidates: candidates, from: index, followFeed: false, inPlace: true, reason: "picked in Sources")
+    }
+
+    // MARK: Guide preview
+    //
+    // The guide's corner preview plays a channel's first version (the one
+    // Watch would start with), with sound, once focus has rested on it: 2 s
+    // for Xtream, 3 s for Emby (slower to open, and it ties up a tuner).
+    // It shares the one stream slot with watching: Emby opens and closes go
+    // through the same one-at-a-time queue, so the app never holds two server
+    // streams; a preview is closed before any channel starts, and picking the
+    // previewed channel hands its open Emby stream to the player. Opens are
+    // at least `previewMinGap` apart, a failed preview is never retried, and
+    // nothing previews while a channel, Multiview or the background is up.
+
+    private static let previewKey = "nuvio.tv.livetv.guidePreview"
+    private static let previewMinGap: TimeInterval = 3
+    /// The screenshot tour has no real streams: Apple's public HLS sample.
+    private static let previewDemoURL = URL(string: "https://devstreaming-cdn.apple.com/videos/streaming/examples/bipbop_16x9/bipbop_16x9_variant.m3u8")
+
+    static var guidePreviewEnabled: Bool {
+        get { UserDefaults.standard.object(forKey: previewKey) as? Bool ?? true }
+        set { UserDefaults.standard.set(newValue, forKey: previewKey) }
+    }
+
+    /// From the guide: preview this channel after a pause, or stop (nil).
+    func requestPreview(_ channel: LiveTVChannel?) {
+        guard let channel, Self.guidePreviewEnabled, !isWatching, overlay == nil,
+              !MultiviewStore.shared.isPresented,
+              UIApplication.shared.applicationState == .active else {
+            stopPreview()
+            return
+        }
+        guard previewChannelID != channel.id else { return }
+        stopPreview()
+        previewGeneration &+= 1
+        let generation = previewGeneration
+        previewChannelID = channel.id
+        let demo = ScreenTour.isActive && !hasServers
+        guard let feed = demo ? channel : versions(of: channel).first else { return }
+        let isXtream = demo || feed.serverID.hasPrefix("xt:")
+        previewTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: isXtream ? 2_000_000_000 : 3_000_000_000)
+            guard let self, !Task.isCancelled, generation == self.previewGeneration else { return }
+            let gap = Self.previewMinGap - Date().timeIntervalSince(self.lastPreviewOpen)
+            if gap > 0 { try? await Task.sleep(nanoseconds: UInt64(gap * 1_000_000_000)) }
+            guard !Task.isCancelled, generation == self.previewGeneration, !self.isWatching else { return }
+            self.enqueueStreamWork { [weak self] in
+                guard let self, generation == self.previewGeneration, !self.isWatching else { return }
+                await self.openPreview(feed, demo: demo, generation: generation)
+            }
+        }
+    }
+
+    /// Runs inside the stream queue.
+    private func openPreview(_ feed: LiveTVChannel, demo: Bool, generation: Int) async {
+        lastPreviewOpen = Date()
+        if demo {
+            guard let url = Self.previewDemoURL else { return }
+            previewFeed = feed
+            previewPlayer.play(url: url)
+            return
+        }
+        if feed.serverID.hasPrefix("xt:") {
+            guard let xtream = xtreamClient(for: feed.serverID),
+                  let url = xtream.streamURL(streamID: feed.itemID, formats: xtreamFormats[feed.serverID] ?? [],
+                                             preferTS: Self.xtreamPrefersTS) else { return }
+            previewFeed = feed
+            previewPlayer.play(url: url)
+            return
+        }
+        guard let client = client(for: feed.serverID) else { return }
+        await closeAllStreams()
+        guard generation == previewGeneration, !isWatching else { return }
+        do {
+            // Not cancellable, like any Emby open: its id is needed to close it.
+            let stream = try await client.openStream(channelItemID: feed.itemID)
+            openStreams.append((stream, feed.serverID))
+            guard generation == previewGeneration, !isWatching else {
+                await closeAllStreams()
+                return
+            }
+            previewFeed = feed
+            previewStream = stream
+            previewPlayer.play(url: stream.url)
+            await client.reportPlaying(stream)
+        } catch {
+            // Not retried: a preview never opens more than it has to.
+        }
+    }
+
+    /// Stops the preview now; its Emby stream (if any) is closed in turn.
+    func stopPreview() {
+        previewGeneration &+= 1
+        previewTask?.cancel()
+        previewTask = nil
+        if previewChannelID != nil { previewChannelID = nil }
+        previewFeed = nil
+        previewPlayer.stop()
+        if previewStream != nil {
+            previewStream = nil
+            enqueueStreamWork { [weak self] in
+                await self?.closeAllStreams()
+            }
+        }
     }
 
     func meta(for channel: LiveTVChannel, now: LiveTVProgram?) -> NuvioMeta {

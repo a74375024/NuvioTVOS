@@ -1,4 +1,5 @@
 import SwiftUI
+import AetherEngine
 
 enum LiveGuideMetrics {
     static let sideInset: CGFloat = 60
@@ -7,6 +8,7 @@ enum LiveGuideMetrics {
     static let rowSpacing: CGFloat = 10
     static let cellGap: CGFloat = 8
     static let heroHeight: CGFloat = 300
+    static let previewWidth: CGFloat = 416
     static let windowMinutes = 180
 }
 
@@ -73,6 +75,8 @@ struct LiveFeedPicker: Identifiable {
 struct LiveTVGuideView: View {
     @ObservedObject private var store = LiveTVStore.shared
     @ObservedObject private var multiview = MultiviewStore.shared
+    @ObservedObject private var preview = LiveTVStore.shared.previewPlayer
+    @Environment(\.scenePhase) private var scenePhase
     @AppStorage(SettingsKey.amoled) private var amoled = false
     @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
     @AppStorage("nuvio.tv.livetv.setupOffered") private var setupOffered = false
@@ -129,6 +133,12 @@ struct LiveTVGuideView: View {
             now = Date()
             store.loadIfNeeded()
             runScreenTourHooks()
+        }
+        .onChange(of: previewTarget, initial: true) { _, target in
+            store.requestPreview(target.isEmpty ? nil : (store.entry(id: target) ?? focusedChannel))
+        }
+        .onDisappear {
+            store.requestPreview(nil)
         }
         .onReceive(ticker) { date in
             now = date
@@ -385,6 +395,21 @@ struct LiveTVGuideView: View {
     }
 
     private var hero: some View {
+        HStack(alignment: .top, spacing: 30) {
+            heroInfo
+                .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
+                .layoutPriority(-1)
+            VStack(alignment: .trailing, spacing: 8) {
+                Text(ChannelsView.clockFormatter.string(from: now))
+                    .font(.system(size: 26, weight: .semibold).monospacedDigit())
+                    .foregroundColor(.white.opacity(0.7))
+                previewWindow
+            }
+            .padding(.top, 26)
+        }
+    }
+
+    private var heroInfo: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 14) {
                 Text(currentView.title)
@@ -408,10 +433,7 @@ struct LiveTVGuideView: View {
                 } else if case .failed(let message) = store.outsideStatus, ScreenTour.isActive {
                     Text(message).font(.system(size: 16)).foregroundColor(.red.opacity(0.8)).lineLimit(2)
                 }
-                Spacer()
-                Text(ChannelsView.clockFormatter.string(from: now))
-                    .font(.system(size: 26, weight: .semibold).monospacedDigit())
-                    .foregroundColor(.white.opacity(0.7))
+                Spacer(minLength: 0)
             }
             if let channel = heroChannel {
                 HStack(spacing: 12) {
@@ -482,6 +504,62 @@ struct LiveTVGuideView: View {
             Spacer(minLength: 0)
         }
         .padding(.top, 26)
+    }
+
+    // MARK: Preview window
+
+    /// The guide's corner preview: the focused channel's logo, then (after
+    /// focus rests on it) its live picture with sound. LiveTVStore owns the
+    /// stream; see "Guide preview" there.
+    private var previewWindow: some View {
+        let width = LiveGuideMetrics.previewWidth
+        let height = width * 9 / 16
+        let channel = heroChannel
+        let isThisChannel = channel != nil && store.previewChannelID == channel?.id
+        let showsVideo = isThisChannel && preview.hasPicture
+        return ZStack {
+            Color.black
+            logo(channel, size: 70)
+                .opacity(showsVideo ? 0 : 0.9)
+            if isThisChannel, let engine = preview.engine {
+                MultiviewEngineSurface(engine: engine)
+                    .id(ObjectIdentifier(engine))
+                    .opacity(showsVideo ? 1 : 0)
+            }
+            VStack {
+                HStack(spacing: 8) {
+                    if showsVideo {
+                        Text(L10n.string("live_preview_badge", fallback: "LIVE"))
+                            .font(.system(size: 14, weight: .heavy))
+                            .tracking(0.8)
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 3)
+                            .background(RoundedRectangle(cornerRadius: 5).fill(Color(red: 1, green: 0.3, blue: 0.3)))
+                    } else if isThisChannel, preview.isActive, !preview.failed {
+                        ProgressView().tint(.white).scaleEffect(0.6)
+                    }
+                    Spacer()
+                }
+                Spacer()
+            }
+            .padding(10)
+        }
+        .frame(width: width, height: height)
+        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).strokeBorder(Color.white.opacity(0.15), lineWidth: 1))
+        .animation(.easeInOut(duration: 0.3), value: showsVideo)
+        .allowsHitTesting(false)
+    }
+
+    /// What the preview should follow: the focused channel while focus is in
+    /// the grid and nothing covers the guide; "" means no preview.
+    private var previewTarget: String {
+        if ScreenTour.requested == "live-demo-preview" { return rows.first?.channel.id ?? "" }
+        guard focusedCell != nil, let channel = focusedChannel, !showingEvents, !showSearch, !showSetup,
+              !showOptions, !showViewPicker, feedPicker == nil, !store.isWatching, store.overlay == nil,
+              !multiview.isPresented, scenePhase == .active else { return "" }
+        return channel.id
     }
 
     private var eventsHeader: some View {
