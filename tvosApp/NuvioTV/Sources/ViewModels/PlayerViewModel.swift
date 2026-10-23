@@ -364,6 +364,13 @@ class PlayerViewModel: ObservableObject {
         didSet {
             if hasRenderedFirstFrame && !oldValue {
                 PlaybackTimelineRecorder.record(.playbackStarted, engine: activeEngineKind)
+                // Live TV's watchdog waits for this. Posted here, not from one
+                // call site: the engine's first-frame callback usually sets the
+                // flag before the poll loop sees it, and Live TV then never
+                // heard about the picture and swapped a healthy stream at 20s.
+                if let id = activeMeta?.id, id.hasPrefix("live:") {
+                    NotificationCenter.default.post(name: LiveTVStore.firstFrameNotification, object: id)
+                }
             }
         }
     }
@@ -3060,9 +3067,6 @@ class PlayerViewModel: ObservableObject {
         if isPresentingFrames {
             if !hasRenderedFirstFrame {
                 hasRenderedFirstFrame = true
-                if let id = activeMeta?.id, id.hasPrefix("live:") {
-                    NotificationCenter.default.post(name: LiveTVStore.firstFrameNotification, object: id)
-                }
                 if let meta = activeMeta {
                     prewarmSceneIfNeeded(meta: meta, isTrailerPlayback: subtitle == PlaybackMarkers.trailerSubtitle)
                 }
