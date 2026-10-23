@@ -7370,10 +7370,10 @@ private enum PlayerTrackSelectionStore {
 extension PlayerViewModel {
     /// Whether the in-player Multiview button applies: live streams only.
     var canAddToMultiview: Bool {
-        // Emby / Jellyfin Live TV is held to one stream at a time.
-        // Emby / Jellyfin Live TV keeps one stream at a time; Xtream
-        // ("live:xt:") can join Multiview.
-        guard activeMeta?.id.hasPrefix("live:jf:") != true else { return false }
+        // Live TV channels (Emby / Jellyfin "live:jf:" and Xtream "live:xt:")
+        // never join Multiview: providers cap streams per account, and a
+        // second tile would be refused or knock the first one off.
+        guard activeMeta?.id.hasPrefix("live:") != true else { return false }
         return isLiveStream && multiviewChannel != nil
     }
 
