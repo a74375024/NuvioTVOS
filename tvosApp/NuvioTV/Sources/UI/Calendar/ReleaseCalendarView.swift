@@ -1,27 +1,20 @@
 import SwiftUI
 
-private enum CalendarMetrics {
-    static let cardWidth: CGFloat = 400
-    static let cardHeight: CGFloat = 225
-    static let cardGap: CGFloat = 40
-    static let pageInset: CGFloat = 49
+/// An episode the Calendar asks the app to play.
+struct CalendarPlayRequest {
+    let showID: String
+    let showType: String
+    let season: Int
+    let episode: Int
+    let released: String?
 }
 
-/// The time span the calendar is showing.
-enum CalendarRange: String, CaseIterable, Identifiable {
-    case next7
-    case next30
-    case recent
-
-    var id: String { rawValue }
-
-    var title: String {
-        switch self {
-        case .next7: return L10n.string("calendar_range_next7", fallback: "Next 7 Days")
-        case .next30: return L10n.string("calendar_range_next30", fallback: "Next 30 Days")
-        case .recent: return L10n.string("calendar_range_recent", fallback: "Recently Aired")
-        }
-    }
+private enum CalendarMetrics {
+    static let panelHeight: CGFloat = 320
+    static let cardWidth: CGFloat = 384
+    static let cardHeight: CGFloat = 216
+    static let cardGap: CGFloat = 36
+    static let backdropWidth: CGFloat = 1240
 }
 
 /// Which shows feed the calendar.
@@ -38,12 +31,6 @@ enum CalendarShowFilter: String, CaseIterable {
         }
     }
 
-    var next: CalendarShowFilter {
-        let all = Self.allCases
-        let index = all.firstIndex(of: self) ?? 0
-        return all[(index + 1) % all.count]
-    }
-
     func includes(_ event: CalendarEvent) -> Bool {
         switch self {
         case .all: return true
@@ -53,47 +40,95 @@ enum CalendarShowFilter: String, CaseIterable {
     }
 }
 
-private struct CalendarSection: Identifiable {
-    let id: String
-    let title: String
-    let subtitle: String?
-    let events: [CalendarEvent]
-    /// Week rows label each card with its day; day rows don't need to.
-    let showsDayOnCards: Bool
+/// A show with new episodes to watch: one card per show, however many
+/// episodes came out.
+private struct NewShowItem: Identifiable {
+    let showID: String
+    let showType: String
+    let showName: String
+    /// The event holding the next unwatched new episode (artwork, synopsis).
+    let event: CalendarEvent
+    /// The next unwatched new episode, and the newest one.
+    let season: Int
+    let episode: Int
+    let lastSeason: Int
+    let lastEpisode: Int
+    let newCount: Int
+    let latestDay: Date
+    /// How far into the next episode the viewer got (0…1), if they started it.
+    let progress: Double?
+
+    var id: String { "n|" + showID }
+    var availabilityKey: String {
+        ReleaseCalendarStore.availabilityKey(showID: showID, season: season, episode: episode)
+    }
 }
 
-/// Release calendar for TV shows in the Library and shows being watched.
+private struct UpcomingSection: Identifiable {
+    let id: String
+    let title: String
+    let subtitle: String
+    let events: [CalendarEvent]
+}
+
+private struct CalendarModel {
+    var newItems: [NewShowItem] = []
+    var sections: [UpcomingSection] = []
+
+    var firstCardID: String? { newItems.first?.id ?? sections.first?.events.first.map { "u|" + $0.id } }
+}
+
+/// Release calendar for the TV shows in the Library and shows being watched:
+/// what's new to watch now (one card per show, Select plays the next new
+/// episode), then what's coming this week, next week and later this month.
+/// A panel at the top describes whichever card has focus.
 struct ReleaseCalendarView: View {
     @ObservedObject private var store = ReleaseCalendarStore.shared
     /// Library entries from the selected library source (Trakt, Simkl, …).
     let libraryItems: [StremioMeta]
     let onOpenShow: (String, String) -> Void
+    let onPlayEpisode: (CalendarPlayRequest) -> Void
 
     @AppStorage(SettingsKey.amoled) private var amoled = false
     @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
-    @AppStorage("nuvio.tv.calendar.range") private var rangeRaw = CalendarRange.next7.rawValue
     @AppStorage("nuvio.tv.calendar.filter") private var filterRaw = CalendarShowFilter.all.rawValue
-    /// Bumped when watched state changes so "new" badges refresh.
+    /// Bumped when watched state changes so "new" counts refresh.
     @State private var watchedRevision = 0
+    @State private var now = Date()
+    @FocusState private var focusedCard: String?
+    /// The card the panel describes (the last one focused).
+    @State private var panelCardID: String?
 
-    private var range: CalendarRange { CalendarRange(rawValue: rangeRaw) ?? .next7 }
+    private let ticker = Timer.publish(every: 60, on: .main, in: .common).autoconnect()
+
     private var filter: CalendarShowFilter { CalendarShowFilter(rawValue: filterRaw) ?? .all }
 
     var body: some View {
-        ZStack(alignment: .top) {
+        let model = makeModel()
+        let focus = panelFocus(in: model)
+        ZStack(alignment: .topLeading) {
             Color.nuvioBackground(amoled: amoled, body: bodyColor).ignoresSafeArea()
-
-            ScrollView(.vertical, showsIndicators: false) {
-                VStack(alignment: .leading, spacing: 44) {
-                    header
-                    content
-                }
-                .padding(.horizontal, CalendarMetrics.pageInset)
-                .padding(.top, 20)
-                .padding(.bottom, 80)
+            backdrop(for: focus)
+            VStack(alignment: .leading, spacing: 0) {
+                header
+                panel(for: focus)
+                    .frame(height: CalendarMetrics.panelHeight, alignment: .topLeading)
+                rows(model)
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .onAppear { refresh(force: false) }
+        .defaultFocus($focusedCard, model.firstCardID)
+        .onAppear {
+            now = Date()
+            refresh(force: false)
+        }
+        .onChange(of: focusedCard) { _, card in
+            if let card { panelCardID = card }
+        }
+        .task(id: model.newItems.prefix(16).map(\.availabilityKey).joined(separator: ",")) {
+            store.checkAvailability(model.newItems.prefix(16).map(\.availabilityKey))
+        }
+        .onReceive(ticker) { now = $0 }
         .onReceive(NotificationCenter.default.publisher(for: WatchedStore.changedNotification)) { _ in
             watchedRevision &+= 1
         }
@@ -112,244 +147,500 @@ struct ReleaseCalendarView: View {
     // MARK: - Header
 
     private var header: some View {
-        VStack(alignment: .leading, spacing: 22) {
-            HStack(alignment: .firstTextBaseline, spacing: 20) {
-                Text(L10n.string("calendar_title", fallback: "Calendar"))
-                    .font(.system(size: 46, weight: .bold))
-                    .foregroundColor(.white)
-                if store.isRefreshing {
-                    ProgressView()
-                        .tint(.white)
-                    Text(L10n.format(
-                        "calendar_checking_shows",
-                        fallback: "Checking %d shows…",
-                        store.showCount
-                    ))
-                    .font(.system(size: 22))
-                    .foregroundColor(.white.opacity(0.6))
-                }
+        HStack(alignment: .center, spacing: 18) {
+            Text(L10n.string("calendar_title", fallback: "Calendar"))
+                .font(.system(size: 38, weight: .bold))
+                .foregroundColor(.white)
+            if store.isRefreshing {
+                ProgressView().tint(.white).scaleEffect(0.7)
+                Text(L10n.format("calendar_checking_shows", fallback: "Checking %d shows…", store.showCount))
+                    .font(.system(size: 20))
+                    .foregroundColor(.white.opacity(0.55))
             }
-
-            HStack(spacing: 16) {
-                ForEach(CalendarRange.allCases) { option in
-                    SourceModeChip(
-                        title: chipTitle(for: option),
-                        isSelected: range == option
-                    ) {
-                        guard range != option else { return }
-                        withAnimation(.easeInOut(duration: 0.2)) { rangeRaw = option.rawValue }
+            Spacer(minLength: 20)
+            HStack(spacing: 12) {
+                ForEach(CalendarShowFilter.allCases, id: \.self) { option in
+                    SourceModeChip(title: option.title, isSelected: filter == option) {
+                        withAnimation(.easeInOut(duration: 0.2)) { filterRaw = option.rawValue }
                     }
-                }
-                Spacer().frame(width: 24)
-                SourceModeChip(title: filter.title, isSelected: false) {
-                    withAnimation(.easeInOut(duration: 0.2)) { filterRaw = filter.next.rawValue }
                 }
             }
             .focusSection()
         }
+        .frame(height: 70)
     }
 
-    private func chipTitle(for option: CalendarRange) -> String {
-        guard option == .recent else { return option.title }
-        let unwatched = unwatchedRecentCount
-        return unwatched > 0 ? "\(option.title) · \(unwatched)" : option.title
-    }
+    // MARK: - Panel (the focused card)
 
-    // MARK: - Content
+    private enum PanelFocus {
+        case new(NewShowItem)
+        case upcoming(CalendarEvent)
 
-    @ViewBuilder
-    private var content: some View {
-        let sections = makeSections()
-        if sections.isEmpty {
-            emptyState
-        } else {
-            ForEach(sections) { section in
-                VStack(alignment: .leading, spacing: 18) {
-                    HStack(alignment: .firstTextBaseline, spacing: 14) {
-                        Text(section.title)
-                            .font(.system(size: 32, weight: .bold))
-                            .foregroundColor(.white)
-                        if let subtitle = section.subtitle {
-                            Text(subtitle)
-                                .font(.system(size: 24, weight: .medium))
-                                .foregroundColor(.white.opacity(0.55))
-                        }
-                    }
-                    ScrollView(.horizontal, showsIndicators: false) {
-                        LazyHStack(alignment: .top, spacing: CalendarMetrics.cardGap) {
-                            ForEach(section.events) { event in
-                                CalendarEventCard(
-                                    event: event,
-                                    showsDay: section.showsDayOnCards,
-                                    isWatched: isWatched(event),
-                                    isRecent: range == .recent
-                                ) {
-                                    onOpenShow(event.showID, event.showType)
-                                }
-                            }
-                        }
-                        // Room for the focus lift so it isn't clipped.
-                        .padding(.vertical, 24)
-                        .padding(.horizontal, 4)
-                    }
-                    .padding(.top, -24)
-                }
-                .focusSection()
+        var imageURL: String? {
+            switch self {
+            case .new(let item): return item.event.imageURL
+            case .upcoming(let event): return event.imageURL
             }
         }
     }
 
+    private func panelFocus(in model: CalendarModel) -> PanelFocus? {
+        let id = panelCardID ?? model.firstCardID
+        if let id, id.hasPrefix("n|"), let item = model.newItems.first(where: { $0.id == id }) { return .new(item) }
+        if let id, id.hasPrefix("u|") {
+            for section in model.sections {
+                if let event = section.events.first(where: { "u|" + $0.id == id }) { return .upcoming(event) }
+            }
+        }
+        if let first = model.newItems.first { return .new(first) }
+        if let event = model.sections.first?.events.first { return .upcoming(event) }
+        return nil
+    }
+
+    /// The focused card's artwork, large and faded into the page, top right.
     @ViewBuilder
-    private var emptyState: some View {
+    private func backdrop(for focus: PanelFocus?) -> some View {
+        if let url = focus?.imageURL {
+            let height = CalendarMetrics.backdropWidth * 9 / 16
+            CachedPosterArtwork(
+                urlString: url,
+                width: CalendarMetrics.backdropWidth,
+                height: height,
+                maximumWidth: CalendarMetrics.backdropWidth
+            ) { Color.clear }
+            .frame(width: CalendarMetrics.backdropWidth, height: height)
+            .clipped()
+            .mask(
+                LinearGradient(colors: [.clear, .black.opacity(0.85), .black], startPoint: .leading, endPoint: .trailing)
+            )
+            .mask(
+                LinearGradient(colors: [.black, .black.opacity(0.6), .clear], startPoint: .top, endPoint: .bottom)
+            )
+            .opacity(0.55)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+            .ignoresSafeArea()
+            .id(url)
+            .transition(.opacity)
+            .animation(.easeInOut(duration: 0.35), value: url)
+            .allowsHitTesting(false)
+        }
+    }
+
+    @ViewBuilder
+    private func panel(for focus: PanelFocus?) -> some View {
+        switch focus {
+        case .new(let item):
+            panelBody(
+                event: item.event, name: item.showName,
+                badges: newBadges(item),
+                episodeLine: episodeLine(season: item.season, episode: item.episode,
+                                         title: item.event.kind == .episode ? item.event.episodeTitle : nil,
+                                         extra: item.newCount > 1 ? "1 of \(item.newCount) new" : nil),
+                statusLine: newStatusLine(item)
+            )
+        case .upcoming(let event):
+            panelBody(
+                event: event, name: event.showName,
+                badges: upcomingBadges(event),
+                episodeLine: event.kind == .seasonDrop
+                    ? "Season \(event.season) · all \(event.episodeCount) episodes"
+                    : episodeLine(season: event.season, episode: event.episode, title: event.episodeTitle, extra: nil),
+                statusLine: upcomingStatusLine(event)
+            )
+        case nil:
+            emptyPanel
+        }
+    }
+
+    private struct Badge: Hashable {
+        let text: String
+        let color: Color
+        let symbol: String?
+    }
+
+    private func panelBody(event: CalendarEvent, name: String, badges: [Badge], episodeLine: String, statusLine: String) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            showTitle(name: name, logo: event.logoURL)
+            if !badges.isEmpty {
+                HStack(spacing: 10) {
+                    ForEach(badges, id: \.self) { badge in
+                        HStack(spacing: 6) {
+                            if let symbol = badge.symbol { Image(systemName: symbol).font(.system(size: 14, weight: .bold)) }
+                            Text(badge.text).font(.system(size: 16, weight: .heavy)).tracking(0.6)
+                        }
+                        .foregroundColor(.black)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 4)
+                        .background(Capsule().fill(badge.color))
+                    }
+                }
+            }
+            Text(episodeLine)
+                .font(.system(size: 28, weight: .semibold))
+                .foregroundColor(.white)
+                .lineLimit(1)
+            Text(statusLine)
+                .font(.system(size: 22, weight: .medium).monospacedDigit())
+                .foregroundColor(.white.opacity(0.7))
+                .lineLimit(1)
+            if let overview = event.overview?.trimmingCharacters(in: .whitespacesAndNewlines), !overview.isEmpty {
+                Text(overview)
+                    .font(.system(size: 21))
+                    .foregroundColor(.white.opacity(0.62))
+                    .lineLimit(2)
+                    .frame(maxWidth: 1000, alignment: .leading)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.top, 6)
+        .animation(.easeInOut(duration: 0.2), value: event.id)
+    }
+
+    @ViewBuilder
+    private func showTitle(name: String, logo: String?) -> some View {
+        if let logo, let url = URL(string: logo) {
+            AsyncImage(url: url) { phase in
+                if let image = phase.image {
+                    image.resizable().scaledToFit()
+                        .frame(maxWidth: 460, maxHeight: 96, alignment: .leading)
+                } else {
+                    titleText(name)
+                }
+            }
+            .frame(height: 96, alignment: .leading)
+        } else {
+            titleText(name)
+        }
+    }
+
+    private func titleText(_ name: String) -> some View {
+        Text(name)
+            .font(.system(size: 52, weight: .bold))
+            .foregroundColor(.white)
+            .lineLimit(1)
+            .minimumScaleFactor(0.7)
+            .frame(maxWidth: 1100, alignment: .leading)
+    }
+
+    @ViewBuilder
+    private var emptyPanel: some View {
         VStack(alignment: .leading, spacing: 14) {
             Image(systemName: "calendar")
-                .font(.system(size: 60))
+                .font(.system(size: 54))
                 .foregroundColor(.white.opacity(0.35))
             if store.isRefreshing && store.events.isEmpty {
                 Text(L10n.string("calendar_loading", fallback: "Looking up release dates…"))
-                    .font(.system(size: 30, weight: .semibold))
-                    .foregroundColor(.white)
+                    .font(.system(size: 34, weight: .semibold)).foregroundColor(.white)
             } else if store.showCount == 0 && store.events.isEmpty {
                 Text(L10n.string("calendar_empty_no_shows", fallback: "No shows to follow yet"))
-                    .font(.system(size: 30, weight: .semibold))
-                    .foregroundColor(.white)
+                    .font(.system(size: 34, weight: .semibold)).foregroundColor(.white)
                 Text(L10n.string(
                     "calendar_empty_no_shows_hint",
                     fallback: "Add TV shows to your Library or start watching one, and new episodes will show up here."
                 ))
-                .font(.system(size: 24))
-                .foregroundColor(.white.opacity(0.6))
+                .font(.system(size: 24)).foregroundColor(.white.opacity(0.6))
             } else {
-                Text(emptyRangeMessage)
-                    .font(.system(size: 30, weight: .semibold))
-                    .foregroundColor(.white)
-                if filter != .all {
-                    Text(L10n.format(
-                        "calendar_empty_filter_hint",
-                        fallback: "Showing %@ only. Switch the filter to see more.",
-                        filter.title
-                    ))
-                    .font(.system(size: 24))
-                    .foregroundColor(.white.opacity(0.6))
+                Text(L10n.string("calendar_empty_all", fallback: "You're all caught up"))
+                    .font(.system(size: 34, weight: .semibold)).foregroundColor(.white)
+                Text(filter == .all
+                     ? L10n.string("calendar_empty_all_hint", fallback: "Nothing new to watch and nothing airing in the next 30 days.")
+                     : L10n.format("calendar_empty_filter_hint", fallback: "Showing %@ only. Switch to All Shows to see more.", filter.title))
+                .font(.system(size: 24)).foregroundColor(.white.opacity(0.6))
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.top, 20)
+    }
+
+    // MARK: - Rows
+
+    private func rows(_ model: CalendarModel) -> some View {
+        ScrollView(.vertical, showsIndicators: false) {
+            LazyVStack(alignment: .leading, spacing: 34) {
+                if !model.newItems.isEmpty {
+                    rowSection(
+                        title: L10n.string("calendar_new_for_you", fallback: "New for You"),
+                        subtitle: newSubtitle(model.newItems)
+                    ) {
+                        ForEach(model.newItems) { item in
+                            NewEpisodeCard(
+                                item: item,
+                                availability: store.availability[item.availabilityKey],
+                                airedLine: airedLine(item.latestDay),
+                                focus: $focusedCard,
+                                onPlay: { play(item) },
+                                onMarkWatched: { markWatched(item, caughtUp: false) },
+                                onMarkCaughtUp: { markWatched(item, caughtUp: true) },
+                                onOpenShow: { onOpenShow(item.showID, item.showType) }
+                            )
+                        }
+                    }
+                } else if !model.sections.isEmpty {
+                    Text(L10n.string("calendar_caught_up", fallback: "You're caught up: no new episodes waiting."))
+                        .font(.system(size: 22, weight: .medium))
+                        .foregroundColor(.white.opacity(0.5))
+                }
+                ForEach(model.sections) { section in
+                    rowSection(title: section.title, subtitle: section.subtitle) {
+                        ForEach(section.events) { event in
+                            UpcomingEpisodeCard(
+                                event: event,
+                                dayLabel: dayLabel(event),
+                                detailLine: upcomingCardLine(event),
+                                focus: $focusedCard,
+                                onOpenShow: { onOpenShow(event.showID, event.showType) }
+                            )
+                        }
+                    }
                 }
             }
+            .padding(.top, 10)
+            .padding(.bottom, 80)
         }
-        .padding(.top, 40)
+        .scrollClipDisabled()
     }
 
-    private var emptyRangeMessage: String {
-        switch range {
-        case .next7: return L10n.string("calendar_empty_next7", fallback: "Nothing airing in the next 7 days")
-        case .next30: return L10n.string("calendar_empty_next30", fallback: "Nothing airing in the next 30 days")
-        case .recent: return L10n.string("calendar_empty_recent", fallback: "Nothing aired in the past week")
+    private func rowSection<Cards: View>(title: String, subtitle: String, @ViewBuilder cards: () -> Cards) -> some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .firstTextBaseline, spacing: 14) {
+                Text(title)
+                    .font(.system(size: 30, weight: .bold))
+                    .foregroundColor(.white)
+                Text(subtitle)
+                    .font(.system(size: 22, weight: .medium))
+                    .foregroundColor(.white.opacity(0.5))
+            }
+            ScrollView(.horizontal, showsIndicators: false) {
+                LazyHStack(alignment: .top, spacing: CalendarMetrics.cardGap) {
+                    cards()
+                }
+                .padding(.vertical, 18)
+            }
+            .scrollClipDisabled()
+            .padding(.top, -18)
+        }
+        .focusSection()
+    }
+
+    // MARK: - Actions
+
+    private func play(_ item: NewShowItem) {
+        onPlayEpisode(CalendarPlayRequest(
+            showID: item.showID, showType: item.showType, season: item.season, episode: item.episode,
+            released: item.event.released
+        ))
+    }
+
+    /// Marks the next new episode watched, or (caught up) everything up to
+    /// the newest one, the same way the show page does.
+    private func markWatched(_ item: NewShowItem, caughtUp: Bool) {
+        Task { @MainActor in
+            guard let meta = await store.meta(for: item.showID, type: item.showType) else { return }
+            if caughtUp {
+                _ = WatchedStore.markWatchedUpTo(meta: meta, season: item.lastSeason, episode: item.lastEpisode)
+            } else if !WatchedStore.containsEpisode(metaId: item.showID, season: item.season, episode: item.episode) {
+                _ = WatchedStore.toggleEpisode(meta: meta, season: item.season, episode: item.episode)
+            }
         }
     }
 
-    // MARK: - Grouping
+    // MARK: - Model
 
-    private var today: Date { Calendar.current.startOfDay(for: Date()) }
-
-    private var filteredEvents: [CalendarEvent] {
-        store.events.filter { filter.includes($0) }
+    private struct Pending {
+        let event: CalendarEvent
+        let season: Int
+        let episode: Int
     }
 
-    private var recentEvents: [CalendarEvent] {
-        let start = Calendar.current.date(byAdding: .day, value: -ReleaseCalendarStore.pastDays, to: today) ?? today
-        let now = Date()
-        return filteredEvents.filter { event in
-            if event.day >= start && event.day < today { return true }
-            // Aired earlier today.
-            if event.day == today, let time = event.airTime, time <= now { return true }
-            return false
-        }
-    }
-
-    private var unwatchedRecentCount: Int {
-        _ = watchedRevision
-        return recentEvents.filter { !isWatched($0) }.count
-    }
-
-    private func makeSections() -> [CalendarSection] {
+    private func makeModel() -> CalendarModel {
         _ = watchedRevision
         let calendar = Calendar.current
-        switch range {
-        case .recent:
-            let grouped = Dictionary(grouping: recentEvents, by: \.day)
-            return grouped.keys.sorted(by: >).map { day in
-                CalendarSection(
-                    id: "recent-\(day.timeIntervalSince1970)",
-                    title: dayTitle(day),
-                    subtitle: daySubtitle(day),
-                    events: (grouped[day] ?? []).sorted { ($0.airTime ?? $0.day) > ($1.airTime ?? $1.day) },
-                    showsDayOnCards: false
-                )
-            }
+        let today = calendar.startOfDay(for: now)
+        let events = store.events.filter { filter.includes($0) }
 
-        case .next7:
-            guard let end = calendar.date(byAdding: .day, value: 7, to: today) else { return [] }
-            let upcoming = filteredEvents.filter { $0.day >= today && $0.day < end }
-            let grouped = Dictionary(grouping: upcoming, by: \.day)
-            return grouped.keys.sorted().map { day in
-                CalendarSection(
-                    id: "day-\(day.timeIntervalSince1970)",
-                    title: dayTitle(day),
-                    subtitle: daySubtitle(day),
-                    events: grouped[day] ?? [],
-                    showsDayOnCards: false
-                )
-            }
+        func aired(_ event: CalendarEvent) -> Bool {
+            if event.day < today { return true }
+            guard event.day == today else { return false }
+            // Date-only listings count as out on the day.
+            return event.airTime.map { $0 <= now } ?? true
+        }
 
-        case .next30:
-            guard let end = calendar.date(byAdding: .day, value: ReleaseCalendarStore.futureDays, to: today) else { return [] }
-            let upcoming = filteredEvents.filter { $0.day >= today && $0.day < end }
-            // Rolling 7-day blocks from today, so the first row is always a full week.
-            let grouped = Dictionary(grouping: upcoming) { event -> Int in
-                let days = calendar.dateComponents([.day], from: today, to: event.day).day ?? 0
-                return max(0, days) / 7
-            }
-            return grouped.keys.sorted().map { block in
-                let start = calendar.date(byAdding: .day, value: block * 7, to: today) ?? today
-                let last = calendar.date(byAdding: .day, value: block * 7 + 6, to: today) ?? today
-                return CalendarSection(
-                    id: "week-\(block)",
-                    title: block == 0
-                        ? L10n.string("calendar_this_week", fallback: "This Week")
-                        : L10n.string("calendar_week_of", fallback: "Week of \(Self.shortDate(start))"),
-                    subtitle: "\(Self.shortDate(start)) – \(Self.shortDate(last))",
-                    events: grouped[block] ?? [],
-                    showsDayOnCards: true
-                )
+        // New for You: unwatched aired episodes, grouped per show.
+        var pendingByShow: [String: [Pending]] = [:]
+        for event in events where aired(event) {
+            let numbers = event.kind == .seasonDrop
+                ? Array(event.episode..<(event.episode + max(1, event.episodeCount)))
+                : [event.episode]
+            for number in numbers where !WatchedStore.containsEpisode(metaId: event.showID, season: event.season, episode: number) {
+                pendingByShow[event.showID, default: []].append(Pending(event: event, season: event.season, episode: number))
             }
         }
-    }
-
-    private func isWatched(_ event: CalendarEvent) -> Bool {
-        if event.kind == .seasonDrop {
-            // A drop counts as watched once its last episode is.
-            return WatchedStore.containsEpisode(
-                metaId: event.showID,
-                season: event.season,
-                episode: event.episode + event.episodeCount - 1
-            )
+        var started: [String: ContinueWatchingItem] = [:]
+        for item in ContinueWatchingStore.items() {
+            guard let season = item.season, let episode = item.episode else { continue }
+            let key = "\(item.meta.id):\(season):\(episode)"
+            if started[key] == nil { started[key] = item }
         }
-        return WatchedStore.containsEpisode(metaId: event.showID, season: event.season, episode: event.episode)
+        var newItems: [NewShowItem] = []
+        for (showID, pending) in pendingByShow {
+            let ordered = pending.sorted { ($0.season, $0.episode) < ($1.season, $1.episode) }
+            guard let next = ordered.first, let last = ordered.last else { continue }
+            var progress: Double?
+            if let item = started["\(showID):\(next.season):\(next.episode)"], item.isUpNext != true,
+               item.duration > 0, item.position > 0 {
+                progress = min(1, item.position / item.duration)
+            }
+            newItems.append(NewShowItem(
+                showID: showID, showType: next.event.showType, showName: next.event.showName,
+                event: next.event, season: next.season, episode: next.episode,
+                lastSeason: last.season, lastEpisode: last.episode,
+                newCount: ordered.count,
+                latestDay: ordered.map(\.event.day).max() ?? next.event.day,
+                progress: progress
+            ))
+        }
+        newItems.sort {
+            if $0.latestDay != $1.latestDay { return $0.latestDay > $1.latestDay }
+            return $0.showName.localizedCaseInsensitiveCompare($1.showName) == .orderedAscending
+        }
+
+        // Coming up: this week, next week, later this month.
+        let upcoming = events.filter { !aired($0) }
+        let weekEnd = calendar.date(byAdding: .day, value: 7, to: today) ?? today
+        let nextWeekEnd = calendar.date(byAdding: .day, value: 14, to: today) ?? today
+        let monthEnd = calendar.date(byAdding: .day, value: ReleaseCalendarStore.futureDays + 1, to: today) ?? today
+        let lastOfWeek = calendar.date(byAdding: .day, value: 6, to: today) ?? today
+        let lastOfNextWeek = calendar.date(byAdding: .day, value: 13, to: today) ?? today
+        var sections: [UpcomingSection] = []
+        let thisWeek = upcoming.filter { $0.day < weekEnd }
+        if !thisWeek.isEmpty {
+            sections.append(UpcomingSection(
+                id: "week", title: L10n.string("calendar_this_week", fallback: "Coming Up This Week"),
+                subtitle: "\(Self.shortDate(today)) – \(Self.shortDate(lastOfWeek))", events: thisWeek))
+        }
+        let nextWeek = upcoming.filter { $0.day >= weekEnd && $0.day < nextWeekEnd }
+        if !nextWeek.isEmpty {
+            sections.append(UpcomingSection(
+                id: "next", title: L10n.string("calendar_next_week", fallback: "Next Week"),
+                subtitle: "\(Self.shortDate(weekEnd)) – \(Self.shortDate(lastOfNextWeek))", events: nextWeek))
+        }
+        let later = upcoming.filter { $0.day >= nextWeekEnd && $0.day < monthEnd }
+        if !later.isEmpty {
+            sections.append(UpcomingSection(
+                id: "later", title: L10n.string("calendar_later", fallback: "Later This Month"),
+                subtitle: "from \(Self.shortDate(nextWeekEnd))", events: later))
+        }
+        return CalendarModel(newItems: newItems, sections: sections)
     }
 
-    private func dayTitle(_ day: Date) -> String {
+    // MARK: - Text
+
+    private func episodeLine(season: Int, episode: Int, title: String?, extra: String?) -> String {
+        var line = "S\(season) · E\(episode)"
+        let trimmed = title?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        // Placeholder titles like "Episode 5" add nothing next to the code.
+        if !trimmed.isEmpty, !trimmed.lowercased().hasPrefix("episode ") { line += " · \(trimmed)" }
+        if let extra { line += "  (\(extra))" }
+        return line
+    }
+
+    private func newSubtitle(_ items: [NewShowItem]) -> String {
+        let episodes = items.reduce(0) { $0 + $1.newCount }
+        if items.count == 1 { return "\(episodes) episode\(episodes == 1 ? "" : "s") to watch" }
+        return "\(episodes) episodes across \(items.count) shows"
+    }
+
+    private func newBadges(_ item: NewShowItem) -> [Badge] {
+        var badges: [Badge] = [Badge(
+            text: item.newCount > 1 ? "\(item.newCount) NEW" : "NEW",
+            color: Color(red: 0.35, green: 0.85, blue: 0.55), symbol: nil)]
+        if item.season == 1 && item.episode == 1 {
+            badges.append(Badge(text: "SERIES PREMIERE", color: Color(red: 1, green: 0.82, blue: 0.35), symbol: nil))
+        } else if item.episode == 1 {
+            badges.append(Badge(text: "SEASON PREMIERE", color: Color(red: 1, green: 0.82, blue: 0.35), symbol: nil))
+        }
+        switch store.availability[item.availabilityKey] {
+        case .ready?: badges.append(Badge(text: "READY TO WATCH", color: .white, symbol: "checkmark"))
+        case .notYet?: badges.append(Badge(text: "NO SOURCES YET", color: Color.white.opacity(0.55), symbol: "clock"))
+        default: break
+        }
+        return badges
+    }
+
+    private func upcomingBadges(_ event: CalendarEvent) -> [Badge] {
+        let gold = Color(red: 1, green: 0.82, blue: 0.35)
+        if event.isSeriesPremiere { return [Badge(text: "SERIES PREMIERE", color: gold, symbol: nil)] }
+        if event.isSeasonPremiere { return [Badge(text: "SEASON PREMIERE", color: gold, symbol: nil)] }
+        if event.kind == .seasonDrop { return [Badge(text: "FULL SEASON", color: gold, symbol: nil)] }
+        return []
+    }
+
+    private func newStatusLine(_ item: NewShowItem) -> String {
+        var parts = [airedLine(item.event.day)]
+        if let progress = item.progress, progress > 0.02 {
+            parts.append("\(Int(((1 - progress) * 100).rounded()))% left")
+        }
+        switch store.availability[item.availabilityKey] {
+        case .ready(let count)?: parts.append("\(count) source\(count == 1 ? "" : "s") ready")
+        case .notYet?: parts.append("No sources yet (new episodes can take a few hours to appear)")
+        case .checking?: parts.append("Checking sources…")
+        default: break
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    private func upcomingStatusLine(_ event: CalendarEvent) -> String {
+        let label = dayLabel(event, long: true)
+        guard let countdown = countdown(event) else { return label }
+        return "\(label) · \(countdown)"
+    }
+
+    private func upcomingCardLine(_ event: CalendarEvent) -> String {
+        if event.kind == .seasonDrop { return "Season \(event.season) · \(event.episodeCount) episodes" }
+        return episodeLine(season: event.season, episode: event.episode, title: event.episodeTitle, extra: nil)
+    }
+
+    /// "Out today", "Aired yesterday", "Aired Tuesday", "Aired Oct 12".
+    private func airedLine(_ day: Date) -> String {
         let calendar = Calendar.current
-        if calendar.isDateInToday(day) { return L10n.string("date_today", fallback: "Today") }
-        if calendar.isDateInTomorrow(day) { return L10n.string("calendar_tomorrow", fallback: "Tomorrow") }
-        if calendar.isDateInYesterday(day) { return L10n.string("calendar_yesterday", fallback: "Yesterday") }
-        return Self.weekdayFormatter.string(from: day)
+        if calendar.isDateInToday(day) { return "Out today" }
+        if calendar.isDateInYesterday(day) { return "Aired yesterday" }
+        let days = calendar.dateComponents([.day], from: day, to: calendar.startOfDay(for: now)).day ?? 0
+        if days < 7 { return "Aired \(Self.weekdayFormatter.string(from: day))" }
+        return "Aired \(Self.shortDate(day))"
     }
 
-    private func daySubtitle(_ day: Date) -> String? {
-        Self.shortDate(day)
+    /// "Tonight · 9:00 PM", "Tomorrow · 8:00 PM", "Sat, Oct 25"; the long
+    /// form spells the day out and says when a time isn't announced.
+    private func dayLabel(_ event: CalendarEvent, long: Bool = false) -> String {
+        let calendar = Calendar.current
+        let time = event.airTime.map { Self.timeFormatter.string(from: $0) }
+        let day: String
+        if calendar.isDateInToday(event.day) {
+            let hour = event.airTime.map { calendar.component(.hour, from: $0) } ?? 0
+            day = hour >= 17 ? "Tonight" : "Today"
+        } else if calendar.isDateInTomorrow(event.day) {
+            day = "Tomorrow"
+        } else {
+            day = (long ? Self.longDayFormatter : Self.cardDayFormatter).string(from: event.day)
+        }
+        if let time { return "\(day) · \(time)" }
+        return long ? "\(day) · time not announced" : day
     }
 
-    static func shortDate(_ date: Date) -> String {
-        shortDateFormatter.string(from: date)
+    private func countdown(_ event: CalendarEvent) -> String? {
+        let target = event.airTime ?? event.day
+        guard target > now else { return nil }
+        return Self.relativeFormatter.localizedString(for: target, relativeTo: now)
     }
+
+    static func shortDate(_ date: Date) -> String { shortDateFormatter.string(from: date) }
+
+    private static let shortDateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.setLocalizedDateFormatFromTemplate("MMM d")
+        return formatter
+    }()
 
     private static let weekdayFormatter: DateFormatter = {
         let formatter = DateFormatter()
@@ -357,153 +648,15 @@ struct ReleaseCalendarView: View {
         return formatter
     }()
 
-    private static let shortDateFormatter: DateFormatter = {
-        let formatter = DateFormatter()
-        formatter.setLocalizedDateFormatFromTemplate("MMM d")
-        return formatter
-    }()
-}
-
-// MARK: - Card
-
-private struct CalendarEventCard: View {
-    let event: CalendarEvent
-    let showsDay: Bool
-    let isWatched: Bool
-    let isRecent: Bool
-    let action: () -> Void
-
-    @FocusState private var isFocused: Bool
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Button(action: action) {
-                ZStack(alignment: .bottomLeading) {
-                    CachedPosterArtwork(
-                        urlString: event.imageURL,
-                        width: CalendarMetrics.cardWidth,
-                        height: CalendarMetrics.cardHeight,
-                        maximumWidth: CalendarMetrics.cardWidth
-                    ) {
-                        ZStack {
-                            Rectangle().fill(Color.white.opacity(0.07))
-                            Image(systemName: "tv")
-                                .font(.system(size: 44))
-                                .foregroundColor(.white.opacity(0.25))
-                        }
-                    }
-                    .frame(width: CalendarMetrics.cardWidth, height: CalendarMetrics.cardHeight)
-                    .clipped()
-
-                    LinearGradient(
-                        colors: [.clear, .black.opacity(0.8)],
-                        startPoint: .center,
-                        endPoint: .bottom
-                    )
-
-                    VStack(alignment: .leading, spacing: 8) {
-                        if let badge = badgeText {
-                            Text(badge)
-                                .font(.system(size: 17, weight: .heavy))
-                                .tracking(0.6)
-                                .foregroundColor(.black)
-                                .padding(.horizontal, 10)
-                                .padding(.vertical, 4)
-                                .background(Capsule().fill(badgeColor))
-                        }
-                        Text(event.showName)
-                            .font(.system(size: 26, weight: .bold))
-                            .foregroundColor(.white)
-                            .lineLimit(1)
-                    }
-                    .padding(18)
-
-                    if isWatched {
-                        Image(systemName: "checkmark.circle.fill")
-                            .font(.system(size: 30))
-                            .foregroundColor(.white)
-                            .shadow(radius: 6)
-                            .padding(14)
-                            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
-                    }
-                }
-                .frame(width: CalendarMetrics.cardWidth, height: CalendarMetrics.cardHeight)
-                .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 16, style: .continuous)
-                        .strokeBorder(isFocused ? AppFocusOutline.color : .clear, lineWidth: isFocused ? AppFocusOutline.width : 0)
-                )
-                .opacity(isWatched && !isFocused ? 0.6 : 1)
-            }
-            .buttonStyle(PosterCardButtonStyle())
-            .focused($isFocused)
-            .focusEffectDisabledIfAvailable()
-            .scaleEffect(isFocused ? 1.06 : 1)
-            .shadow(color: .black.opacity(isFocused ? 0.5 : 0), radius: 20, y: 10)
-            .animation(.easeOut(duration: 0.18), value: isFocused)
-
-            VStack(alignment: .leading, spacing: 4) {
-                Text(episodeLine)
-                    .font(.system(size: 22, weight: .semibold))
-                    .foregroundColor(.white.opacity(isFocused ? 1 : 0.85))
-                    .lineLimit(1)
-                Text(timeLine)
-                    .font(.system(size: 20))
-                    .foregroundColor(.white.opacity(0.55))
-                    .lineLimit(1)
-            }
-            .frame(width: CalendarMetrics.cardWidth, alignment: .leading)
-        }
-    }
-
-    private var episodeLine: String {
-        if event.kind == .seasonDrop {
-            return L10n.format(
-                "calendar_season_drop",
-                fallback: "Season %d · %d episodes",
-                event.season,
-                event.episodeCount
-            )
-        }
-        let code = "S\(event.season) · E\(event.episode)"
-        let title = event.episodeTitle.trimmingCharacters(in: .whitespacesAndNewlines)
-        // Placeholder titles like "Episode 5" add nothing next to the code.
-        guard !title.isEmpty, !title.lowercased().hasPrefix("episode ") else { return code }
-        return "\(code)  \(title)"
-    }
-
-    private var timeLine: String {
-        var parts: [String] = []
-        if showsDay {
-            parts.append(Self.dayFormatter.string(from: event.day))
-        }
-        if let time = event.airTime {
-            parts.append(Self.timeFormatter.string(from: time))
-        }
-        if parts.isEmpty {
-            parts.append(isRecent
-                ? L10n.string("calendar_aired", fallback: "Aired")
-                : L10n.string("calendar_time_tba", fallback: "Time not announced"))
-        }
-        return parts.joined(separator: " · ")
-    }
-
-    private var badgeText: String? {
-        if isRecent && !isWatched { return L10n.string("calendar_badge_new", fallback: "NEW") }
-        if event.isSeriesPremiere { return L10n.string("calendar_badge_series_premiere", fallback: "SERIES PREMIERE") }
-        if event.isSeasonPremiere { return L10n.string("calendar_badge_season_premiere", fallback: "SEASON PREMIERE") }
-        if event.kind == .seasonDrop { return L10n.string("calendar_badge_full_season", fallback: "FULL SEASON") }
-        return nil
-    }
-
-    private var badgeColor: Color {
-        if isRecent && !isWatched { return Color(red: 0.35, green: 0.85, blue: 0.55) }
-        return Color(red: 1.0, green: 0.82, blue: 0.35)
-    }
-
-    private static let dayFormatter: DateFormatter = {
+    private static let cardDayFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.setLocalizedDateFormatFromTemplate("EEE MMM d")
+        return formatter
+    }()
+
+    private static let longDayFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.setLocalizedDateFormatFromTemplate("EEEE MMM d")
         return formatter
     }()
 
@@ -513,4 +666,211 @@ private struct CalendarEventCard: View {
         formatter.dateStyle = .none
         return formatter
     }()
+
+    private static let relativeFormatter: RelativeDateTimeFormatter = {
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .full
+        return formatter
+    }()
+}
+
+// MARK: - Cards
+
+/// Shared card chrome: 16:9 artwork with a bottom fade, the show name, and
+/// the app's focus lift and outline.
+private struct CalendarCardArtwork<Overlay: View>: View {
+    let imageURL: String?
+    let showName: String
+    let isFocused: Bool
+    @ViewBuilder let overlay: () -> Overlay
+
+    var body: some View {
+        ZStack(alignment: .bottomLeading) {
+            CachedPosterArtwork(
+                urlString: imageURL,
+                width: CalendarMetrics.cardWidth,
+                height: CalendarMetrics.cardHeight,
+                maximumWidth: CalendarMetrics.cardWidth
+            ) {
+                ZStack {
+                    Rectangle().fill(Color.white.opacity(0.07))
+                    Image(systemName: "tv").font(.system(size: 44)).foregroundColor(.white.opacity(0.25))
+                }
+            }
+            .frame(width: CalendarMetrics.cardWidth, height: CalendarMetrics.cardHeight)
+            .clipped()
+            LinearGradient(colors: [.clear, .black.opacity(0.85)], startPoint: .center, endPoint: .bottom)
+            Text(showName)
+                .font(.system(size: 24, weight: .bold))
+                .foregroundColor(.white)
+                .lineLimit(1)
+                .padding(.horizontal, 16)
+                .padding(.bottom, 14)
+            overlay()
+        }
+        .frame(width: CalendarMetrics.cardWidth, height: CalendarMetrics.cardHeight)
+        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .strokeBorder(isFocused ? AppFocusOutline.color : .clear, lineWidth: isFocused ? AppFocusOutline.width : 0)
+        )
+        .scaleEffect(isFocused ? 1.06 : 1)
+        .shadow(color: .black.opacity(isFocused ? 0.5 : 0), radius: 20, y: 10)
+        .animation(.easeOut(duration: 0.18), value: isFocused)
+    }
+}
+
+/// A show with new episodes: Select plays the next one; hold for more.
+private struct NewEpisodeCard: View {
+    let item: NewShowItem
+    let availability: ReleaseCalendarStore.Availability?
+    let airedLine: String
+    var focus: FocusState<String?>.Binding
+    let onPlay: () -> Void
+    let onMarkWatched: () -> Void
+    let onMarkCaughtUp: () -> Void
+    let onOpenShow: () -> Void
+
+    private var isFocused: Bool { focus.wrappedValue == item.id }
+
+    private var episodeText: String {
+        let title = item.event.kind == .episode ? item.event.episodeTitle.trimmingCharacters(in: .whitespaces) : ""
+        let code = "S\(item.season) · E\(item.episode)"
+        guard !title.isEmpty, !title.lowercased().hasPrefix("episode ") else { return code }
+        return "\(code) · \(title)"
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Button(action: onPlay) {
+                CalendarCardArtwork(imageURL: item.event.imageURL, showName: item.showName, isFocused: isFocused) {
+                    ZStack {
+                        // New-episode count, top left.
+                        Text(item.newCount > 1 ? "\(item.newCount) NEW" : "NEW")
+                            .font(.system(size: 15, weight: .heavy))
+                            .tracking(0.6)
+                            .foregroundColor(.black)
+                            .padding(.horizontal, 9)
+                            .padding(.vertical, 4)
+                            .background(Capsule().fill(Color(red: 0.35, green: 0.85, blue: 0.55)))
+                            .padding(12)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                        // Ready to watch, top right.
+                        if case .ready? = availability {
+                            Image(systemName: "checkmark.circle.fill")
+                                .font(.system(size: 26))
+                                .foregroundColor(.white)
+                                .shadow(radius: 4)
+                                .padding(12)
+                                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+                        }
+                        // Progress through a started episode, along the bottom.
+                        if let progress = item.progress, progress > 0.02 {
+                            VStack(spacing: 0) {
+                                Spacer()
+                                ZStack(alignment: .leading) {
+                                    Rectangle().fill(Color.white.opacity(0.25))
+                                    Rectangle().fill(Color.white).frame(width: CalendarMetrics.cardWidth * progress)
+                                }
+                                .frame(height: 5)
+                            }
+                        }
+                    }
+                }
+            }
+            .buttonStyle(PosterCardButtonStyle())
+            .focused(focus, equals: item.id)
+            .focusEffectDisabledIfAvailable()
+            .contextMenu {
+                Button(action: onPlay) {
+                    Label("Play S\(item.season) · E\(item.episode)", systemImage: "play.fill")
+                }
+                Button(action: onMarkWatched) {
+                    Label("Mark S\(item.season) · E\(item.episode) Watched", systemImage: "checkmark.circle")
+                }
+                if item.newCount > 1 {
+                    Button(action: onMarkCaughtUp) {
+                        Label("Mark All \(item.newCount) Watched", systemImage: "checkmark.circle.fill")
+                    }
+                }
+                Button(action: onOpenShow) {
+                    Label("Go to Show", systemImage: "info.circle")
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(episodeText)
+                    .font(.system(size: 21, weight: .semibold))
+                    .foregroundColor(.white.opacity(isFocused ? 1 : 0.85))
+                    .lineLimit(1)
+                Text(airedLine)
+                    .font(.system(size: 19))
+                    .foregroundColor(.white.opacity(0.5))
+                    .lineLimit(1)
+            }
+            .frame(width: CalendarMetrics.cardWidth, alignment: .leading)
+        }
+    }
+}
+
+/// An episode coming up: Select opens the show.
+private struct UpcomingEpisodeCard: View {
+    let event: CalendarEvent
+    let dayLabel: String
+    let detailLine: String
+    var focus: FocusState<String?>.Binding
+    let onOpenShow: () -> Void
+
+    private var cardID: String { "u|" + event.id }
+    private var isFocused: Bool { focus.wrappedValue == cardID }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Button(action: onOpenShow) {
+                CalendarCardArtwork(imageURL: event.imageURL, showName: event.showName, isFocused: isFocused) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(dayLabel.uppercased())
+                            .font(.system(size: 15, weight: .heavy))
+                            .tracking(0.6)
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 9)
+                            .padding(.vertical, 4)
+                            .background(Capsule().fill(Color.black.opacity(0.65)))
+                        if let badge = premiereBadge {
+                            Text(badge)
+                                .font(.system(size: 14, weight: .heavy))
+                                .tracking(0.6)
+                                .foregroundColor(.black)
+                                .padding(.horizontal, 9)
+                                .padding(.vertical, 3)
+                                .background(Capsule().fill(Color(red: 1, green: 0.82, blue: 0.35)))
+                        }
+                    }
+                    .padding(12)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                }
+            }
+            .buttonStyle(PosterCardButtonStyle())
+            .focused(focus, equals: cardID)
+            .focusEffectDisabledIfAvailable()
+            .contextMenu {
+                Button(action: onOpenShow) {
+                    Label("Go to Show", systemImage: "info.circle")
+                }
+            }
+
+            Text(detailLine)
+                .font(.system(size: 21, weight: .semibold))
+                .foregroundColor(.white.opacity(isFocused ? 1 : 0.85))
+                .lineLimit(1)
+                .frame(width: CalendarMetrics.cardWidth, alignment: .leading)
+        }
+    }
+
+    private var premiereBadge: String? {
+        if event.isSeriesPremiere { return "SERIES PREMIERE" }
+        if event.isSeasonPremiere { return "SEASON PREMIERE" }
+        if event.kind == .seasonDrop { return "FULL SEASON" }
+        return nil
+    }
 }

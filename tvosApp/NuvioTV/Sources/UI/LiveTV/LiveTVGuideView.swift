@@ -2,13 +2,15 @@ import SwiftUI
 import AetherEngine
 
 enum LiveGuideMetrics {
-    static let sideInset: CGFloat = 60
-    static let channelColumn: CGFloat = 320
-    static let rowHeight: CGFloat = 96
-    static let rowSpacing: CGFloat = 10
+    /// Extra side margin inside tvOS's own 80 pt safe area (none: the guide
+    /// uses the full safe width).
+    static let sideInset: CGFloat = 0
+    static let channelColumn: CGFloat = 290
+    static let rowHeight: CGFloat = 84
+    static let rowSpacing: CGFloat = 8
     static let cellGap: CGFloat = 8
-    static let heroHeight: CGFloat = 300
-    static let previewWidth: CGFloat = 416
+    static let heroHeight: CGFloat = 270
+    static let previewWidth: CGFloat = 400
     static let windowMinutes = 180
 }
 
@@ -593,12 +595,12 @@ struct LiveTVGuideView: View {
                     .foregroundColor(.white.opacity(0.7))
                 previewWindow
             }
-            .padding(.top, 26)
+            .padding(.top, 4)
         }
     }
 
     private var heroInfo: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 14) {
                 Text(currentView.title)
                     .font(.system(size: 24, weight: .bold))
@@ -643,7 +645,7 @@ struct LiveTVGuideView: View {
             }
             if let program = heroProgram {
                 Text(program.title)
-                    .font(.system(size: 50, weight: .bold))
+                    .font(.system(size: 44, weight: .bold))
                     .foregroundColor(.white)
                     .lineLimit(1)
                 HStack(spacing: 12) {
@@ -673,7 +675,7 @@ struct LiveTVGuideView: View {
                 }
                 if let overview = program.overview {
                     Text(overview)
-                        .font(.system(size: 22))
+                        .font(.system(size: 20))
                         .foregroundColor(.white.opacity(0.7))
                         .lineLimit(2)
                         .frame(maxWidth: 1200, alignment: .leading)
@@ -685,7 +687,7 @@ struct LiveTVGuideView: View {
             }
             Spacer(minLength: 0)
         }
-        .padding(.top, 26)
+        .padding(.top, 4)
     }
 
     // MARK: Preview window

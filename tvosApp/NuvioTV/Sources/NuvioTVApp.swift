@@ -1395,12 +1395,14 @@ struct ContentView: View {
     ///
     /// `startFromBeginning` plays the same episode with no resume point, for the
     /// card menu's "Start from beginning".
-    private func resumePlayback(_ item: ContinueWatchingItem, startFromBeginning: Bool = false) {
+    private func resumePlayback(_ item: ContinueWatchingItem, startFromBeginning: Bool = false, exactEpisode: Bool = false) {
         continueWatchingPlaybackTask?.cancel()
         continueWatchingPlaybackTask = nil
         isResolvingContinueWatchingStream = false
 
-        let item = RemoteTrackingState.isProgressSourceAuthenticated
+        // `exactEpisode`: the caller picked this episode (the Calendar), so a
+        // remote progress source must not swap in a different one.
+        let item = RemoteTrackingState.isProgressSourceAuthenticated && !exactEpisode
             ? (TraktProgressService.currentContinueWatchingItem(for: item.meta) ?? item)
             : item
 
@@ -1528,6 +1530,29 @@ struct ContentView: View {
                     openDetailsRoot(id: item.meta.id, type: item.meta.type, collectionContext: provenance)
                 }
             }
+        }
+    }
+
+    /// Plays an episode picked on the Calendar the way Continue Watching does
+    /// (smart source selection or the source picker, per the user's
+    /// settings), resuming it if it was started.
+    private func playCalendarEpisode(_ request: CalendarPlayRequest) {
+        if let started = ContinueWatchingStore.items().first(where: {
+            $0.meta.id == request.showID && $0.season == request.season && $0.episode == request.episode
+        }) {
+            resumePlayback(started, exactEpisode: true)
+            return
+        }
+        Task { @MainActor in
+            guard let meta = await ReleaseCalendarStore.shared.meta(for: request.showID, type: request.showType) else {
+                onNavigateToDetails(request.showID, request.showType)
+                return
+            }
+            let item = ContinueWatchingItem(
+                meta: meta, streamUrl: "", position: 0, duration: 0, lastWatchedAt: Date(),
+                season: request.season, episode: request.episode, released: request.released, isUpNext: true
+            )
+            resumePlayback(item, exactEpisode: true)
         }
     }
 
@@ -2497,6 +2522,9 @@ struct ContentView: View {
             },
             onPlayContinueWatchingManually: { item in
                 playContinueWatchingManually(item)
+            },
+            onPlayCalendarEpisode: { request in
+                playCalendarEpisode(request)
             },
             onStartContinueWatchingFromBeginning: { item in
                 resumePlayback(item, startFromBeginning: true)
@@ -3708,6 +3736,7 @@ private struct TVMainTabView: View {
     let onResumePlayback: (ContinueWatchingItem) -> Void
     var onNavigateToContinueWatchingDetails: ((String, String) -> Void)? = nil
     var onPlayContinueWatchingManually: ((ContinueWatchingItem) -> Void)? = nil
+    var onPlayCalendarEpisode: ((CalendarPlayRequest) -> Void)? = nil
     var onStartContinueWatchingFromBeginning: ((ContinueWatchingItem) -> Void)? = nil
     var onRemoveFromContinueWatching: ((ContinueWatchingItem) -> Void)? = nil
     let onLongPressCard: (NuvioMeta) -> Void
@@ -3889,7 +3918,10 @@ private struct TVMainTabView: View {
     private var calendarTabContent: some View {
         ReleaseCalendarView(
             libraryItems: libraryViewModel.items,
-            onOpenShow: onNavigateToDetails
+            onOpenShow: onNavigateToDetails,
+            onPlayEpisode: { request in
+                if let play = onPlayCalendarEpisode { play(request) } else { onNavigateToDetails(request.showID, request.showType) }
+            }
         )
             .id(activeProfile?.id ?? "none")
     }

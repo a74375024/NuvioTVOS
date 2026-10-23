@@ -33,6 +33,10 @@ struct CalendarEvent: Identifiable, Codable, Hashable, Sendable {
     let imageURL: String?
     let logoURL: String?
     var sources: Set<Source>
+    /// Episode synopsis (the show's description for a season drop).
+    var overview: String? = nil
+    /// The release value as the source gave it (for starting playback).
+    var released: String? = nil
 
     var isSeriesPremiere: Bool { season == 1 && episode == 1 }
     var isSeasonPremiere: Bool { season > 1 && episode == 1 }
@@ -44,8 +48,8 @@ struct CalendarEvent: Identifiable, Codable, Hashable, Sendable {
 final class ReleaseCalendarStore: ObservableObject {
     static let shared = ReleaseCalendarStore()
 
-    /// How far back "Recently aired" reaches, and how far ahead we look.
-    static let pastDays = 7
+    /// How far back "New for You" reaches, and how far ahead we look.
+    static let pastDays = 30
     static let futureDays = 30
     /// Shows watched within this window count as "watching".
     static let watchingWindowDays = 120
@@ -58,6 +62,26 @@ final class ReleaseCalendarStore: ObservableObject {
     @Published private(set) var isRefreshing = false
     @Published private(set) var showCount = 0
     @Published private(set) var lastUpdated: Date?
+    /// Whether the next new episode of a show can be played right now
+    /// (keyed by `availabilityKey`): the installed add-ons are asked once,
+    /// a few at a time, and the answer is kept for a while.
+    @Published private(set) var availability: [String: Availability] = [:]
+
+    enum Availability: Equatable {
+        case checking
+        case ready(Int)
+        case notYet
+        case unknown
+    }
+
+    /// Full show metadata from the last build (and on demand), for playback
+    /// and watched marking from the calendar.
+    private var metas: [String: NuvioMeta] = [:]
+    private var availabilityCheckedAt: [String: Date] = [:]
+    private var availabilityQueue: [(key: String, id: String)] = []
+    private var activeAvailabilityChecks = 0
+    private static let availabilityLifetime: TimeInterval = 2 * 60 * 60
+    private static let availabilityConcurrency = 2
 
     private var refreshTask: Task<Void, Never>?
     private var loadedProfileKey: String?
@@ -105,8 +129,9 @@ final class ReleaseCalendarStore: ObservableObject {
         showCount = shows.count
         isRefreshing = true
         refreshTask = Task { [weak self] in
-            let built = await Self.buildEvents(for: shows)
+            let (built, metas) = await Self.buildEvents(for: shows)
             guard let self, !Task.isCancelled else { return }
+            self.metas.merge(metas) { _, new in new }
             guard ProfileSettings.activeProfileScope == profileKey else {
                 self.refreshTask = nil
                 self.isRefreshing = false
@@ -125,6 +150,74 @@ final class ReleaseCalendarStore: ObservableObject {
                 showCount: shows.count,
                 events: built
             ))
+        }
+    }
+
+    // MARK: - Show metadata
+
+    /// A show's full metadata: from the last build, or fetched now.
+    func meta(for showID: String, type: String = "series") async -> NuvioMeta? {
+        if let meta = metas[showID] { return meta }
+        guard let meta = try? await CinemetaCatalogRepository().getMetadata(id: showID, type: type) else { return nil }
+        metas[showID] = meta
+        return meta
+    }
+
+    // MARK: - Ready to watch
+
+    static func availabilityKey(showID: String, season: Int, episode: Int) -> String {
+        "\(showID):\(season):\(episode)"
+    }
+
+    /// Asks the installed add-ons whether these episodes have sources yet
+    /// (two at a time; answers kept for two hours). Warms the same stream
+    /// discovery that playback uses, so pressing Play right after is quicker.
+    func checkAvailability(_ keys: [String]) {
+        let now = Date()
+        for key in keys {
+            if availability[key] == .checking || availabilityQueue.contains(where: { $0.key == key }) { continue }
+            if let checked = availabilityCheckedAt[key], now.timeIntervalSince(checked) < Self.availabilityLifetime { continue }
+            availabilityQueue.append((key, key))
+            availability[key] = .checking
+        }
+        startAvailabilityChecks()
+    }
+
+    private func startAvailabilityChecks() {
+        while activeAvailabilityChecks < Self.availabilityConcurrency, !availabilityQueue.isEmpty {
+            let job = availabilityQueue.removeFirst()
+            activeAvailabilityChecks += 1
+            Task { [weak self] in
+                let result = await Self.lookUpSources(videoID: job.id)
+                guard let self else { return }
+                self.activeAvailabilityChecks -= 1
+                self.availability[job.key] = result
+                self.availabilityCheckedAt[job.key] = Date()
+                self.startAvailabilityChecks()
+            }
+        }
+    }
+
+    /// The first add-on answer with a playable source settles it; no answer
+    /// within 25 s counts as unknown.
+    private static func lookUpSources(videoID: String) async -> Availability {
+        let updates = CinemetaCatalogRepository().streamsProgressively(id: videoID, type: "series", finishAfterStreamResults: true)
+        return await withTaskGroup(of: Availability.self) { group in
+            group.addTask {
+                var last = 0
+                for await streams in updates {
+                    last = streams.filter { !$0.isNotPlayable }.count
+                    if last > 0 { return .ready(last) }
+                }
+                return last > 0 ? .ready(last) : .notYet
+            }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: 25_000_000_000)
+                return .unknown
+            }
+            let first = await group.next() ?? .unknown
+            group.cancelAll()
+            return first
         }
     }
 
@@ -175,45 +268,50 @@ final class ReleaseCalendarStore: ObservableObject {
 
     // MARK: - Building events
 
-    private static func buildEvents(for shows: [Show]) async -> [CalendarEvent] {
+    private static func buildEvents(for shows: [Show]) async -> ([CalendarEvent], [String: NuvioMeta]) {
         let repository = CinemetaCatalogRepository()
         let calendar = Calendar.current
         let today = calendar.startOfDay(for: Date())
         guard let windowStart = calendar.date(byAdding: .day, value: -pastDays, to: today),
-              let windowEnd = calendar.date(byAdding: .day, value: futureDays + 1, to: today) else { return [] }
+              let windowEnd = calendar.date(byAdding: .day, value: futureDays + 1, to: today) else { return ([], [:]) }
 
         // Look shows up a few at a time so a big library doesn't flood the
         // metadata source.
         var collected: [CalendarEvent] = []
+        var metas: [String: NuvioMeta] = [:]
         let maxConcurrent = 4
         var start = 0
         while start < shows.count, !Task.isCancelled {
             let batch = Array(shows[start..<min(start + maxConcurrent, shows.count)])
             start += maxConcurrent
-            let results = await withTaskGroup(of: [CalendarEvent].self, returning: [CalendarEvent].self) { group in
+            let results = await withTaskGroup(of: (NuvioMeta?, [CalendarEvent]).self, returning: [(NuvioMeta?, [CalendarEvent])].self) { group in
                 for show in batch {
                     group.addTask {
                         guard let meta = try? await repository.getMetadata(id: show.id, type: "series") else {
-                            return []
+                            return (nil, [])
                         }
-                        return Self.events(from: meta, show: show, windowStart: windowStart, windowEnd: windowEnd)
+                        return (meta, Self.events(from: meta, show: show, windowStart: windowStart, windowEnd: windowEnd))
                     }
                 }
-                var merged: [CalendarEvent] = []
-                for await events in group {
-                    merged.append(contentsOf: events)
+                var merged: [(NuvioMeta?, [CalendarEvent])] = []
+                for await result in group {
+                    merged.append(result)
                 }
                 return merged
             }
-            collected.append(contentsOf: results)
+            for (meta, events) in results {
+                if let meta, !events.isEmpty { metas[meta.id] = meta }
+                collected.append(contentsOf: events)
+            }
         }
 
-        return collected.sorted { lhs, rhs in
+        let sorted = collected.sorted { lhs, rhs in
             if lhs.day != rhs.day { return lhs.day < rhs.day }
             let lt = lhs.airTime ?? lhs.day, rt = rhs.airTime ?? rhs.day
             if lt != rt { return lt < rt }
             return lhs.showName.localizedCaseInsensitiveCompare(rhs.showName) == .orderedAscending
         }
+        return (sorted, metas)
     }
 
     private nonisolated static func events(
@@ -260,7 +358,9 @@ final class ReleaseCalendarStore: ObservableObject {
                     airTime: first.time,
                     imageURL: meta.backgroundUrl ?? first.video.thumbnail ?? meta.posterUrl,
                     logoURL: meta.logoUrl,
-                    sources: show.sources
+                    sources: show.sources,
+                    overview: meta.description,
+                    released: first.video.released
                 ))
             } else {
                 for entry in sortedGroup {
@@ -278,7 +378,9 @@ final class ReleaseCalendarStore: ObservableObject {
                         airTime: entry.time,
                         imageURL: entry.video.thumbnail ?? meta.backgroundUrl ?? meta.posterUrl,
                         logoURL: meta.logoUrl,
-                        sources: show.sources
+                        sources: show.sources,
+                        overview: entry.video.overview?.isEmpty == false ? entry.video.overview : meta.description,
+                        released: entry.video.released
                     ))
                 }
             }
@@ -327,7 +429,8 @@ final class ReleaseCalendarStore: ObservableObject {
     private nonisolated static func cacheURL(profileKey: String) -> URL? {
         guard let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first else { return nil }
         let safe = profileKey.replacingOccurrences(of: "[^A-Za-z0-9_-]", with: "_", options: .regularExpression)
-        return base.appendingPathComponent("ReleaseCalendar-\(safe).json")
+        // v2: 30 days back, synopses and release values.
+        return base.appendingPathComponent("ReleaseCalendar-v2-\(safe).json")
     }
 
     private nonisolated static func readCache(profileKey: String) -> CacheFile? {
