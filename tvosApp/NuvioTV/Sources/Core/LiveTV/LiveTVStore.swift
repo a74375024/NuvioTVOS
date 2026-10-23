@@ -2571,6 +2571,9 @@ final class LiveTVStore: ObservableObject {
 
     func meta(for channel: LiveTVChannel, feed: LiveTVChannel, now: LiveTVProgram?) -> NuvioMeta {
         let description = [now?.title, now?.episodeTitle, now?.overview].compactMap { $0 }.joined(separator: "\n")
+        // The curated logo (see ChannelLogos) for the player's loading and
+        // pause screens; the provider's when there's none.
+        let logo = logoSpec(for: channel).urls.first ?? channel.imageURL
         return NuvioMeta(
             // "live:xt:<account>:<stream>" for Xtream, "live:jf:<server>:<item>"
             // for Emby / Jellyfin (which Multiview leaves out: one stream).
@@ -2579,7 +2582,7 @@ final class LiveTVStore: ObservableObject {
             description: description.isEmpty ? nil : description,
             posterUrl: channel.imageURL?.absoluteString,
             backgroundUrl: now?.imageURL?.absoluteString,
-            logoUrl: channel.imageURL?.absoluteString,
+            logoUrl: logo?.absoluteString,
             type: "livetv"
         )
     }

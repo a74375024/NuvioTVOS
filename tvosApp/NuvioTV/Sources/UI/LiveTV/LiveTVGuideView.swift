@@ -1152,6 +1152,7 @@ struct LiveTVOverlay: View {
             Color.black.ignoresSafeArea()
             VStack(alignment: .leading, spacing: 18) {
                 Spacer()
+                ChannelLogoView(urls: store.logoSpec(for: channel).urls, width: 300, height: 110, alignment: .leading)
                 HStack(spacing: 14) {
                     Text(channel.name)
                         .font(.system(size: 34, weight: .bold))

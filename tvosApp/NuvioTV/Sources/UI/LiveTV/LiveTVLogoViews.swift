@@ -9,6 +9,7 @@ struct ChannelLogoView<Fallback: View>: View {
     let width: CGFloat
     let height: CGFloat
     var focused = false
+    var alignment: Alignment = .center
     @ViewBuilder var fallback: () -> Fallback
 
     @State private var logo: ChannelLogoLoader.Logo?
@@ -17,7 +18,7 @@ struct ChannelLogoView<Fallback: View>: View {
 
     var body: some View {
         content
-            .frame(width: width, height: height)
+            .frame(width: width, height: height, alignment: alignment)
             .task(id: urls) { await load() }
     }
 
@@ -72,8 +73,8 @@ struct ChannelLogoView<Fallback: View>: View {
 }
 
 extension ChannelLogoView where Fallback == EmptyView {
-    init(urls: [URL], width: CGFloat, height: CGFloat, focused: Bool = false) {
-        self.init(urls: urls, width: width, height: height, focused: focused, fallback: { EmptyView() })
+    init(urls: [URL], width: CGFloat, height: CGFloat, focused: Bool = false, alignment: Alignment = .center) {
+        self.init(urls: urls, width: width, height: height, focused: focused, alignment: alignment, fallback: { EmptyView() })
     }
 }
 
