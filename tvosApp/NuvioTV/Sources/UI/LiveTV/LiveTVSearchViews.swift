@@ -399,18 +399,22 @@ final class LiveTVExportModel: ObservableObject {
         working = true
         url = nil
         qrImage = nil
-        message = L10n.string("live_report_checking", fallback: "Checking your server's guide for every channel…")
+        message = L10n.string("live_report_checking", fallback: "Checking guides for your channels…")
         Task {
             await LiveTVStore.shared.checkAllGuides { [weak self] done, total in
                 self?.message = L10n.format("live_report_progress", fallback: "Checking guides: %d of %d channels…", done, total)
             }
-            let csv = LiveTVStore.shared.channelReportCSV()
+            message = L10n.string("live_report_building", fallback: "Writing the report…")
+            let csv = await LiveTVStore.shared.channelReportCSV { [weak self] done, total in
+                self?.message = L10n.format("live_report_writing", fallback: "Writing the report: %d of %d channels…", done, total)
+            }
             message = L10n.string("live_report_starting", fallback: "Starting the download link…")
             server.start(
                 report: Data(csv.utf8),
                 contentType: "text/csv; charset=utf-8",
                 filename: "nuvio-live-tv-channels.csv",
-                maximumBytes: 16 * 1024 * 1024,
+                // Big provider lists (70k channels) make a 20-30 MB report.
+                maximumBytes: 96 * 1024 * 1024,
                 lifetime: 600
             ) { [weak self] state in
                 Task { @MainActor in

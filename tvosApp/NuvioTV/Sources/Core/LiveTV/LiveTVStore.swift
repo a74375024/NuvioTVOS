@@ -964,10 +964,24 @@ final class LiveTVStore: ObservableObject {
 
     // MARK: Channel report
 
-    /// Fetches the server guide for every channel (for the report), waiting
-    /// up to `timeout` for it to finish. `progress` gets "checked / total".
-    func checkAllGuides(timeout: TimeInterval = 240, progress: @escaping (Int, Int) -> Void) async {
-        await checkGuides(ids: channels.filter { traits[$0.id]?.familyKey == nil }.map(\.id), timeout: timeout, progress: progress)
+    /// Fetches per-channel guides for the report, waiting up to `timeout`.
+    /// Only each entry's main version is asked, lineup first, skipping event
+    /// feeds and channels the provider's full guide already covers, and at
+    /// most `limit` of them: asking a big provider for tens of thousands of
+    /// per-channel guides takes ages and hammers it. `progress` gets
+    /// "checked / total".
+    func checkAllGuides(timeout: TimeInterval = 120, limit: Int = 2500, progress: @escaping (Int, Int) -> Void) async {
+        let start = Self.windowStart()
+        var seen = Set<String>()
+        var ids: [String] = []
+        for entry in lineupEntries + entries {
+            guard ids.count < limit else { break }
+            guard let member = entryInfo[entry.id]?.members.first ?? (indexByID[entry.id] != nil ? entry.id : nil),
+                  traits[member]?.familyKey == nil, !providerCovers(member, from: start),
+                  seen.insert(member).inserted else { continue }
+            ids.append(member)
+        }
+        await checkGuides(ids: ids, timeout: timeout, progress: progress)
     }
 
     private func checkGuides(ids: [String], timeout: TimeInterval, progress: @escaping (Int, Int) -> Void) async {
@@ -981,36 +995,39 @@ final class LiveTVStore: ObservableObject {
         }
     }
 
+    /// One report row's data, gathered on the main actor.
+    private struct ReportRow {
+        let channel: LiveTVChannel
+        let hidden: Bool
+        let serverState: String
+        let serverCount: Int
+        let nowTitle: String
+        let nowSource: String
+        let entryName: String
+        let inLineup: Bool
+        let category: String
+        let family: String
+        let eventText: String
+        let provider: String
+        let outsideNote: String
+        let outsideRaw: [OutsideGuide.RawProgram]?
+        let providerGuide: String
+        let providerRaw: [OutsideGuide.RawProgram]?
+    }
+
     /// One row per channel: what it is, what the server's guide has, and
     /// how outside listings matched (or didn't). No stream links or tokens.
-    func channelReportCSV() -> String {
-        func cell(_ value: String?) -> String {
-            let text = (value ?? "").replacingOccurrences(of: "\"", with: "\"\"")
-            return "\"\(text)\""
-        }
+    /// The data is gathered here; the name analysis and text run off the
+    /// main thread (big provider lists have tens of thousands of channels).
+    func channelReportCSV(progress: @escaping @MainActor (Int, Int) -> Void = { _, _ in }) async -> String {
         let now = Date()
         let start = Self.windowStart()
         let end = start.addingTimeInterval(Self.guideHours * 3600)
-        var stationsByNetwork: [String: [OutsideGuide.Station]] = [:]
-        if let data = try? Data(contentsOf: FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("OutsideGuide/stations.json")),
-           let stations = try? JSONDecoder().decode([OutsideGuide.Station].self, from: data) {
-            stationsByNetwork = Dictionary(grouping: stations, by: \.network)
-        }
-        var lines = [[
-            "number", "name", "group", "tags", "hidden_group", "favorite",
-            "callsign_in_name", "station_lookup", "match_key",
-            "server_guide", "server_programs_next_3h", "outside_listing", "outside_programs_next_3h",
-            "now_title", "now_source", "entry", "category", "in_my_lineup", "event_family", "event_text",
-            "provider", "country", "guide_id", "provider_guide", "provider_guide_programs_next_3h"
-        ].joined(separator: ",")]
+        var names: [String: String] = [:]
+        var rows: [ReportRow] = []
+        rows.reserveCapacity(channels.count)
         for channel in channels {
-            let isLocal = (channel.group ?? "").lowercased().contains("local")
-            let signs = OutsideGuide.callsigns(in: channel.name, strongContext: isLocal)
-            let station = signs.isEmpty ? OutsideGuide.stationCallsign(for: channel.name, stations: stationsByNetwork) : nil
             let serverList = serverPrograms[channel.id] ?? []
-            let serverCount = serverList.filter { $0.end > start && $0.start < end }.count
-            let outsideCount = (outsideListing(for: channel.id) ?? []).filter { $0.end > start && $0.start < end }.count
             let serverState: String
             switch guideState[channel.id] {
             case .loaded: serverState = serverList.isEmpty ? "none" : "yes"
@@ -1018,11 +1035,15 @@ final class LiveTVStore: ObservableObject {
             case .loading: serverState = "loading"
             case nil: serverState = "not checked"
             }
-            let current = self.current(on: channel.id, at: now)
             let trait = traits[channel.id]
             let entryID = entryOf[channel.id]
             let isXtream = channel.serverID.hasPrefix("xt:")
-            let providerCount = (providerListing(for: channel.id) ?? []).filter { $0.end > start && $0.start < end }.count
+            let current = self.current(on: channel.id, at: now)
+            let source: String = current.map { program in
+                if program.fromOutsideGuide { return "outside" }
+                if program.id.hasPrefix("pg|") || program.id.contains("|pg|") { return "provider guide" }
+                return isXtream ? "provider short guide" : "server"
+            } ?? ""
             let providerGuide: String
             if !isXtream {
                 providerGuide = ""
@@ -1042,27 +1063,68 @@ final class LiveTVStore: ObservableObject {
                 case nil: providerGuide = "provider guide not loaded"
                 }
             }
-            let source: String = current.map { program in
-                if program.fromOutsideGuide { return "outside" }
-                if program.id.hasPrefix("pg|") || program.id.contains("|pg|") { return "provider guide" }
-                return isXtream ? "provider short guide" : "server"
-            } ?? ""
-            lines.append([
-                cell(channel.number ?? ""), cell(channel.name), cell(channel.group ?? ""),
-                cell(channel.tags.joined(separator: " | ")), cell(isHidden(channel) ? "yes" : ""),
-                cell(channel.isFavorite ? "yes" : ""), cell(signs.joined(separator: " ")), cell(station ?? ""),
-                cell(OutsideGuide.normalize(channel.displayName)), cell(serverState), cell(String(serverCount)),
-                cell(outsideNotes[channel.id] ?? (outsideMatches[channel.id] == nil ? "no match" : "matched")),
-                cell(String(outsideCount)), cell(current?.title ?? ""),
-                cell(source),
-                cell(entryID.flatMap { entryInfo[$0]?.name } ?? ""), cell(trait?.category.rawValue ?? ""),
-                cell(entryID.map { lineupIDs.contains($0) ? "yes" : "" } ?? ""),
-                cell(trait?.familyKey ?? ""), cell(trait?.eventText ?? ""),
-                cell(providerName(for: channel.serverID) ?? ""), cell(ProviderGuide.countryPrefix(of: channel.group) ?? ""),
-                cell(channel.epgID ?? ""), cell(providerGuide), cell(isXtream ? String(providerCount) : "")
-            ].joined(separator: ","))
+            if names[channel.serverID] == nil { names[channel.serverID] = providerName(for: channel.serverID) ?? "" }
+            rows.append(ReportRow(
+                channel: channel, hidden: isHidden(channel), serverState: serverState,
+                serverCount: serverList.filter { $0.end > start && $0.start < end }.count,
+                nowTitle: current?.title ?? "", nowSource: source,
+                entryName: entryID.flatMap { entryInfo[$0]?.name } ?? "",
+                inLineup: entryID.map { lineupIDs.contains($0) } ?? false,
+                category: trait?.category.rawValue ?? "", family: trait?.familyKey ?? "", eventText: trait?.eventText ?? "",
+                provider: names[channel.serverID] ?? "",
+                outsideNote: outsideNotes[channel.id] ?? (outsideMatches[channel.id] == nil ? "no match" : "matched"),
+                outsideRaw: outsideMatches[channel.id],
+                providerGuide: providerGuide, providerRaw: isXtream ? providerMatches[channel.id] : nil
+            ))
         }
-        return lines.joined(separator: "\n") + "\n"
+        let low = Int(start.timeIntervalSince1970 / 60)
+        let high = Int(end.timeIntervalSince1970 / 60)
+        let total = rows.count
+        return await Task.detached(priority: .userInitiated) { () -> String in
+            func cell(_ value: String?) -> String {
+                "\"" + (value ?? "").replacingOccurrences(of: "\"", with: "\"\"") + "\""
+            }
+            func count(_ raw: [OutsideGuide.RawProgram]?) -> Int {
+                (raw ?? []).reduce(0) { $0 + ($1.s < high && $1.s + $1.m > low ? 1 : 0) }
+            }
+            var stationsByNetwork: [String: [OutsideGuide.Station]] = [:]
+            if let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first,
+               let data = try? Data(contentsOf: base.appendingPathComponent("OutsideGuide/stations.json")),
+               let stations = try? JSONDecoder().decode([OutsideGuide.Station].self, from: data) {
+                stationsByNetwork = Dictionary(grouping: stations, by: \.network)
+            }
+            var lines = [[
+                "number", "name", "group", "tags", "hidden_group", "favorite",
+                "callsign_in_name", "station_lookup", "match_key",
+                "server_guide", "server_programs_next_3h", "outside_listing", "outside_programs_next_3h",
+                "now_title", "now_source", "entry", "category", "in_my_lineup", "event_family", "event_text",
+                "provider", "country", "guide_id", "provider_guide", "provider_guide_programs_next_3h"
+            ].joined(separator: ",")]
+            lines.reserveCapacity(total + 1)
+            for (index, row) in rows.enumerated() {
+                let channel = row.channel
+                let isLocal = (channel.group ?? "").lowercased().contains("local")
+                let signs = OutsideGuide.callsigns(in: channel.name, strongContext: isLocal)
+                let station = signs.isEmpty ? OutsideGuide.stationCallsign(for: channel.name, stations: stationsByNetwork) : nil
+                let isXtream = channel.serverID.hasPrefix("xt:")
+                lines.append([
+                    cell(channel.number ?? ""), cell(channel.name), cell(channel.group ?? ""),
+                    cell(channel.tags.joined(separator: " | ")), cell(row.hidden ? "yes" : ""),
+                    cell(channel.isFavorite ? "yes" : ""), cell(signs.joined(separator: " ")), cell(station ?? ""),
+                    cell(OutsideGuide.normalize(channel.displayName)), cell(row.serverState), cell(String(row.serverCount)),
+                    cell(row.outsideNote), cell(String(count(row.outsideRaw))), cell(row.nowTitle), cell(row.nowSource),
+                    cell(row.entryName), cell(row.category), cell(row.inLineup ? "yes" : ""),
+                    cell(row.family), cell(row.eventText),
+                    cell(row.provider), cell(ProviderGuide.countryPrefix(of: channel.group) ?? ""),
+                    cell(channel.epgID ?? ""), cell(row.providerGuide), cell(isXtream ? String(count(row.providerRaw)) : "")
+                ].joined(separator: ","))
+                if index % 2000 == 1999 {
+                    let done = index + 1
+                    await MainActor.run { progress(done, total) }
+                }
+            }
+            return lines.joined(separator: "\n") + "\n"
+        }.value
     }
 
     // MARK: Guide helpers
