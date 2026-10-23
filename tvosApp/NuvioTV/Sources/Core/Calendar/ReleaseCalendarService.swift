@@ -165,7 +165,7 @@ final class ReleaseCalendarStore: ObservableObject {
 
     // MARK: - Ready to watch
 
-    static func availabilityKey(showID: String, season: Int, episode: Int) -> String {
+    nonisolated static func availabilityKey(showID: String, season: Int, episode: Int) -> String {
         "\(showID):\(season):\(episode)"
     }
 

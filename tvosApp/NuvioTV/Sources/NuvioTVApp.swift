@@ -1545,7 +1545,7 @@ struct ContentView: View {
         }
         Task { @MainActor in
             guard let meta = await ReleaseCalendarStore.shared.meta(for: request.showID, type: request.showType) else {
-                onNavigateToDetails(request.showID, request.showType)
+                openDetailsRoot(id: request.showID, type: request.showType)
                 return
             }
             let item = ContinueWatchingItem(
