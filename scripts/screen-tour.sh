@@ -52,8 +52,6 @@ shots=(
   "07d-live-tv-listings|live-demo-sources|12"
   "07e-live-tv-outside-listings|live-demo-outside|180"
   "07h-live-tv-provider-guide|live-demo-provider|40"
-  "07k-live-mock-first-load|live-mock|50"
-  "07l-live-mock-from-saved|live-mock|25"
   "08-settings|settings|12"
 )
 

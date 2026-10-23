@@ -252,6 +252,10 @@ struct LiveTVGuideView: View {
             setupOffered = true
             showSetup = true
         }
+        .onChange(of: store.entriesRevision) { _, _ in
+            // Keep the genre picker's counts current while it's open.
+            if showGenres { genreCounts = countGenres() }
+        }
         .onChange(of: genre) { _, newGenre in
             // "On now" filtering needs guide data for the whole list.
             guard newGenre?.needsPrograms == true else { return }
@@ -325,7 +329,8 @@ struct LiveTVGuideView: View {
             case "live-demo-events": showingEvents = true
             case "live-demo-all": chosenView = .all; store.setShowHidden(true)
             case "live-demo-setup": showSetup = true
-            case "live-demo-genres": genreCounts = countGenres(); showGenres = true
+            case "live-demo-genres":
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3) { genreCounts = countGenres(); showGenres = true }
             default: break
             }
         }
