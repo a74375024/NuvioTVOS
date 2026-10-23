@@ -416,6 +416,27 @@ struct LiveEventBackdrop: View {
                     .opacity(0.75)
                     .id(url)
                     .transition(.opacity)
+                }  else if let game = event?.game {
+                    // No art: the two badges, big and faded, over a glow.
+                    ZStack {
+                        RadialGradient(colors: [Color(red: 0.05, green: 0.2, blue: 0.55).opacity(0.85), .clear],
+                                       center: .center, startRadius: 40, endRadius: geo.size.width * 0.32)
+                        HStack(spacing: 40) {
+                            TeamBadge(team: game.isSoccer ? game.home : game.away, size: geo.size.height * 0.3)
+                            Text("VS")
+                                .font(.system(size: geo.size.height * 0.08, weight: .heavy))
+                                .foregroundColor(.white.opacity(0.7))
+                            TeamBadge(team: game.isSoccer ? game.away : game.home, size: geo.size.height * 0.3)
+                        }
+                        .opacity(0.45)
+                    }
+                    .frame(width: geo.size.width * 0.55, height: geo.size.height * 0.48)
+                    .mask(
+                        LinearGradient(colors: [.clear, .black], startPoint: .leading, endPoint: UnitPoint(x: 0.35, y: 0.5))
+                            .mask(LinearGradient(colors: [.black, .black, .clear], startPoint: .top, endPoint: .bottom))
+                    )
+                    .id(game.id)
+                    .transition(.opacity)
                 }
             }
             .frame(width: geo.size.width, height: geo.size.height, alignment: .topTrailing)

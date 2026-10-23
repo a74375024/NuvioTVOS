@@ -230,7 +230,7 @@ struct LiveTVGuideView: View {
         ZStack(alignment: .top) {
             Color.nuvioBackground(amoled: amoled, body: bodyColor).ignoresSafeArea()
             if showingEvents, store.state == .loaded {
-                LiveEventBackdrop(event: focusedEvent)
+                LiveEventBackdrop(event: heroEvent)
             }
             switch store.state {
             case .loaded:
@@ -539,7 +539,7 @@ struct LiveTVGuideView: View {
             let ppm = gridWidth / CGFloat(LiveGuideMetrics.windowMinutes)
             VStack(alignment: .leading, spacing: 0) {
                 if showingEvents {
-                    LiveEventsHero(event: focusedEvent, now: now)
+                    LiveEventsHero(event: heroEvent, now: now)
                         .frame(width: max(0, proxy.size.width - LiveGuideMetrics.sideInset * 2), height: LiveGuideMetrics.heroHeight,
                                alignment: .topLeading)
                         .clipped()
@@ -1233,6 +1233,18 @@ struct LiveTVGuideView: View {
               panel == nil, feedPicker == nil, !store.isWatching, store.overlay == nil,
               !multiview.isPresented, scenePhase == .active else { return "" }
         return channel.id
+    }
+
+    /// The game the Live Events header shows: the focused one, else the
+    /// first live game you can watch, else the next one.
+    private var heroEvent: SportsEvent? {
+        if let focusedEvent { return focusedEvent }
+        let events = store.sportsEvents.filter { !$0.sources.isEmpty }
+        return events.first { event in
+            let state = event.state(at: now)
+            return state == .live || state == .mayHaveEnded
+        }
+            ?? events.first { $0.state(at: now) == .upcoming }
     }
 
     private var eventsHeader: some View {

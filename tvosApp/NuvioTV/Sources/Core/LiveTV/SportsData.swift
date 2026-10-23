@@ -164,8 +164,17 @@ final class SportsData: ObservableObject {
             if refreshTeams, let teams = await fetchTeams(league) {
                 saved.teams[league.id] = teams
             }
-            for endpoint in ["eventsnextleague.php", "eventspastleague.php"] {
-                guard let list = await fetchEvents(endpoint, league: league) else { continue }
+            // The free key returns only one game for "next" and "past", so
+            // also ask for today's and tomorrow's games by date.
+            let dayFormat = DateFormatter()
+            dayFormat.locale = Locale(identifier: "en_US_POSIX")
+            dayFormat.timeZone = TimeZone(identifier: "UTC")
+            dayFormat.dateFormat = "yyyy-MM-dd"
+            let days = [0, 1].map { dayFormat.string(from: Date().addingTimeInterval(Double($0) * 86_400)) }
+            let requests = ["eventsnextleague.php?id=\(league.id)", "eventspastleague.php?id=\(league.id)"]
+                + days.map { "eventsday.php?d=\($0)&l=\(league.id)" }
+            for path in requests {
+                guard let list = await fetchEvents(path, league: league) else { continue }
                 anyOK = true
                 for game in list { byID[game.id] = game }
             }
@@ -205,8 +214,8 @@ final class SportsData: ObservableObject {
         return teams.isEmpty ? nil : teams
     }
 
-    private func fetchEvents(_ endpoint: String, league: League) async -> [SportsGame]? {
-        guard let object = await get("\(endpoint)?id=\(league.id)") else { return nil }
+    private func fetchEvents(_ path: String, league: League) async -> [SportsGame]? {
+        guard let object = await get(path) else { return nil }
         guard let list = object["events"] as? [[String: Any]] else { return [] }
         let teams = Dictionary((saved.teams[league.id] ?? []).map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
         return list.compactMap { item -> SportsGame? in

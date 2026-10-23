@@ -96,7 +96,7 @@ enum SportsMatcher {
 
     static func build(games: [SportsGame], events: [ProviderEvent], listings: [GuideListing],
                       preferSpanish: Bool, now: Date) -> [SportsEvent] {
-        let variants = Dictionary(uniqueKeysWithValues: games.map { ($0.id, (teamVariants($0.home), teamVariants($0.away))) })
+        let variants = Dictionary(games.map { ($0.id, (teamVariants($0.home), teamVariants($0.away))) }, uniquingKeysWith: { a, _ in a })
         var byGame: [String: SportsEvent] = [:]
         var unmatched: [ProviderEvent] = []
 
@@ -201,7 +201,9 @@ enum SportsMatcher {
                 return copy
             }
         }
-        return ordered(Array(byGame.values) + loose).sorted {
+        var seenIDs = Set<String>()
+        let unique = (Array(byGame.values) + loose).filter { seenIDs.insert($0.id).inserted }
+        return ordered(unique).sorted {
             switch ($0.start, $1.start) {
             case let (a?, b?): return a == b ? $0.title < $1.title : a < b
             case (_?, nil): return true

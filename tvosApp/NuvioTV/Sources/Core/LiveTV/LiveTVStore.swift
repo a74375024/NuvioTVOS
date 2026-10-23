@@ -1691,6 +1691,11 @@ final class LiveTVStore: ObservableObject {
             for feed in eventBackups(forEntry: channel.id) where !list.contains(feed) { list.append(feed) }
             return list
         }
+        // A game from Live Events: its channels, then its event feeds.
+        if let game = sportsEvents.first(where: { $0.id == channel.id }) {
+            let list = eventCandidates(game)
+            if !list.isEmpty { return list }
+        }
         if let event = events.first(where: { $0.id == channel.id }) {
             let feeds = event.feeds.compactMap { self.channel(id: $0) }
             // Xtream feeds first, server feeds as backup.
@@ -2527,21 +2532,41 @@ final class LiveTVStore: ObservableObject {
     // MARK: Sports events
 
     private var sportsRebuildTask: Task<Void, Never>?
+    private var sportsRebuildDue: Date?
+    private var sportsRebuildRunning = false
+    private var sportsRebuildAgain = false
     private var sportsSink: AnyCancellable?
 
     /// Re-matches games, guide listings and event feeds a moment after any
-    /// of them change (coalesced; the matching runs off the main thread).
+    /// of them change. Throttled, not debounced: guide listings arrive every
+    /// few seconds while the guide loads, and a debounce that restarts on
+    /// each one would never get to run.
     func scheduleSportsRebuild(delay: Double = 0.5) {
         if sportsSink == nil {
             sportsSink = SportsData.shared.$revision.dropFirst().sink { [weak self] _ in
                 self?.scheduleSportsRebuild(delay: 0.3)
             }
         }
+        if sportsRebuildRunning {
+            sportsRebuildAgain = true
+            return
+        }
+        let due = Date().addingTimeInterval(delay)
+        // Already queued to run sooner: that run picks this change up.
+        if let pending = sportsRebuildDue, pending <= due { return }
         sportsRebuildTask?.cancel()
+        sportsRebuildDue = due
         sportsRebuildTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            try? await Task.sleep(nanoseconds: UInt64(max(0, delay) * 1_000_000_000))
             guard !Task.isCancelled, let self else { return }
+            self.sportsRebuildDue = nil
+            self.sportsRebuildRunning = true
             await self.rebuildSportsEvents()
+            self.sportsRebuildRunning = false
+            if self.sportsRebuildAgain {
+                self.sportsRebuildAgain = false
+                self.scheduleSportsRebuild(delay: 3)
+            }
         }
     }
 
@@ -2576,7 +2601,6 @@ final class LiveTVStore: ObservableObject {
         let built = await Task.detached(priority: .utility) {
             SportsMatcher.build(games: games, events: providerEvents, listings: listings, preferSpanish: preferSpanish, now: now)
         }.value
-        guard !Task.isCancelled else { return }
         if built != sportsEvents { sportsEvents = built }
     }
 
