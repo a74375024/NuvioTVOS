@@ -28,6 +28,7 @@ struct LiveTVOptionsPanel: View {
     @State private var countriesAtOpen: Set<String> = []
     @State private var preferTS = LiveTVStore.xtreamPrefersTS
     @State private var guidePreview = LiveTVStore.guidePreviewEnabled
+    @State private var sportsInfo = SportsData.isEnabled
     @State private var showEdit = false
     @State private var showSources = false
     @State private var showReport = false
@@ -96,6 +97,14 @@ struct LiveTVOptionsPanel: View {
             guidePreview.toggle()
             LiveTVStore.guidePreviewEnabled = guidePreview
             if !guidePreview { store.stopPreview() }
+        }
+        LivePanelRow(title: L10n.string("live_sports_info", fallback: "Sports info"),
+                     detail: L10n.string("live_sports_info_detail", fallback: "Team badges, art and results from TheSportsDB"),
+                     accessory: .toggle(sportsInfo)) {
+            sportsInfo.toggle()
+            SportsData.isEnabled = sportsInfo
+            SportsData.shared.refreshIfNeeded()
+            store.scheduleSportsRebuild(delay: 0.2)
         }
         LivePanelRow(title: L10n.string("live_guide_sources", fallback: "Guide Listings"), accessory: .chevron(nil)) {
             showSources = true

@@ -99,11 +99,19 @@ final class LiveTVStore: ObservableObject {
     /// Entries from the chosen countries (plus favorites and My Lineup): what
     /// All Channels, groups and Show hidden list. Search covers everything.
     @Published private(set) var browseEntries: [LiveTVChannel] = []
-    @Published private(set) var events: [LiveEvent] = []
+    @Published private(set) var events: [LiveEvent] = [] {
+        didSet { scheduleSportsRebuild(delay: 1) }
+    }
+    /// Live Events: TheSportsDB games joined with guide channels and
+    /// provider event feeds (see SportsMatcher).
+    @Published private(set) var sportsEvents: [SportsEvent] = []
     @Published private(set) var families: [EventFamily] = []
     @Published private(set) var prefs = LineupPrefs()
     @Published private(set) var programs: [String: [LiveTVProgram]] = [:] {
-        didSet { programsRevision &+= 1 }
+        didSet {
+            programsRevision &+= 1
+            scheduleSportsRebuild(delay: 6)
+        }
     }
     @Published private(set) var state: LoadState = .idle
     @Published private(set) var isLoadingGuide = false
@@ -1661,6 +1669,16 @@ final class LiveTVStore: ObservableObject {
         return channel(id: id)
     }
 
+    /// An entry's own versions, without the event feeds `versions(of:)` adds.
+    func baseVersions(of channel: LiveTVChannel) -> [LiveTVChannel] {
+        guard let info = entryInfo[channel.id] else { return [channel] }
+        var list = orderedByReliability(info.members.compactMap { self.channel(id: $0) })
+        if let pinned = pinnedFeeds[channel.id], let index = list.firstIndex(where: { $0.id == pinned }), index > 0 {
+            list.insert(list.remove(at: index), at: 0)
+        }
+        return list
+    }
+
     /// Raw versions of an entry, best first (reliable sources moved up).
     func versions(of channel: LiveTVChannel) -> [LiveTVChannel] {
         if let info = entryInfo[channel.id] {
@@ -1669,6 +1687,8 @@ final class LiveTVStore: ObservableObject {
             if let pinned = pinnedFeeds[channel.id], let index = list.firstIndex(where: { $0.id == pinned }), index > 0 {
                 list.insert(list.remove(at: index), at: 0)
             }
+            // A game on this channel: its provider event feeds back it up.
+            for feed in eventBackups(forEntry: channel.id) where !list.contains(feed) { list.append(feed) }
             return list
         }
         if let event = events.first(where: { $0.id == channel.id }) {
@@ -2502,6 +2522,147 @@ final class LiveTVStore: ObservableObject {
             }
         }
         return Array(result.sorted { $0.program.start < $1.program.start }.prefix(limit))
+    }
+
+    // MARK: Sports events
+
+    private var sportsRebuildTask: Task<Void, Never>?
+    private var sportsSink: AnyCancellable?
+
+    /// Re-matches games, guide listings and event feeds a moment after any
+    /// of them change (coalesced; the matching runs off the main thread).
+    func scheduleSportsRebuild(delay: Double = 0.5) {
+        if sportsSink == nil {
+            sportsSink = SportsData.shared.$revision.dropFirst().sink { [weak self] _ in
+                self?.scheduleSportsRebuild(delay: 0.3)
+            }
+        }
+        sportsRebuildTask?.cancel()
+        sportsRebuildTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            guard !Task.isCancelled, let self else { return }
+            await self.rebuildSportsEvents()
+        }
+    }
+
+    private func rebuildSportsEvents() async {
+        let now = Date()
+        let games = SportsData.shared.games
+        let spanishWords = "\\b(spanish|espanol|español|deportes|telemundo|univision|tudn|unimas)\\b"
+        let providerEvents = events.map { event in
+            SportsMatcher.ProviderEvent(
+                id: event.id, title: event.title, league: event.league, start: event.start, feeds: event.feeds,
+                family: event.family, spanish: event.market == "US-ES" || RX.test(spanishWords, event.title, caseInsensitive: true)
+            )
+        }
+        let lineup = Set(lineupIDs)
+        let eligible = Set(browseEntries.map(\.id)).union(lineup)
+        let low = now.addingTimeInterval(-5 * 3600), high = now.addingTimeInterval(16 * 3600)
+        let sportsWords = "\\b(nfl|nba|wnba|mlb|nhl|mls|ncaa|football|basketball|baseball|hockey|soccer|futbol|fútbol|premier league|champions league|liga|serie a|bundesliga)\\b"
+        var listings: [SportsMatcher.GuideListing] = []
+        if !games.isEmpty {
+            for (id, list) in programs where id.hasPrefix("e|") && eligible.contains(id) {
+                let info = entryInfo[id]
+                let spanish = info?.category == .spanish || info?.market == "US-ES"
+                for program in list where program.end > low && program.start < high {
+                    let title = program.episodeTitle.map { "\(program.title) \($0)" } ?? program.title
+                    guard program.isSports || RX.test(sportsWords, title, caseInsensitive: true) else { continue }
+                    listings.append(SportsMatcher.GuideListing(entryID: id, inLineup: lineup.contains(id), spanish: spanish,
+                                                               title: title, start: program.start, end: program.end))
+                }
+            }
+        }
+        let preferSpanish = prefs.countries.contains("US-ES")
+        let built = await Task.detached(priority: .utility) {
+            SportsMatcher.build(games: games, events: providerEvents, listings: listings, preferSpanish: preferSpanish, now: now)
+        }.value
+        guard !Task.isCancelled else { return }
+        if built != sportsEvents { sportsEvents = built }
+    }
+
+    func sourceChannel(_ source: EventSource) -> LiveTVChannel? {
+        source.kind == .provider ? channel(id: source.channelID) : (entry(id: source.channelID) ?? channel(id: source.channelID))
+    }
+
+    private func quality(_ channel: LiveTVChannel) -> Int { traits[channel.id]?.quality ?? 0 }
+
+    /// Provider feeds best first: quality, then how reliable their source has been.
+    private func bestFeeds(_ feeds: [LiveTVChannel]) -> [LiveTVChannel] {
+        let byQuality = feeds.enumerated().sorted { a, b in
+            let qa = quality(a.element), qb = quality(b.element)
+            return qa != qb ? qa > qb : a.offset < b.offset
+        }.map(\.element)
+        return orderedByReliability(byQuality)
+    }
+
+    /// Everything that can play an event, in order: the picked source (if
+    /// any) first, then My Lineup / guide channels, then provider feeds.
+    func eventCandidates(_ event: SportsEvent, preferring sourceID: String? = nil) -> [LiveTVChannel] {
+        var list: [LiveTVChannel] = []
+        func add(_ channels: [LiveTVChannel]) {
+            for channel in channels where !list.contains(where: { $0.id == channel.id }) { list.append(channel) }
+        }
+        if let sourceID, let source = event.sources.first(where: { $0.channelID == sourceID }), let channel = sourceChannel(source) {
+            add(source.kind == .provider ? [channel] : baseVersions(of: channel))
+        }
+        for source in event.channels {
+            if let channel = sourceChannel(source) { add(baseVersions(of: channel)) }
+        }
+        add(bestFeeds(event.feeds.compactMap { channel(id: $0.channelID) }))
+        return list
+    }
+
+    /// An event shown as a channel (player, banner, tuning card).
+    func displayChannel(for event: SportsEvent) -> LiveTVChannel {
+        let first = eventCandidates(event).first
+        return LiveTVChannel(
+            id: event.id, serverID: first?.serverID ?? "", itemID: first?.itemID ?? "", name: event.title,
+            number: nil, imageURL: nil, isFavorite: false, group: event.league, shortName: event.title
+        )
+    }
+
+    func watchSportsEvent(_ event: SportsEvent, preferring sourceID: String? = nil) {
+        let candidates = eventCandidates(event, preferring: sourceID)
+        guard !candidates.isEmpty else {
+            flash(L10n.string("live_event_no_source", fallback: "Nothing in your channels is showing this yet"))
+            return
+        }
+        // Starting a guide channel: watch the channel itself (the game's
+        // event feeds back it up through versions(of:)).
+        if let sourceID, let source = event.sources.first(where: { $0.channelID == sourceID }), source.kind != .provider,
+           let entry = entry(id: source.channelID) {
+            watch(entry)
+            return
+        }
+        let display = displayChannel(for: event)
+        flipList = [display]
+        surfStep = 0
+        tune(display, candidates: candidates, from: 0, followFeed: false)
+    }
+
+    /// Feeds of a game airing now on an entry, as extra backups for it.
+    private func eventBackups(forEntry id: String) -> [LiveTVChannel] {
+        guard !sportsEvents.isEmpty else { return [] }
+        let now = Date()
+        for event in sportsEvents where event.sources.contains(where: { $0.channelID == id && $0.kind != .provider }) {
+            guard let start = event.start, start < now.addingTimeInterval(15 * 60) else { continue }
+            let state = event.state(at: now)
+            guard state == .live || state == .mayHaveEnded || state == .upcoming else { continue }
+            return bestFeeds(event.feeds.compactMap { channel(id: $0.channelID) })
+        }
+        return []
+    }
+
+    /// What a reminder for an upcoming event points at: its best channel.
+    func reminderTarget(for event: SportsEvent) -> (channel: LiveTVChannel, program: LiveTVProgram)? {
+        guard let start = event.start,
+              let source = event.channels.first ?? event.feeds.first, let channel = sourceChannel(source) else { return nil }
+        let program = LiveTVProgram(
+            id: event.id, channelID: channel.id, title: event.title, episodeTitle: nil, overview: nil,
+            start: start, end: start.addingTimeInterval(event.expectedLength), isMovie: false, isSports: true,
+            isNews: false, isKids: false, isLive: true, isPremiere: false, imageURL: nil
+        )
+        return (channel, program)
     }
 
     // MARK: Mini guide and previous channel

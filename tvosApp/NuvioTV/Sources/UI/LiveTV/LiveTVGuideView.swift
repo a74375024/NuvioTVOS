@@ -206,6 +206,9 @@ struct LiveTVGuideView: View {
     @FocusState private var timeFocus: String?
     /// The details card for a future show.
     @State private var detail: LiveProgramDetail?
+    @State private var focusedEvent: SportsEvent?
+    @State private var eventDetail: SportsEvent?
+    @State private var eventWhere: SportsEvent?
     @ObservedObject private var reminders = LiveReminders.shared
     @State private var genreCounts: (channels: [LineupCategory: Int], now: [LiveNowGenre: Int])?
     @State private var rowsMemo = LiveRowsMemo()
@@ -226,6 +229,9 @@ struct LiveTVGuideView: View {
     var body: some View {
         ZStack(alignment: .top) {
             Color.nuvioBackground(amoled: amoled, body: bodyColor).ignoresSafeArea()
+            if showingEvents, store.state == .loaded {
+                LiveEventBackdrop(event: focusedEvent)
+            }
             switch store.state {
             case .loaded:
                 content
@@ -266,6 +272,21 @@ struct LiveTVGuideView: View {
                 LiveProgramDetailCard(detail: detail, onClose: { self.detail = nil })
                     .transition(.opacity)
             }
+            if let event = eventDetail {
+                LiveEventDetailCard(
+                    event: event,
+                    onClose: { eventDetail = nil },
+                    onWhere: {
+                        eventDetail = nil
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { eventWhere = event }
+                    }
+                )
+                .transition(.opacity)
+            }
+            if let event = eventWhere {
+                LiveEventWherePanel(event: event, onClose: { eventWhere = nil })
+                    .transition(.move(edge: .trailing).combined(with: .opacity))
+            }
             if let panel {
                 Group {
                     switch panel {
@@ -287,11 +308,15 @@ struct LiveTVGuideView: View {
         .animation(.easeInOut(duration: 0.25), value: store.toast)
         .animation(.easeOut(duration: 0.22), value: panel)
         .animation(.easeOut(duration: 0.2), value: detail?.id)
+        .animation(.easeOut(duration: 0.2), value: eventDetail?.id)
+        .animation(.easeOut(duration: 0.22), value: eventWhere?.id)
         .onChange(of: store.isWatching) { _, watching in
             // After watching, the guide is back on Now.
             if watching {
                 viewStart = nil
                 detail = nil
+                eventDetail = nil
+                eventWhere = nil
             }
         }
         .onChange(of: showsAllTab) { _, shows in
@@ -514,11 +539,19 @@ struct LiveTVGuideView: View {
             let ppm = gridWidth / CGFloat(LiveGuideMetrics.windowMinutes)
             VStack(alignment: .leading, spacing: 0) {
                 if showingEvents {
-                    eventsHeader
-                    tabBar.padding(.bottom, 16)
-                    LiveEventsView(onPickFamily: { family in
-                        feedPicker = LiveFeedPicker(title: family.name, channel: nil, family: family)
-                    })
+                    LiveEventsHero(event: focusedEvent, now: now)
+                        .frame(width: max(0, proxy.size.width - LiveGuideMetrics.sideInset * 2), height: LiveGuideMetrics.heroHeight,
+                               alignment: .topLeading)
+                        .clipped()
+                    tabBar.padding(.bottom, 14)
+                    LiveEventsBoard(
+                        focusedEvent: $focusedEvent,
+                        onPickFamily: { family in
+                            feedPicker = LiveFeedPicker(title: family.name, channel: nil, family: family)
+                        },
+                        onDetail: { event in eventDetail = event },
+                        onWhere: { event in eventWhere = event }
+                    )
                 } else {
                     hero.frame(width: max(0, proxy.size.width - LiveGuideMetrics.sideInset * 2), height: LiveGuideMetrics.heroHeight).clipped()
                     tabBar.padding(.bottom, 14)
@@ -532,7 +565,7 @@ struct LiveTVGuideView: View {
             }
             .padding(.horizontal, LiveGuideMetrics.sideInset)
             .frame(width: proxy.size.width, alignment: .leading)
-            .disabled(panel != nil || detail != nil)
+            .disabled(panel != nil || detail != nil || eventDetail != nil || eventWhere != nil)
             .overlay(alignment: .topLeading) {
                 if !showingEvents, !railOpen {
                     nowLine(gridWidth: gridWidth, ppm: ppm, height: proxy.size.height)
