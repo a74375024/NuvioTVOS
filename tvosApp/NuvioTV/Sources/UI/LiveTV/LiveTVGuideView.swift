@@ -184,6 +184,11 @@ struct LiveTVGuideView: View {
     @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
     @AppStorage("nuvio.tv.livetv.setupOffered") private var setupOffered = false
     @FocusState private var focusedCell: String?
+    /// Neighborhood rail: Left from a row's first show opens it.
+    @State private var railOpen = false
+    @State private var railOrigin: LineupCategory?
+    @State private var railReturnKey: String?
+    @FocusState private var railFocus: LineupCategory?
     @State private var focusedChannel: LiveTVChannel?
     @State private var focusedProgram: LiveTVProgram?
     @State private var chosenView: LiveView?
@@ -491,7 +496,7 @@ struct LiveTVGuideView: View {
             .padding(.horizontal, LiveGuideMetrics.sideInset)
             .frame(width: proxy.size.width, alignment: .leading)
             .overlay(alignment: .topLeading) {
-                if !showingEvents {
+                if !showingEvents, !railOpen {
                     nowLine(gridWidth: gridWidth, ppm: ppm, height: proxy.size.height)
                 }
             }
@@ -500,32 +505,219 @@ struct LiveTVGuideView: View {
 
     private func guideList(gridWidth: CGFloat, ppm: CGFloat) -> some View {
         let list = rows
+        let items = guideItems(list)
         return ScrollViewReader { scroller in
-        ScrollView(.vertical, showsIndicators: false) {
-            LazyVStack(alignment: .leading, spacing: LiveGuideMetrics.rowSpacing) {
-                if list.isEmpty {
-                    Text(emptyMessage)
-                        .font(.system(size: 24))
-                        .foregroundColor(.white.opacity(0.6))
-                        .padding(.vertical, 40)
-                }
-                ForEach(guideItems(list)) { item in
-                    switch item {
-                    case .header(let title, _):
-                        neighborhoodHeader(title)
-                    case .row(let row):
-                        guideRow(row, list: list, gridWidth: gridWidth, ppm: ppm)
+            ZStack(alignment: .topLeading) {
+                ScrollView(.vertical, showsIndicators: false) {
+                    LazyVStack(alignment: .leading, spacing: LiveGuideMetrics.rowSpacing) {
+                        if list.isEmpty {
+                            Text(emptyMessage)
+                                .font(.system(size: 24))
+                                .foregroundColor(.white.opacity(0.6))
+                                .padding(.vertical, 40)
+                        }
+                        ForEach(items) { item in
+                            switch item {
+                            case .header(let title, _):
+                                neighborhoodHeader(title)
+                            case .row(let row):
+                                guideRow(row, list: list, gridWidth: gridWidth, ppm: ppm)
+                            }
+                        }
                     }
+                    .padding(.bottom, 60)
+                }
+                .mask(Rectangle().padding(.horizontal, -60).padding(.bottom, -200))
+                .disabled(railOpen)
+                .overlay(Color.black.opacity(railOpen ? 0.5 : 0).allowsHitTesting(false))
+                .focusSection()
+                if railOpen {
+                    neighborhoodRail(neighborhoods(items), list: list, ppm: ppm, scroller: scroller)
+                        .padding(.leading, -16)
+                        .transition(.move(edge: .leading).combined(with: .opacity))
                 }
             }
-            .padding(.bottom, 60)
+            .animation(.easeOut(duration: 0.18), value: railOpen)
+            .onChange(of: store.isWatching) { _, watching in
+                guard !watching else { return }
+                returnFocus(list: list, ppm: ppm, scroller: scroller)
+            }
+            .onChange(of: focusedCell) { old, new in
+                channelColumnFocused(old: old, new: new, list: list, items: items, ppm: ppm)
+            }
+            .onChange(of: railFocus) { old, new in
+                if let new, let hood = neighborhoods(items).first(where: { $0.category == new }) {
+                    // The guide follows the rail, so you see where you'll land.
+                    scroller.scrollTo(hood.headerID, anchor: .top)
+                } else if old != nil, new == nil, railOpen {
+                    // Focus left the rail (Left to the app menu, Up to the filters).
+                    railOpen = false
+                }
+            }
         }
-        .mask(Rectangle().padding(.horizontal, -60).padding(.bottom, -200))
+    }
+
+    // MARK: Neighborhood rail
+    //
+    // Left from a row's first show focuses that row's channel cell, which
+    // opens the rail on the row's neighborhood instead. Up / Down move
+    // through the neighborhoods (the guide scrolls along behind it), Right or
+    // Select lands on the first channel of the highlighted one, Back returns
+    // to where you were. Left again goes on to the app menu. Channel cells
+    // are only a way into the rail: reached any other way (Down from the
+    // filters), focus moves on to the row's current show.
+
+    struct Neighborhood: Identifiable {
+        let category: LineupCategory
+        let headerID: String
+        let firstRow: LiveGuideRow
+        var count: Int
+        var id: String { category.rawValue }
+    }
+
+    /// The neighborhoods in the current view, in guide order.
+    private func neighborhoods(_ items: [LiveGuideItem]) -> [Neighborhood] {
+        var result: [Neighborhood] = []
+        var indexOf: [LineupCategory: Int] = [:]
+        var pendingHeader: String?
+        for item in items {
+            switch item {
+            case .header:
+                pendingHeader = item.id
+            case .row(let row):
+                guard let category = store.category(of: row.channel.id) else { continue }
+                if let index = indexOf[category] {
+                    result[index].count += 1
+                } else if let header = pendingHeader {
+                    indexOf[category] = result.count
+                    result.append(Neighborhood(category: category, headerID: header, firstRow: row, count: 1))
+                }
+                pendingHeader = nil
+            }
+        }
+        return result
+    }
+
+    /// The cell to focus on a channel's row: what's on now, else its first
+    /// show, else its "no guide" cell.
+    private func nowKey(for channel: LiveTVChannel, ppm: CGFloat) -> String {
+        let programs = segments(for: channel, ppm: ppm).compactMap { part -> LiveTVProgram? in
+            if case .program(let program, _, _) = part { return program }
+            return nil
+        }
+        if let program = programs.first(where: { $0.isOn(at: Date()) }) ?? programs.first {
+            return "\(channel.id)#\(program.id)"
+        }
+        return "\(channel.id)#none"
+    }
+
+    /// Focus moves to `key` once the grid can take it (it's disabled while
+    /// the rail is open), checked again a moment later.
+    private func focusGrid(_ key: String) {
+        for delay in [0.05, 0.3] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                guard !railOpen, !store.isWatching, focusedCell != key else { return }
+                focusedCell = key
+            }
+        }
+    }
+
+    private func channelColumnFocused(old: String?, new: String?, list: [LiveGuideRow], items: [LiveGuideItem], ppm: CGFloat) {
+        guard let new, new.hasSuffix("#ch") else { return }
+        let id = String(new.dropLast(3))
+        guard let row = list.first(where: { $0.channel.id == id }) else { return }
+        let fromRow = old.map { $0.hasPrefix(id + "#") && !$0.hasSuffix("#ch") } ?? false
+        if fromRow, let old, let category = store.category(of: id),
+           neighborhoods(items).contains(where: { $0.category == category }) {
+            railReturnKey = old
+            railOrigin = category
+            railOpen = true
+            railFocus = category
+            DispatchQueue.main.async { if railOpen { railFocus = category } }
+        } else {
+            let key = fromRow ? (old ?? nowKey(for: row.channel, ppm: ppm)) : nowKey(for: row.channel, ppm: ppm)
+            DispatchQueue.main.async { focusedCell = key }
+        }
+    }
+
+    private func closeRail(landingOn hood: Neighborhood, ppm: CGFloat, scroller: ScrollViewProxy) {
+        railOpen = false
+        scroller.scrollTo(hood.headerID, anchor: .top)
+        focusGrid(nowKey(for: hood.firstRow.channel, ppm: ppm))
+    }
+
+    private func cancelRail(scroller: ScrollViewProxy) {
+        railOpen = false
+        guard let key = railReturnKey, let hash = key.lastIndex(of: "#") else { return }
+        scroller.scrollTo(String(key[..<hash]), anchor: .center)
+        focusGrid(key)
+    }
+
+    private func neighborhoodRail(_ hoods: [Neighborhood], list: [LiveGuideRow], ppm: CGFloat, scroller: ScrollViewProxy) -> some View {
+        let buttons = VStack(alignment: .leading, spacing: 4) {
+            ForEach(hoods) { hood in
+                railButton(hood, ppm: ppm, scroller: scroller)
+            }
+        }
+        return VStack(alignment: .leading, spacing: 10) {
+            Text(L10n.string("live_jump_to", fallback: "JUMP TO"))
+                .font(.system(size: 16, weight: .heavy))
+                .tracking(2)
+                .foregroundColor(.white.opacity(0.5))
+                .padding(.leading, 20)
+            ViewThatFits(in: .vertical) {
+                buttons
+                ScrollView(.vertical, showsIndicators: false) { buttons.padding(.vertical, 6) }
+            }
+        }
+        .padding(.top, 22)
+        .padding(.bottom, 14)
+        .padding(.horizontal, 12)
+        .frame(width: 360, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 26, style: .continuous)
+                .fill(Color(white: 0.12))
+                .overlay(RoundedRectangle(cornerRadius: 26, style: .continuous).strokeBorder(Color.white.opacity(0.12), lineWidth: 1))
+                .shadow(color: .black.opacity(0.6), radius: 30, x: 8, y: 8)
+        )
         .focusSection()
-        .onChange(of: store.isWatching) { _, watching in
-            guard !watching else { return }
-            returnFocus(list: list, ppm: ppm, scroller: scroller)
+        .onExitCommand { cancelRail(scroller: scroller) }
+    }
+
+    private func railButton(_ hood: Neighborhood, ppm: CGFloat, scroller: ScrollViewProxy) -> some View {
+        let focused = railFocus == hood.category
+        return Button {
+            closeRail(landingOn: hood, ppm: ppm, scroller: scroller)
+        } label: {
+            HStack(spacing: 10) {
+                Circle()
+                    .fill(Color(red: 1, green: 0.32, blue: 0.32))
+                    .frame(width: 8, height: 8)
+                    .opacity(hood.category == railOrigin && !focused ? 1 : 0)
+                Text(hood.category.genreTitle)
+                    .font(.system(size: 24, weight: .bold))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
+                Spacer(minLength: 8)
+                Text("\(hood.count)")
+                    .font(.system(size: 18, weight: .bold).monospacedDigit())
+                    .opacity(0.55)
+            }
+            .foregroundColor(focused ? .black : .white.opacity(0.9))
+            .padding(.leading, 10)
+            .padding(.trailing, 18)
+            .frame(height: 50)
+            .background(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .fill(focused ? Color.white : Color.clear)
+            )
+            .animation(.easeOut(duration: 0.12), value: focused)
         }
+        .buttonStyle(PosterCardButtonStyle())
+        .focused($railFocus, equals: hood.category)
+        .focusEffectDisabledIfAvailable()
+        .onMoveCommand { direction in
+            if direction == .right { closeRail(landingOn: hood, ppm: ppm, scroller: scroller) }
         }
     }
 
@@ -535,14 +727,7 @@ struct LiveTVGuideView: View {
     /// gone and checked again a moment later.
     private func returnFocus(list: [LiveGuideRow], ppm: CGFloat, scroller: ScrollViewProxy) {
         guard let id = store.lastWatchedID, let row = list.first(where: { $0.channel.id == id }) else { return }
-        var key = "\(id)#none"
-        let programs = segments(for: row.channel, ppm: ppm).compactMap { part -> LiveTVProgram? in
-            if case .program(let program, _, _) = part { return program }
-            return nil
-        }
-        if let program = programs.first(where: { $0.isOn(at: Date()) }) ?? programs.first {
-            key = "\(id)#\(program.id)"
-        }
+        let key = nowKey(for: row.channel, ppm: ppm)
         scroller.scrollTo(row.id, anchor: .center)
         for delay in [0.35, 0.7] {
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
@@ -965,6 +1150,10 @@ struct LiveTVGuideView: View {
 
     private func channelCell(_ channel: LiveTVChannel, dimmed: Bool, isRowFocused: Bool) -> some View {
         LiveChannelCell(channel: channel, spec: store.logoSpec(for: channel), focused: isRowFocused, dimmed: dimmed)
+            // Focusable only as the way into the neighborhood rail.
+            .focusable(!railOpen && currentView != .recent)
+            .focused($focusedCell, equals: "\(channel.id)#ch")
+            .focusEffectDisabledIfAvailable()
             .padding(.trailing, LiveGuideMetrics.cellGap)
     }
 
