@@ -2048,7 +2048,8 @@ class PlayerViewModel: ObservableObject {
     }
 
     var canShowPauseOverlay: Bool {
-        status == .paused
+        !isLiveStream
+            && status == .paused
             && !isAwaitingStreamStart
             && !isAdvancingEpisode
             && pendingAdvanceResolutionGeneration == nil
@@ -3372,6 +3373,8 @@ class PlayerViewModel: ObservableObject {
     }
 
     func pause(forBackground: Bool = false) {
+        // A live stream is only ever paused when the app goes to the background.
+        if isLiveStream, !forBackground { return }
         if forBackground {
             // Revoke room effects first; lifecycle parking must not broadcast a user's pause.
             watchPartyLifecycle.suspend(engineWillPark: false)
@@ -3862,6 +3865,12 @@ class PlayerViewModel: ObservableObject {
     }
 
     func togglePlayPause() {
+        // Live streams never pause (Play/Pause shows the options instead).
+        if isLiveStream {
+            if status == .paused { play() }
+            revealControls()
+            return
+        }
         recordWatchPartyTransportIntent()
         if isScrubbing {
             commitScrub(andPlay: true)
@@ -4790,6 +4799,12 @@ class PlayerViewModel: ObservableObject {
     /// Handles a select / click gesture from the remote (e.g. from SwiftUI `.onTapGesture`).
     /// Dispatches edge clicks to discrete seeking on 1st Gen Siri Remotes, and center clicks to play/pause.
     func handleSelectTap(isOverlayFocused: Bool = false) {
+        // Live streams can't pause: Select brings up the player options.
+        if isLiveStream, !isOverlayFocused {
+            if status == .paused { play() }
+            revealControls()
+            return
+        }
         if isOverlayFocused {
             if isScrubbing {
                 commitScrub()

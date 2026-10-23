@@ -253,7 +253,11 @@ extension PlayerView {
     }
 
     private var canRevealControlsFromRemotePress: Bool {
-        !liveOverlay.blocksPlayerInput
+        // Live TV and Channels: Up changes channel (onMoveCommand), so a click
+        // Up must not also pop the options.
+        !(viewModel.isLiveStream && LiveTVStore.shared.isWatching)
+            && !viewModel.isChannelPlayback
+            && !liveOverlay.blocksPlayerInput
             && !viewModel.showControls
             && !viewModel.showSettingsPanel
             && !viewModel.showScenePanel
