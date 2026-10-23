@@ -12,6 +12,10 @@ on:
         description: Publish as the full (latest) release instead of a preview
         type: boolean
         default: false
+      screens:
+        description: Run the simulator screenshot tour
+        type: boolean
+        default: false
   push:
     branches: [multiview]
     paths-ignore: ['.github/approved-build']
@@ -58,8 +62,12 @@ jobs:
           fi
           exit $status
 
+      # Opt-in (GitHub pauses forks that use a lot of Actions time): runs
+      # when dispatched with screens=true or when the commit message has
+      # [screens].
       - name: Screen tour (simulator screenshots)
         id: tour
+        if: inputs.screens || contains(github.event.head_commit.message, '[screens]')
         continue-on-error: true
         shell: bash
         run: bash scripts/screen-tour.sh
