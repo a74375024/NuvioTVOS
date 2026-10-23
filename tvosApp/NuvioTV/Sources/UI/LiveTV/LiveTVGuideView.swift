@@ -203,6 +203,18 @@ struct LiveTVGuideView: View {
             case .failed(let message):
                 statusView(symbol: "exclamationmark.triangle", title: L10n.string("live_failed", fallback: "Couldn't load Live TV"), message: message, showsProgress: false, showsRetry: true)
             }
+            if ScreenTour.isMockLiveTV, !store.loadLines.isEmpty {
+                VStack(alignment: .leading, spacing: 4) {
+                    ForEach(Array(store.loadLines.enumerated()), id: \.offset) { _, line in
+                        Text(line).font(.system(size: 17, weight: .medium).monospacedDigit()).foregroundColor(.white)
+                    }
+                }
+                .padding(16)
+                .background(RoundedRectangle(cornerRadius: 12).fill(Color.black.opacity(0.85)))
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+                .padding(40)
+                .allowsHitTesting(false)
+            }
             if let toast = store.toast, !store.isWatching {
                 VStack {
                     Spacer()

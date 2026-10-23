@@ -14,6 +14,10 @@ enum ScreenTour {
 
     static var isActive: Bool { requested != nil }
 
+    /// Live TV against the local mock Xtream provider the CI job runs
+    /// (scripts/mock-xtream.py): the real load path, not demo data.
+    static var isMockLiveTV: Bool { requested == "live-mock" }
+
     enum Destination {
         case tab(TVTab)
         case details(id: String, type: String)
@@ -25,7 +29,7 @@ enum ScreenTour {
         switch parts.first?.lowercased() {
         case "channels": return .tab(.channels)
         case "calendar": return .tab(.calendar)
-        case "live", "live-demo", "live-demo-search", "live-demo-groups", "live-demo-sources", "live-demo-outside", "live-demo-events", "live-demo-all", "live-demo-setup", "live-demo-provider", "live-demo-preview", "live-demo-genres": return .tab(.live)
+        case "live", "live-demo", "live-demo-search", "live-demo-groups", "live-demo-sources", "live-demo-outside", "live-demo-events", "live-demo-all", "live-demo-setup", "live-demo-provider", "live-demo-preview", "live-demo-genres", "live-mock": return .tab(.live)
         case "library": return .tab(.library)
         case "search": return .tab(.search)
         case "settings": return .tab(.settings)

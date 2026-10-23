@@ -52,8 +52,34 @@ shots=(
   "07d-live-tv-listings|live-demo-sources|12"
   "07e-live-tv-outside-listings|live-demo-outside|180"
   "07h-live-tv-provider-guide|live-demo-provider|40"
+  "07k-live-mock-first-load|live-mock|50"
+  "07l-live-mock-from-saved|live-mock|25"
   "08-settings|settings|12"
 )
+
+# A fake Xtream provider (~50k made-up channels) for the live-mock shots,
+# which run the real Live TV load path (download, build, save, reopen).
+python3 "$ROOT_DIR/scripts/mock-xtream.py" 8765 &
+mock_pid=$!
+trap 'kill $mock_pid 2>/dev/null || true' EXIT
+
+# Load-timing lines the app logged, as notices on the run.
+report_load_log() {
+  local container
+  container=$(xcrun simctl get_app_container "$udid" "$bundle" data 2>/dev/null) || return 0
+  python3 - "$container/Library/Caches/LiveTVPlaybackLog.json" "$1" <<'PY' || true
+import json, sys
+path, shot = sys.argv[1], sys.argv[2]
+try:
+    entries = json.load(open(path))
+except Exception as error:
+    print(f"::warning title=Live TV load log ({shot})::not readable: {error}")
+    sys.exit(0)
+for entry in entries:
+    if entry.get("event", "").startswith("load:"):
+        print(f"::notice title=Live TV load ({shot})::{entry['event'][5:].strip()} — {entry.get('detail', '')}")
+PY
+}
 
 is_running() {
   xcrun simctl spawn "$udid" launchctl list 2>/dev/null | grep -q "UIKitApplication:$bundle"
@@ -72,6 +98,7 @@ for entry in "${shots[@]}"; do
     echo "::warning title=Screen tour::$name: the app wasn't running after launch (attempt $attempt)"
   done
   xcrun simctl io "$udid" screenshot --type=png "$OUT/$name.png" >/dev/null 2>&1 || echo "  (screenshot failed)"
+  if [ "$target" = "live-mock" ]; then sleep 3; report_load_log "$name"; fi
 done
 
 # Surface any crash reports from the run.

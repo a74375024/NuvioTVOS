@@ -58,7 +58,7 @@ enum OutsideGuide {
     private static let shardsKey = "nuvio.tv.livetv.outsideGuide.shards"
 
     static var isEnabled: Bool {
-        get { UserDefaults.standard.object(forKey: enabledKey) as? Bool ?? true }
+        get { !ScreenTour.isMockLiveTV && (UserDefaults.standard.object(forKey: enabledKey) as? Bool ?? true) }
         set { UserDefaults.standard.set(newValue, forKey: enabledKey) }
     }
 

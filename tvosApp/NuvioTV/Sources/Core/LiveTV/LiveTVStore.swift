@@ -117,7 +117,7 @@ final class LiveTVStore: ObservableObject {
     static let guideHours = 3.0
     /// Event feeds rename themselves through the day, so the channel list is
     /// re-read this often while Live TV is open.
-    private static let channelLifetime: TimeInterval = 30 * 60
+    private static var channelLifetime: TimeInterval { ScreenTour.isMockLiveTV ? 1 : 30 * 60 }
     private static let programBatch = 25
     private static let guideConcurrency = 4
     private static let otherGroup = "Other"
@@ -405,7 +405,7 @@ final class LiveTVStore: ObservableObject {
 
     /// Saves the finished list (off the main thread) for the next launch.
     private func saveCatalog(signature: String) {
-        guard !catalogPartial, !channels.isEmpty, !ScreenTour.isActive else { return }
+        guard !catalogPartial, !channels.isEmpty, !ScreenTour.isActive || ScreenTour.isMockLiveTV else { return }
         let saved = LiveTVCatalogCache.Saved(
             version: LiveTVCatalogCache.version, signature: signature, savedAt: channelsLoadedAt ?? Date(),
             channels: channels,
@@ -486,6 +486,23 @@ final class LiveTVStore: ObservableObject {
     /// A load-timing line in the exportable log.
     func logLoad(_ event: String, detail: String) {
         LiveTVPlaybackLog.shared.add("load: " + event, session: 0, detail: detail)
+        if ScreenTour.isMockLiveTV {
+            loadLines.append(event + (detail.isEmpty ? "" : " — " + detail))
+            if loadLines.count > 9 { loadLines.removeFirst(loadLines.count - 9) }
+        }
+    }
+
+    /// The latest load lines, shown on screen in the CI mock-provider tour.
+    @Published private(set) var loadLines: [String] = []
+
+    /// CI only (`-NuvioScreenTour live-mock`): an Xtream account on the
+    /// local mock provider (scripts/mock-xtream.py).
+    func installMockAccount() {
+        guard ScreenTour.isMockLiveTV else { return }
+        let account = XtreamAccount(id: "tourmock", displayName: "Mock IPTV", serverURLString: "http://127.0.0.1:8765",
+                                    username: "tour", expires: nil, maxConnections: 1, lastChannelCount: nil)
+        XtreamCredentialStore.save("tour", forAccountID: account.id)
+        if XtreamStore.shared.account(sourceID: account.sourceID) == nil { XtreamStore.shared.upsert(account) }
     }
 
     // MARK: Downloading the channel list

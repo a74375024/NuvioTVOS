@@ -1202,7 +1202,9 @@ struct ContentView: View {
             try? await Task.sleep(nanoseconds: 1_500_000_000)
             switch ScreenTour.destination {
             case .tab(let tab):
-                if ScreenTour.requested == "live-demo-outside" {
+                if ScreenTour.isMockLiveTV {
+                    LiveTVStore.shared.installMockAccount()
+                } else if ScreenTour.requested == "live-demo-outside" {
                     LiveTVStore.shared.loadOutsideDemo()
                 } else if ScreenTour.requested == "live-demo-provider" {
                     LiveTVStore.shared.loadProviderDemo()
