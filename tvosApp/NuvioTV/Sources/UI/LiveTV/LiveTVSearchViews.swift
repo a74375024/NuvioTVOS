@@ -89,9 +89,6 @@ struct LiveTVSearchView: View {
             onWatch(channel, lineup)
         } label: {
             HStack(spacing: 20) {
-                Text(store.number(of: channel))
-                    .font(.system(size: 24, weight: .heavy).monospacedDigit())
-                    .frame(width: 90, alignment: .leading)
                 VStack(alignment: .leading, spacing: 4) {
                     Text(channel.name).font(.system(size: 26, weight: .semibold))
                     Text(subtitle(for: channel))
@@ -160,7 +157,7 @@ struct LiveTVSearchView: View {
                             }
                             Text(program.title).font(.system(size: 26, weight: .semibold)).lineLimit(1)
                         }
-                        Text("\(store.number(of: channel)) · \(channel.name) · \(Self.timeRange(program))")
+                        Text("\(channel.name) · \(Self.timeRange(program))")
                             .font(.system(size: 20))
                             .foregroundColor(.secondary)
                             .lineLimit(1)

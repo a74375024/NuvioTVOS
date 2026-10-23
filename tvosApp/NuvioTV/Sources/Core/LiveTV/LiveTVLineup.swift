@@ -103,7 +103,7 @@ struct LineupPrefs: Codable, Equatable {
     }
 }
 
-/// Builds the suggested lineup and its cable-style numbering.
+/// Works out which channels the suggested lineup holds.
 enum LineupEngine {
     /// Whether an entry belongs in the suggested lineup.
     static func suggests(
@@ -163,33 +163,4 @@ enum LineupEngine {
         }
     }
 
-    /// Lineup numbers: locals on their real channel numbers, the rest in
-    /// category blocks (news 100s, sports 200s…), alphabetical within a block.
-    static func numbers(for entries: [LiveTVEntryInfo]) -> [String: Int] {
-        var result: [String: Int] = [:]
-        var used = Set<Int>()
-        let locals = entries.filter { $0.category == .local }
-            .sorted { ($0.virtualNumber ?? 999, $0.name) < ($1.virtualNumber ?? 999, $1.name) }
-        var nextLocal = 2
-        for entry in locals {
-            if let number = entry.virtualNumber, number >= 1, number < 100, !used.contains(number) {
-                result[entry.id] = number
-                used.insert(number)
-            } else {
-                while used.contains(nextLocal) { nextLocal += 1 }
-                result[entry.id] = nextLocal
-                used.insert(nextLocal)
-            }
-        }
-        let others = Dictionary(grouping: entries.filter { $0.category != .local }, by: \.category)
-        for category in LineupCategory.allCases where category != .local {
-            var number = category.numberBlock
-            for entry in (others[category] ?? []).sorted(by: { $0.name.localizedStandardCompare($1.name) == .orderedAscending }) {
-                while used.contains(number) { number += 1 }
-                result[entry.id] = number
-                used.insert(number)
-            }
-        }
-        return result
-    }
 }

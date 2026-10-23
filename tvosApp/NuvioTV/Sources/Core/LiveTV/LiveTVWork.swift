@@ -170,7 +170,6 @@ enum LiveTVWork {
 
     struct LineupOutput {
         let lineupIDs: Set<String>
-        let lineupNumbers: [String: Int]
         let entries: [LiveTVChannel]
         let entryIndex: [String: Int]
         let lineupEntries: [LiveTVChannel]
@@ -178,7 +177,7 @@ enum LiveTVWork {
         let groups: [(name: String, count: Int)]
     }
 
-    /// Lineup membership, numbering and the entry list.
+    /// Lineup membership and the entry list, in guide order.
     static func lineup(_ input: LineupInput) -> LineupOutput {
         let prefs = input.prefs
         let infos = input.infos
@@ -200,34 +199,34 @@ enum LiveTVWork {
                 }
             }
         }
-        let lineupNumbers = LineupEngine.numbers(for: infos.filter { lineup.contains($0.id) })
-        // Everything else gets numbers after the lineup, by category.
-        var allNumbers = lineupNumbers
-        var restByCategory: [LineupCategory: [LiveTVEntryInfo]] = [:]
-        for info in infos where !lineup.contains(info.id) { restByCategory[info.category, default: []].append(info) }
-        var next = (lineupNumbers.values.max() ?? 0) / 1000 * 1000 + 5000
-        for category in LineupCategory.allCases {
-            let sorted = (restByCategory[category] ?? []).sorted {
-                $0.name.localizedStandardCompare($1.name) == .orderedAscending
+        // Guide order: neighborhoods (Local, News, Sports, Entertainment…),
+        // locals by their broadcast number, everything else A–Z. No channel
+        // numbers: channels come and go, and the Apple TV remote can't dial.
+        let rank = Dictionary(uniqueKeysWithValues: LineupCategory.allCases.enumerated().map { ($1, $0) })
+        let ordered = infos.sorted { a, b in
+            let ra = rank[a.category] ?? 99, rb = rank[b.category] ?? 99
+            if ra != rb { return ra < rb }
+            if a.category == .local {
+                let na = a.virtualNumber ?? 999, nb = b.virtualNumber ?? 999
+                if na != nb { return na < nb }
             }
-            for info in sorted {
-                allNumbers[info.id] = next
-                next += 1
-            }
+            let byName = a.name.localizedStandardCompare(b.name)
+            if byName != .orderedSame { return byName == .orderedAscending }
+            return a.id < b.id
         }
         var marketOf: [String: String] = [:]
-        let built: [LiveTVChannel] = infos.compactMap { info in
+        let built: [LiveTVChannel] = ordered.compactMap { info in
             let members = info.members.compactMap(member)
             guard let primary = members.first else { return nil }
             if let market = info.market { marketOf[info.id] = market }
             return LiveTVChannel(
                 id: info.id, serverID: primary.serverID, itemID: primary.itemID, name: info.name,
-                number: allNumbers[info.id].map(String.init),
+                number: nil,
                 imageURL: members.lazy.compactMap(\.imageURL).first,
                 isFavorite: members.contains(where: \.isFavorite),
                 tags: primary.tags, isRadio: primary.isRadio, group: primary.group, shortName: info.name
             )
-        }.sorted { (Int($0.number ?? "") ?? Int.max) < (Int($1.number ?? "") ?? Int.max) }
+        }
         let entryIndex = Dictionary(built.enumerated().map { ($1.id, $0) }, uniquingKeysWith: { first, _ in first })
         let lineupEntries = built.filter { lineup.contains($0.id) }
         let browseEntries = built.filter { entry in
@@ -238,7 +237,7 @@ enum LiveTVWork {
         let groups = counts.map { (name: $0.key, count: $0.value) }
             .sorted { $0.count != $1.count ? $0.count > $1.count : $0.name.localizedStandardCompare($1.name) == .orderedAscending }
         return LineupOutput(
-            lineupIDs: lineup, lineupNumbers: lineupNumbers, entries: built, entryIndex: entryIndex,
+            lineupIDs: lineup, entries: built, entryIndex: entryIndex,
             lineupEntries: lineupEntries, browseEntries: browseEntries, groups: groups
         )
     }

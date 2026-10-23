@@ -131,7 +131,6 @@ final class LiveTVStore: ObservableObject {
     private(set) var traits: [String: ChannelTraits] = [:]
     private var entryOf: [String: String] = [:]
     private var entryIndex: [String: Int] = [:]
-    private var lineupNumbers: [String: Int] = [:]
     private(set) var lineupIDs: Set<String> = []
     private var loadedSignature: String?
     private var channelsLoadedAt: Date?
@@ -717,7 +716,6 @@ final class LiveTVStore: ObservableObject {
 
     private func install(_ output: LiveTVWork.LineupOutput) {
         lineupIDs = output.lineupIDs
-        lineupNumbers = output.lineupNumbers
         entries = output.entries
         entryIndex = output.entryIndex
         lineupEntries = output.lineupEntries
@@ -1677,9 +1675,6 @@ final class LiveTVStore: ObservableObject {
         for channel in entries {
             let name = channel.name.lowercased()
             var score = 0
-            if let number = channel.number?.lowercased() {
-                if number == query { score = 100 } else if number.hasPrefix(query), lineupIDs.contains(channel.id) { score = 60 }
-            }
             if name == query { score = max(score, 95) }
             else if name.hasPrefix(query) { score = max(score, 80) }
             else if name.split(whereSeparator: { !$0.isLetter && !$0.isNumber }).contains(where: { $0.hasPrefix(query) }) { score = max(score, 70) }

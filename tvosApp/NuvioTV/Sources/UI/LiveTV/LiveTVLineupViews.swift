@@ -492,8 +492,8 @@ struct LineupEditView: View {
                             store.setInLineup(channel, false)
                         } label: {
                             HStack {
-                                Text(store.number(of: channel)).monospacedDigit().foregroundColor(.secondary).frame(width: 90, alignment: .leading)
                                 Text(channel.name)
+                                Text(store.category(of: channel.id)?.genreTitle ?? "").foregroundColor(.secondary)
                                 Spacer()
                                 Image(systemName: "minus.circle").foregroundColor(.secondary)
                             }

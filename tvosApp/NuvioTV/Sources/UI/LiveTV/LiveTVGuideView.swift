@@ -135,6 +135,19 @@ extension LineupCategory {
     }
 }
 
+/// A guide row, or the header that starts a neighborhood.
+enum LiveGuideItem: Identifiable {
+    case header(String, Int)
+    case row(LiveGuideRow)
+
+    var id: String {
+        switch self {
+        case .header(let title, let index): return "h|\(index)|" + title
+        case .row(let row): return row.id
+        }
+    }
+}
+
 /// Rows of the guide, worked out once per change (not on every redraw).
 final class LiveRowsMemo {
     var key = ""
@@ -378,11 +391,9 @@ struct LiveTVGuideView: View {
         let showHidden = store.prefs.showHidden
         switch currentView {
         case .lineup:
-            var rows = store.lineupEntries.map { LiveGuideRow(channel: $0, dimmed: false) }
-            if showHidden {
-                rows += store.browseEntries.filter { !store.isInLineup($0) }.map { LiveGuideRow(channel: $0, dimmed: true) }
-            }
-            return rows
+            guard showHidden else { return store.lineupEntries.map { LiveGuideRow(channel: $0, dimmed: false) } }
+            // Hidden channels in their neighborhoods, between the lineup's.
+            return store.browseEntries.map { LiveGuideRow(channel: $0, dimmed: !store.isInLineup($0)) }
         case .all:
             return store.browseEntries.compactMap { entry in
                 let hidden = store.isHidden(entry)
@@ -495,14 +506,48 @@ struct LiveTVGuideView: View {
                         .foregroundColor(.white.opacity(0.6))
                         .padding(.vertical, 40)
                 }
-                ForEach(list) { row in
-                    guideRow(row, list: list, gridWidth: gridWidth, ppm: ppm)
+                ForEach(guideItems(list)) { item in
+                    switch item {
+                    case .header(let title, _):
+                        neighborhoodHeader(title)
+                    case .row(let row):
+                        guideRow(row, list: list, gridWidth: gridWidth, ppm: ppm)
+                    }
                 }
             }
             .padding(.bottom, 60)
         }
         .mask(Rectangle().padding(.horizontal, -60).padding(.bottom, -200))
         .focusSection()
+    }
+
+    /// Rows with a header where each neighborhood starts (Local, News,
+    /// Sports…). Recent keeps its own order and has none.
+    private func guideItems(_ list: [LiveGuideRow]) -> [LiveGuideItem] {
+        guard currentView != .recent else { return list.map(LiveGuideItem.row) }
+        var items: [LiveGuideItem] = []
+        items.reserveCapacity(list.count + 12)
+        var last: LineupCategory?
+        for row in list {
+            let category = store.category(of: row.channel.id)
+            if let category, category != last {
+                items.append(.header(category.genreTitle.uppercased(), items.count))
+                last = category
+            }
+            items.append(.row(row))
+        }
+        return items
+    }
+
+    private func neighborhoodHeader(_ title: String) -> some View {
+        Text(title)
+            .font(.system(size: 17, weight: .heavy))
+            .tracking(1.4)
+            .foregroundColor(.white.opacity(0.5))
+            .padding(.leading, 14)
+            .padding(.top, 12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .accessibilityAddTraits(.isHeader)
     }
 
     private var setupPrompt: some View {
@@ -580,12 +625,6 @@ struct LiveTVGuideView: View {
             }
             if let channel = heroChannel {
                 HStack(spacing: 12) {
-                    Text(store.number(of: channel))
-                        .font(.system(size: 22, weight: .heavy).monospacedDigit())
-                        .foregroundColor(.black)
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 3)
-                        .background(RoundedRectangle(cornerRadius: 6).fill(Color.white))
                     logo(channel, size: 30)
                     Text(channel.name)
                         .font(.system(size: 26, weight: .semibold))
@@ -772,8 +811,13 @@ struct LiveTVGuideView: View {
             SourceModeChip(title: L10n.string("live_search", fallback: "Search"), isSelected: false) {
                 showSearch = true
             }
-            SourceModeChip(title: currentView.title + " ▾", isSelected: !showingEvents) {
+            SourceModeChip(title: (currentView == .favorites ? (store.prefs.configured ? LiveView.lineup : LiveView.all).title : currentView.title) + " ▾",
+                           isSelected: !showingEvents && currentView != .favorites) {
                 if showingEvents { showingEvents = false } else { showViewPicker = true }
+            }
+            SourceModeChip(title: L10n.string("live_filter_favorites", fallback: "Favorites"), isSelected: !showingEvents && currentView == .favorites) {
+                showingEvents = false
+                chosenView = currentView == .favorites ? nil : .favorites
             }
             SourceModeChip(title: L10n.string("live_events_chip", fallback: "Live Events"), isSelected: showingEvents) {
                 showingEvents.toggle()
@@ -900,12 +944,6 @@ struct LiveTVGuideView: View {
 
     private func channelCell(_ channel: LiveTVChannel, dimmed: Bool, isRowFocused: Bool) -> some View {
         HStack(spacing: 12) {
-            Text(store.number(of: channel))
-                .font(.system(size: 20, weight: .heavy).monospacedDigit())
-                .foregroundColor(isRowFocused ? .black : .white.opacity(0.7))
-                .frame(width: 62)
-                .lineLimit(1)
-                .minimumScaleFactor(0.6)
             logo(channel, size: 40)
                 .frame(width: 66)
             Text(channel.name)
@@ -1148,14 +1186,6 @@ struct LiveTVOverlay: View {
             VStack(alignment: .leading, spacing: 18) {
                 Spacer()
                 HStack(spacing: 14) {
-                    if channel.number != nil {
-                        Text(store.number(of: channel))
-                            .font(.system(size: 28, weight: .heavy).monospacedDigit())
-                            .foregroundColor(.black)
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 4)
-                            .background(RoundedRectangle(cornerRadius: 8).fill(Color.white))
-                    }
                     Text(channel.name)
                         .font(.system(size: 34, weight: .bold))
                         .foregroundColor(.white)
@@ -1214,7 +1244,7 @@ struct LiveTVOverlay: View {
         VStack {
             Spacer()
             HStack(alignment: .center, spacing: 28) {
-                Text(banner.channel.number.map { _ in store.number(of: banner.channel) } ?? "LIVE")
+                Text("LIVE")
                     .font(.system(size: 34, weight: .heavy).monospacedDigit())
                     .foregroundColor(.white)
                     .frame(minWidth: 110)
