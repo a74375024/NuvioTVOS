@@ -98,6 +98,9 @@ final class SportsData: ObservableObject {
         var leagueFetched: [String: Date] = [:]
         /// League → last time one of its games was on your channels.
         var leagueWatchable: [String: Date] = [:]
+        /// Last attempt that got nothing, so a failing source isn't asked
+        /// again every time Live Events opens.
+        var failedAt: Date?
     }
 
     private var saved = Saved()
@@ -132,6 +135,7 @@ final class SportsData: ObservableObject {
         guard Self.isEnabled, task == nil else { return }
         if let fetched = saved.fetchedAt, Calendar.current.isDateInToday(fetched),
            Date().timeIntervalSince(fetched) < 20 * 3600 { return }
+        if let failed = saved.failedAt, Date().timeIntervalSince(failed) < 3600 { return }
         start(force: false)
     }
 
@@ -189,11 +193,15 @@ final class SportsData: ObservableObject {
     private func fetch(force: Bool) async {
         let now = Date()
         let calendar = Calendar.current
+        // Date ranges stopped working (HTTP 400) in Sept 2026; a whole month
+        // still does. The week ahead is one month, or two near month's end.
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = "yyyyMMdd"
-        let from = formatter.string(from: calendar.date(byAdding: .day, value: -1, to: now) ?? now)
-        let to = formatter.string(from: calendar.date(byAdding: .day, value: 7, to: now) ?? now)
+        formatter.dateFormat = "yyyyMM"
+        let from = calendar.date(byAdding: .day, value: -1, to: now) ?? now
+        let to = calendar.date(byAdding: .day, value: 8, to: now) ?? now
+        var months = [formatter.string(from: from)]
+        if formatter.string(from: to) != months[0] { months.append(formatter.string(from: to)) }
         var byLeague = Dictionary(grouping: saved.games, by: \.leagueShort)
         var fetchedAny = false
         var requests = 0
@@ -201,13 +209,27 @@ final class SportsData: ObservableObject {
             if !force, skip(league.short, now: now) { continue }
             if requests > 0 { try? await Task.sleep(nanoseconds: 700_000_000) }
             requests += 1
-            guard let list = await fetchLeague(league, from: from, to: to) else { continue }
+            var list: [SportsGame] = []
+            var ok = false
+            for (index, month) in months.enumerated() {
+                if index > 0 { try? await Task.sleep(nanoseconds: 700_000_000) }
+                if let part = await fetchLeague(league, month: month, from: from, to: to) {
+                    list += part
+                    ok = true
+                }
+            }
+            guard ok else { continue }
             byLeague[league.short] = list
             saved.leagueFetched[league.short] = now
             fetchedAny = true
         }
         CrashRecorder.note("schedule: \(requests) requests, ok=\(fetchedAny)")
-        guard fetchedAny || requests == 0 else { return }
+        guard fetchedAny || requests == 0 else {
+            saved.failedAt = now
+            save()
+            return
+        }
+        saved.failedAt = nil
         let cutoff = now.addingTimeInterval(-2 * 86_400)
         saved.games = byLeague.values.flatMap { $0 }.filter { $0.start > cutoff }
         saved.fetchedAt = now
@@ -224,31 +246,41 @@ final class SportsData: ObservableObject {
         return now.timeIntervalSince(fetched) < week
     }
 
-    private func fetchLeague(_ league: League, from: String, to: String) async -> [SportsGame]? {
-        let address = "https://site.api.espn.com/apis/site/v2/sports/\(league.path)/scoreboard?dates=\(from)-\(to)&limit=500\(league.extra)"
+    private func get(_ address: String) async -> (status: Int, data: Data)? {
         guard let url = URL(string: address) else { return nil }
         var request = URLRequest(url: url)
         request.timeoutInterval = 20
-        let result: (Data, URLResponse)
         do {
-            result = try await URLSession.shared.data(for: request)
+            let result = try await URLSession.shared.data(for: request)
+            return ((result.1 as? HTTPURLResponse)?.statusCode ?? 0, result.0)
         } catch {
-            CrashRecorder.note("schedule \(league.short): failed (\((error as NSError).code))")
+            CrashRecorder.note("schedule: request failed (\((error as NSError).code))")
             return nil
         }
-        let status = (result.1 as? HTTPURLResponse)?.statusCode ?? 0
-        guard status == 200 else {
-            CrashRecorder.note("schedule \(league.short): HTTP \(status)")
+    }
+
+    private func fetchLeague(_ league: League, month: String, from: Date, to: Date) async -> [SportsGame]? {
+        let base = "https://site.api.espn.com/apis/site/v2/sports/\(league.path)/scoreboard?dates=\(month)\(league.extra)"
+        guard var result = await get(base + "&limit=1000") else { return nil }
+        if result.status == 400 {
+            // In case the limit isn't accepted with a month.
+            try? await Task.sleep(nanoseconds: 700_000_000)
+            guard let retry = await get(base) else { return nil }
+            result = retry
+        }
+        guard result.status == 200 else {
+            CrashRecorder.note("schedule \(league.short) \(month): HTTP \(result.status)")
             return nil
         }
-        let data = result.0
+        let data = result.data
         // Parsed off the main thread (a week of college football is a few MB).
         let games = await Task.detached(priority: .utility) { () -> [SportsGame]? in
             guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let events = object["events"] as? [[String: Any]] else { return nil }
-            return events.compactMap { SportsParse.game($0, league: league) }
+            // Only the week ahead is kept.
+            return events.compactMap { SportsParse.game($0, league: league) }.filter { $0.start >= from && $0.start <= to }
         }.value
-        CrashRecorder.note("schedule \(league.short): \(data.count / 1024) KB, \(games.map { String($0.count) } ?? "unreadable") games")
+        CrashRecorder.note("schedule \(league.short) \(month): \(data.count / 1024) KB, \(games.map { String($0.count) } ?? "unreadable") games")
         return games
     }
 }

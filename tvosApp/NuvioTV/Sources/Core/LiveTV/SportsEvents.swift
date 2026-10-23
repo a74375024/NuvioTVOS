@@ -113,10 +113,19 @@ enum SportsMatcher {
         }
 
         // 1. Provider event feeds → games.
+        let gamesByLeague = Dictionary(grouping: games, by: \.league)
         for event in events {
             let text = normalized(event.title)
             var best: (SportsGame, TimeInterval)?
-            for game in games {
+            // Only games of a league the event could be (soccer and MLS
+            // count as one).
+            let candidates: [SportsGame]
+            switch event.league {
+            case "", "Other": candidates = games
+            case "Soccer", "MLS": candidates = (gamesByLeague["Soccer"] ?? []) + (gamesByLeague["MLS"] ?? [])
+            default: candidates = gamesByLeague[event.league] ?? []
+            }
+            for game in candidates {
                 guard compatible(event.league, game), let pair = variants[game.id],
                       contains(text, pair.0), contains(text, pair.1) else { continue }
                 let gap: TimeInterval
@@ -178,25 +187,29 @@ enum SportsMatcher {
         }
 
         // 3. Provider events that matched no game: grouped forgivingly
-        // (either team order, start within 90 minutes).
+        // (either team order, start within 90 minutes). Each title's pair
+        // key is worked out once and looked up, not compared pairwise
+        // (thousands of events made that quadratic).
         var loose: [SportsEvent] = []
+        var byPair: [String: [Int]] = [:]
         for event in unmatched {
-            let key = pairKey(event.title)
-            if let key, let index = loose.firstIndex(where: { other in
-                pairKey(other.title) == key && closeEnough(other.start, event.start)
-            }) {
-                for feed in event.feeds where !loose[index].sources.contains(where: { $0.channelID == feed }) {
-                    loose[index].sources.append(EventSource(channelID: feed, kind: .provider, spanish: event.spanish,
-                                                            detail: "Provider event channel"))
+            autoreleasepool {
+                let key = pairKey(event.title)
+                if let key, let index = byPair[key]?.first(where: { closeEnough(loose[$0].start, event.start) }) {
+                    for feed in event.feeds where !loose[index].sources.contains(where: { $0.channelID == feed }) {
+                        loose[index].sources.append(EventSource(channelID: feed, kind: .provider, spanish: event.spanish,
+                                                                detail: "Provider event channel"))
+                    }
+                    return
                 }
-                continue
+                loose.append(SportsEvent(
+                    id: event.id, title: event.title, league: event.league, leagueShort: shortLeague(event.league),
+                    start: event.start, game: nil,
+                    sources: event.feeds.map { EventSource(channelID: $0, kind: .provider, spanish: event.spanish, detail: "Provider event channel") },
+                    family: event.family
+                ))
+                if let key { byPair[key, default: []].append(loose.count - 1) }
             }
-            loose.append(SportsEvent(
-                id: event.id, title: event.title, league: event.league, leagueShort: shortLeague(event.league),
-                start: event.start, game: nil,
-                sources: event.feeds.map { EventSource(channelID: $0, kind: .provider, spanish: event.spanish, detail: "Provider event channel") },
-                family: event.family
-            ))
         }
 
         // Source order: My Lineup, other guide channels, provider feeds;
