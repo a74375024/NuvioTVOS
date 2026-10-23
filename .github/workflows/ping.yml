@@ -1,0 +1,9 @@
+name: Ping
+on:
+  push:
+    branches: [ping-test]
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Actions is running"
