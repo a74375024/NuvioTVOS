@@ -28,11 +28,21 @@ struct LiveTVOptionsPanel: View {
     @State private var countriesAtOpen: Set<String> = []
     @State private var preferTS = LiveTVStore.xtreamPrefersTS
     @State private var guidePreview = LiveTVStore.guidePreviewEnabled
-    @State private var sportsInfo = SportsData.isEnabled
+    @State private var gameSchedule = SportsData.isEnabled
+    @State private var showUnwatchable = SportsData.showsUnwatchable
+    @ObservedObject private var schedule = SportsData.shared
     @State private var showEdit = false
     @State private var showSources = false
     @State private var showReport = false
     @State private var showLog = false
+
+    private var updatedText: String {
+        if schedule.refreshing { return L10n.string("live_schedule_updating", fallback: "Updating…") }
+        guard let date = schedule.updatedAt else { return L10n.string("live_schedule_never", fallback: "Not yet") }
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .full
+        return L10n.format("live_schedule_updated", fallback: "Updated %@", formatter.localizedString(for: date, relativeTo: Date()))
+    }
 
     var body: some View {
         LiveSidePanel(edge: .trailing, width: 760) {
@@ -98,16 +108,31 @@ struct LiveTVOptionsPanel: View {
             LiveTVStore.guidePreviewEnabled = guidePreview
             if !guidePreview { store.stopPreview() }
         }
-        LivePanelRow(title: L10n.string("live_sports_info", fallback: "Sports info"),
-                     detail: L10n.string("live_sports_info_detail", fallback: "Team badges, art and results from TheSportsDB"),
-                     accessory: .toggle(sportsInfo)) {
-            sportsInfo.toggle()
-            SportsData.isEnabled = sportsInfo
-            SportsData.shared.refreshIfNeeded()
-            store.scheduleSportsRebuild(delay: 0.2)
-        }
         LivePanelRow(title: L10n.string("live_guide_sources", fallback: "Guide Listings"), accessory: .chevron(nil)) {
             showSources = true
+        }
+
+        section(L10n.string("live_events_title", fallback: "Live Events"))
+        LivePanelRow(title: L10n.string("live_game_schedule", fallback: "Game schedule"),
+                     detail: L10n.string("live_game_schedule_detail", fallback: "Schedule, logos and TV networks"),
+                     accessory: .toggle(gameSchedule)) {
+            gameSchedule.toggle()
+            SportsData.isEnabled = gameSchedule
+            SportsData.shared.enabledChanged()
+            store.scheduleSportsRebuild(delay: 0.2)
+        }
+        if gameSchedule {
+            LivePanelRow(title: L10n.string("live_schedule_refresh", fallback: "Refresh schedule"),
+                         accessory: .chevron(updatedText)) {
+                SportsData.shared.refreshNow()
+            }
+            LivePanelRow(title: L10n.string("live_show_unwatchable", fallback: "Games not in my channels"),
+                         detail: L10n.string("live_show_unwatchable_detail", fallback: "Show them dimmed at the end of each row"),
+                         accessory: .toggle(showUnwatchable)) {
+                showUnwatchable.toggle()
+                SportsData.showsUnwatchable = showUnwatchable
+                store.scheduleSportsRebuild(delay: 0.1)
+            }
         }
 
         if !XtreamStore.shared.accounts.isEmpty {

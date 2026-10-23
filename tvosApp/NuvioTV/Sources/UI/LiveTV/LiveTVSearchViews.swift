@@ -459,7 +459,7 @@ final class LiveTVExportModel: ObservableObject {
             let csv: String
             switch kind {
             case .playbackLog:
-                csv = LiveTVPlaybackLog.shared.csv()
+                csv = LiveTVPlaybackLog.shared.csv() + CrashRecorder.report()
             case .channels:
                 message = L10n.string("live_report_checking", fallback: "Checking guides for your channels…")
                 await LiveTVStore.shared.checkAllGuides { [weak self] done, total in

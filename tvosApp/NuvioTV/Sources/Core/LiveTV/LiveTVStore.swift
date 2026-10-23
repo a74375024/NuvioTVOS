@@ -2542,6 +2542,7 @@ final class LiveTVStore: ObservableObject {
     /// few seconds while the guide loads, and a debounce that restarts on
     /// each one would never get to run.
     func scheduleSportsRebuild(delay: Double = 0.5) {
+        SportsData.shared.loadCached()
         if sportsSink == nil {
             sportsSink = SportsData.shared.$revision.dropFirst().sink { [weak self] _ in
                 self?.scheduleSportsRebuild(delay: 0.3)
@@ -2598,10 +2599,98 @@ final class LiveTVStore: ObservableObject {
             }
         }
         let preferSpanish = prefs.countries.contains("US-ES")
+        let channelSources = networkSources(for: games)
         let built = await Task.detached(priority: .utility) {
-            SportsMatcher.build(games: games, events: providerEvents, listings: listings, preferSpanish: preferSpanish, now: now)
+            SportsMatcher.build(games: games, channelSources: channelSources, events: providerEvents, listings: listings,
+                                preferSpanish: preferSpanish, now: now)
         }.value
+        CrashRecorder.note("sports rebuild: \(games.count) games, \(providerEvents.count) provider events, \(built.count) shown")
         if built != sportsEvents { sportsEvents = built }
+        SportsData.shared.noteWatchable(Set(built.filter { !$0.sources.isEmpty && $0.game != nil }.map(\.leagueShort)))
+    }
+
+    // MARK: Networks → channels
+
+    /// Short names used in TV listings for networks, as the channel is named.
+    private static let networkAliases: [String: String] = [
+        "nfl net": "NFL Network", "nfl netwrk": "NFL Network", "mlb net": "MLB Network", "nhl net": "NHL Network",
+        "usa net": "USA Network", "usa": "USA Network", "cbssn": "CBS Sports Network", "btn": "Big Ten Network",
+        "secn": "SEC Network", "accn": "ACC Network", "espnews": "ESPNews", "golf": "Golf Channel"
+    ]
+    private static let broadcastNetworks: Set<String> = ["ABC", "CBS", "NBC", "FOX", "CW", "TELEMUNDO", "UNIVISION", "UNIMAS"]
+
+    /// "core:FS1" / "net:FOX" for a network name, or nil (streaming
+    /// services, regional networks).
+    private static func networkKey(_ name: String) -> String? {
+        let key = ChannelCatalog.coreKey(name).key
+        if let alias = networkAliases[key] { return "core:\(alias)" }
+        if let core = ChannelCatalog.coreMatch(name) { return "core:\(core.name)" }
+        let word = key.replacingOccurrences(of: " ", with: "").uppercased()
+        if broadcastNetworks.contains(word) { return "net:\(word)" }
+        return nil
+    }
+
+    /// For each game, the channels you have airing its network: My Lineup
+    /// first, then the rest of your channels (two at most of each).
+    private func networkSources(for games: [SportsGame]) -> [String: [EventSource]] {
+        guard !games.isEmpty else { return [:] }
+        let lineup = Set(lineupIDs)
+        var index: [String: [(id: String, inLineup: Bool, spanish: Bool)]] = [:]
+        var seen = Set<String>()
+        for entry in lineupIDs.compactMap({ self.entry(id: $0) }) + browseEntries {
+            guard seen.insert(entry.id).inserted, let info = entryInfo[entry.id], !isHidden(entry) else { continue }
+            let key: String
+            if let core = info.core {
+                key = "core:\(core)"
+            } else if info.category == .local, let word = ChannelCatalog.networkWord(info.name) {
+                key = "net:\(word)"
+            } else {
+                continue
+            }
+            let spanish = info.category == .spanish || info.market == "US-ES"
+            index[key, default: []].append((entry.id, lineup.contains(entry.id), spanish))
+        }
+        var keys: [String: String?] = [:]
+        func cachedKey(_ network: String) -> String? {
+            if let cached = keys[network] { return cached }
+            let value = Self.networkKey(network)
+            keys[network] = value
+            return value
+        }
+        // Broadcast networks split up some games by region (several NFL
+        // games on FOX at 1 PM): those only count when the guide listing
+        // confirms which one your station has.
+        var regional = Set<String>()
+        var byNetwork: [String: [Date]] = [:]
+        for game in games where !game.completed {
+            for network in game.networks.prefix(1) {
+                guard let k = cachedKey(network), k.hasPrefix("net:") else { continue }
+                if byNetwork[k, default: []].contains(where: { abs($0.timeIntervalSince(game.start)) < 90 * 60 }) {
+                    regional.insert("\(k)|\(Int(game.start.timeIntervalSince1970 / 10_800))")
+                }
+                byNetwork[k, default: []].append(game.start)
+            }
+        }
+        var result: [String: [EventSource]] = [:]
+        for game in games where !game.completed {
+            var sources: [EventSource] = []
+            for network in game.networks {
+                guard let key = cachedKey(network), let entries = index[key] else { continue }
+                if key.hasPrefix("net:") {
+                    let bucket = Int(game.start.timeIntervalSince1970 / 10_800)
+                    let overlapping = (byNetwork[key] ?? []).filter { abs($0.timeIntervalSince(game.start)) < 90 * 60 }.count > 1
+                    if overlapping || regional.contains("\(key)|\(bucket)") { continue }
+                }
+                let mine = Array(entries.filter { $0.inLineup }.prefix(2))
+                let others = mine.isEmpty ? Array(entries.filter { !$0.inLineup }.prefix(2)) : []
+                for item in mine + others where !sources.contains(where: { $0.channelID == item.id }) {
+                    sources.append(EventSource(channelID: item.id, kind: item.inLineup ? .lineup : .guide, spanish: item.spanish,
+                                               detail: item.inLineup ? "In My Lineup" : "In your channels"))
+                }
+            }
+            if !sources.isEmpty { result[game.id] = sources }
+        }
+        return result
     }
 
     func sourceChannel(_ source: EventSource) -> LiveTVChannel? {

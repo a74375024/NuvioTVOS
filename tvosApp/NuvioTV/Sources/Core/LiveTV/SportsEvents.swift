@@ -25,9 +25,11 @@ struct SportsEvent: Identifiable, Hashable {
     var game: SportsGame?
     var sources: [EventSource]
     var family: String?
+    /// The end of the guide listing showing it, when later than usual.
+    var listingEnd: Date?
 
     static func == (lhs: SportsEvent, rhs: SportsEvent) -> Bool {
-        lhs.id == rhs.id && lhs.sources == rhs.sources && lhs.game == rhs.game
+        lhs.id == rhs.id && lhs.sources == rhs.sources && lhs.game == rhs.game && lhs.listingEnd == rhs.listingEnd
     }
     func hash(into hasher: inout Hasher) { hasher.combine(id) }
 
@@ -52,17 +54,18 @@ struct SportsEvent: Identifiable, Hashable {
         case upcoming, live, mayHaveEnded, finished, postponed, unknownTime
     }
 
+    /// Live for the sport's usual length (or until the guide listing ends,
+    /// if later), then "may have ended" for half an hour, then gone.
     func state(at now: Date) -> State {
-        if let game {
-            if game.postponed { return .postponed }
-            if game.isFinished { return .finished }
-        }
+        if let game, game.postponed { return .postponed }
         guard let start else { return .unknownTime }
         if now < start { return .upcoming }
-        let end = start.addingTimeInterval(expectedLength)
+        if let game, game.completed { return .finished }
+        var end = start.addingTimeInterval(expectedLength)
+        if let listingEnd, listingEnd > end, listingEnd < start.addingTimeInterval(8 * 3600) { end = listingEnd }
         if now < end { return .live }
         if now < end.addingTimeInterval(30 * 60) { return .mayHaveEnded }
-        return game == nil ? .finished : .mayHaveEnded
+        return .finished
     }
 
     /// Fraction of the expected length gone by (for the progress bar).
@@ -94,11 +97,20 @@ enum SportsMatcher {
         let spanish: Bool
     }
 
-    static func build(games: [SportsGame], events: [ProviderEvent], listings: [GuideListing],
-                      preferSpanish: Bool, now: Date) -> [SportsEvent] {
+    static func build(games: [SportsGame], channelSources: [String: [EventSource]], events: [ProviderEvent],
+                      listings: [GuideListing], preferSpanish: Bool, now: Date) -> [SportsEvent] {
         let variants = Dictionary(games.map { ($0.id, (teamVariants($0.home), teamVariants($0.away))) }, uniquingKeysWith: { a, _ in a })
         var byGame: [String: SportsEvent] = [:]
         var unmatched: [ProviderEvent] = []
+
+        // 0. Channels airing each game's TV network.
+        for game in games {
+            guard let sources = channelSources[game.id], !sources.isEmpty else { continue }
+            byGame[game.id] = SportsEvent(
+                id: "sev|\(game.id)", title: game.title, league: game.league, leagueShort: game.leagueShort,
+                start: game.start, game: game, sources: sources, family: nil
+            )
+        }
 
         // 1. Provider event feeds → games.
         for event in events {
@@ -130,7 +142,7 @@ enum SportsMatcher {
         }
 
         // 2. Guide listings → games (only the game itself, not the shows around it).
-        let relevant = games.filter { !$0.isFinished && $0.start > now.addingTimeInterval(-5 * 3600) && $0.start < now.addingTimeInterval(16 * 3600) }
+        let relevant = games.filter { !$0.completed && $0.start > now.addingTimeInterval(-5 * 3600) && $0.start < now.addingTimeInterval(16 * 3600) }
         if !relevant.isEmpty {
             for listing in listings {
                 let text = normalized(listing.title)
@@ -144,6 +156,7 @@ enum SportsMatcher {
                         id: "sev|\(game.id)", title: game.title, league: game.league, leagueShort: game.leagueShort,
                         start: game.start, game: game, sources: [], family: nil
                     )
+                    if value.listingEnd.map({ listing.end > $0 }) ?? true { value.listingEnd = listing.end }
                     if !value.sources.contains(where: { $0.channelID == listing.entryID }) {
                         let time = timeFormatter.string(from: listing.start)
                         value.sources.append(EventSource(

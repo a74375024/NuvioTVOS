@@ -18,6 +18,7 @@ import AetherEngine
 @main
 struct NuvioTVApp: App {
     init() {
+        CrashRecorder.start()
         let totalRam = ProcessInfo.processInfo.physicalMemory
         let isLegacyDevice = totalRam <= 2_500_000_000 // <= 2.5 GB (Apple TV HD)
         let memCapacity = isLegacyDevice ? (12 * 1024 * 1024) : (32 * 1024 * 1024)

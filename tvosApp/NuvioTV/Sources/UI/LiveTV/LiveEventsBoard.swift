@@ -8,9 +8,10 @@ enum SportsNames {
         "trail blazers", "black hawks", "st louis", "golden state"
     ]
 
-    /// "Rams" for "Los Angeles Rams"; soccer clubs keep their name.
+    /// "Rams" for "Los Angeles Rams", "Utah", "Man City".
     static func short(_ team: SportsTeam, soccer: Bool) -> String {
-        if soccer { return team.alternates.first(where: { $0.count <= 14 }) ?? team.name }
+        if let first = team.alternates.first, first.count <= 16 { return first }
+        if soccer { return team.name }
         let words = team.name.split(separator: " ").map(String.init)
         guard words.count >= 2 else { return team.name }
         let lastTwo = words.suffix(2).joined(separator: " ")
@@ -39,7 +40,7 @@ enum SportsNames {
     }
 }
 
-/// A team's badge (TheSportsDB), or its initials when there's none.
+/// A team's logo, or its initials when there's none.
 struct TeamBadge: View {
     let team: SportsTeam
     let size: CGFloat
@@ -82,8 +83,16 @@ private let clock: DateFormatter = {
 
 private func leagueLine(_ event: SportsEvent) -> String {
     var parts: [String] = [event.leagueShort]
-    if let round = event.game?.roundLabel { parts.append(round) }
+    if let week = event.game?.weekLabel { parts.append(week) }
     return parts.joined(separator: "  ·  ")
+}
+
+/// "On NBA League Pass · not in your channels".
+private func notInChannels(_ event: SportsEvent) -> String {
+    if let network = event.game?.networks.first {
+        return L10n.format("live_event_on_not_yours", fallback: "On %@ · not in your channels", network)
+    }
+    return L10n.string("live_event_not_in_channels", fallback: "Not in your channels")
 }
 
 private func dayTime(_ date: Date, now: Date) -> String {
@@ -100,7 +109,6 @@ private func dayTime(_ date: Date, now: Date) -> String {
 struct LiveEventTile: View {
     let event: SportsEvent
     let focused: Bool
-    let revealed: Bool
     let now: Date
     @ObservedObject private var store = LiveTVStore.shared
 
@@ -120,6 +128,7 @@ struct LiveEventTile: View {
             bottomLine(state)
                 .frame(height: 30, alignment: .leading)
         }
+        .opacity(event.sources.isEmpty && !focused ? 0.45 : 1)
         .foregroundColor(focused ? .black : .white)
         .padding(18)
         .frame(width: 400, height: 240, alignment: .topLeading)
@@ -145,22 +154,14 @@ struct LiveEventTile: View {
             chipLabel(event.start.map { dayTime($0, now: now) } ?? "", fill: focused ? Color.black.opacity(0.08) : Color.white.opacity(0.12),
                       foreground: focused ? .black : .white)
         case .finished:
-            chipLabel(finalText, fill: focused ? Color.black.opacity(0.08) : Color.white.opacity(0.12), foreground: focused ? .black : .white)
+            chipLabel(L10n.string("live_event_ended", fallback: "ENDED"), fill: focused ? Color.black.opacity(0.08) : Color.white.opacity(0.12),
+                      foreground: focused ? .black : .white)
         case .postponed:
             chipLabel(L10n.string("live_event_postponed", fallback: "POSTPONED"), fill: Color.orange.opacity(0.85))
         case .unknownTime:
             chipLabel(L10n.string("live_events_no_time", fallback: "Time not listed"), fill: Color.white.opacity(focused ? 0.0 : 0.12),
                       foreground: focused ? .black : .white, outlined: focused)
         }
-    }
-
-    private var finalText: String {
-        guard let start = event.start, !Calendar.current.isDateInToday(start) else {
-            return L10n.string("live_event_final", fallback: "Final")
-        }
-        let formatter = DateFormatter()
-        formatter.setLocalizedDateFormatFromTemplate("EEE")
-        return L10n.string("live_event_final", fallback: "Final") + " · " + formatter.string(from: start)
     }
 
     @ViewBuilder
@@ -171,7 +172,7 @@ struct LiveEventTile: View {
             HStack {
                 TeamBadge(team: left, size: 64, focused: focused)
                 Spacer()
-                middle(game, state)
+                Text(game.isSoccer ? "vs" : "@").font(.system(size: 26, weight: .bold)).opacity(0.85)
                 Spacer()
                 TeamBadge(team: right, size: 64, focused: focused)
             }
@@ -183,20 +184,6 @@ struct LiveEventTile: View {
                     .background(RoundedRectangle(cornerRadius: 14).fill(focused ? Color.black.opacity(0.08) : Color.white.opacity(0.1)))
                 Spacer()
             }
-        }
-    }
-
-    @ViewBuilder
-    private func middle(_ game: SportsGame, _ state: SportsEvent.State) -> some View {
-        if state == .finished, let away = game.awayScore, let home = game.homeScore {
-            if revealed {
-                let left = game.isSoccer ? home : away, right = game.isSoccer ? away : home
-                Text("\(left) – \(right)").font(.system(size: 32, weight: .heavy).monospacedDigit())
-            } else {
-                Text("• • •").font(.system(size: 24, weight: .heavy)).opacity(0.7)
-            }
-        } else {
-            Text(game.isSoccer ? "vs" : "@").font(.system(size: 26, weight: .bold)).opacity(0.85)
         }
     }
 
@@ -221,13 +208,8 @@ struct LiveEventTile: View {
                 }
                 whereLine(compact: true)
             }
-        case .upcoming, .unknownTime, .postponed:
+        case .upcoming, .unknownTime, .postponed, .finished:
             whereLine(compact: false)
-        case .finished:
-            Text(revealed
-                 ? L10n.string("live_event_score_shown", fallback: "Score shown")
-                 : L10n.string("live_event_show_score", fallback: "Select to show the score"))
-                .font(.system(size: 17, weight: .medium)).opacity(0.65)
         }
     }
 
@@ -249,8 +231,8 @@ struct LiveEventTile: View {
                 Text(L10n.format("live_event_provider_feeds", fallback: "%d feeds from your provider", feeds))
                     .font(.system(size: compact ? 15 : 17)).opacity(0.65)
             } else {
-                Text(L10n.string("live_event_not_in_channels", fallback: "Not in your channels"))
-                    .font(.system(size: compact ? 15 : 17)).opacity(0.5)
+                Text(notInChannels(event))
+                    .font(.system(size: compact ? 15 : 17)).opacity(0.75)
             }
         }
         .lineLimit(1)
@@ -306,7 +288,7 @@ struct LiveEventsHero: View {
                         .font(.system(size: 26, weight: .semibold).monospacedDigit())
                         .foregroundColor(.white.opacity(0.8))
                 }
-                Text(L10n.string("live_events_empty_hero", fallback: "Games and events from your channels and your provider's event feeds."))
+                Text(L10n.string("live_events_empty_hero", fallback: "This week's games, and where you can watch them."))
                     .font(.system(size: 22))
                     .foregroundColor(.white.opacity(0.65))
             }
@@ -325,7 +307,7 @@ struct LiveEventsHero: View {
             case .upcoming:
                 chipLabel(L10n.string("live_badge_later", fallback: "LATER"), fill: .clear, outlined: true)
             case .finished:
-                chipLabel(L10n.string("live_event_final", fallback: "Final").uppercased(), fill: Color.white.opacity(0.18))
+                chipLabel(L10n.string("live_event_ended", fallback: "ENDED"), fill: Color.white.opacity(0.18))
             case .postponed:
                 chipLabel(L10n.string("live_event_postponed", fallback: "POSTPONED"), fill: Color.orange.opacity(0.85))
             case .mayHaveEnded:
@@ -353,11 +335,7 @@ struct LiveEventsHero: View {
                     parts.append(L10n.format("live_starts_in", fallback: "Starts in %@", minutes >= 60 ? "\(minutes / 60) h \(minutes % 60) m" : "\(max(1, minutes)) m"))
                 }
             }
-        case .finished:
-            if let game = event.game, let away = game.awayScore, let home = game.homeScore {
-                parts.append("\(game.away.abbreviation) \(away) – \(home) \(game.home.abbreviation)")
-            }
-        case .postponed, .unknownTime:
+        case .finished, .postponed, .unknownTime:
             break
         }
         if let venue = event.game?.venue { parts.append(venue) }
@@ -382,7 +360,7 @@ struct LiveEventsHero: View {
             } else if feeds > 0 {
                 Text(L10n.format("live_event_provider_feeds", fallback: "%d feeds from your provider", feeds))
             } else {
-                Text(L10n.string("live_event_not_in_channels", fallback: "Not in your channels"))
+                Text(notInChannels(event))
             }
         }
         .font(.system(size: 20))
@@ -391,33 +369,15 @@ struct LiveEventsHero: View {
     }
 }
 
-/// The focused game's art (TheSportsDB) or a blend of the two teams'
-/// colors, fading in behind the top right of Live Events.
+/// The focused game's two team logos, big and faded over a glow, behind
+/// the top right of Live Events.
 struct LiveEventBackdrop: View {
     let event: SportsEvent?
 
     var body: some View {
         GeometryReader { geo in
             ZStack(alignment: .topTrailing) {
-                if let url = event?.game?.thumb.flatMap(URL.init(string:)) {
-                    AsyncImage(url: url) { phase in
-                        if let image = phase.image {
-                            image.resizable().scaledToFill()
-                        } else {
-                            Color.clear
-                        }
-                    }
-                    .frame(width: geo.size.width * 0.6, height: geo.size.height * 0.6)
-                    .clipped()
-                    .mask(
-                        LinearGradient(colors: [.clear, .black], startPoint: .leading, endPoint: UnitPoint(x: 0.45, y: 0.5))
-                            .mask(LinearGradient(colors: [.black, .black, .clear], startPoint: .top, endPoint: .bottom))
-                    )
-                    .opacity(0.75)
-                    .id(url)
-                    .transition(.opacity)
-                }  else if let game = event?.game {
-                    // No art: the two badges, big and faded, over a glow.
+                if let game = event?.game {
                     ZStack {
                         RadialGradient(colors: [Color(red: 0.05, green: 0.2, blue: 0.55).opacity(0.85), .clear],
                                        center: .center, startRadius: 40, endRadius: geo.size.width * 0.32)
@@ -449,8 +409,9 @@ struct LiveEventBackdrop: View {
 
 // MARK: - Board
 
-/// Live Events: a row of what's live, a row per sport, recent results,
-/// events without a time, and the provider's event channels. Left from a
+/// Live Events: a row of what's live, a row per sport for the week (games
+/// none of your channels has dimmed at the end), events without a time,
+/// and the provider's event channels. Left from a
 /// row's first game opens the Sports column (like the guide's Jump to).
 struct LiveEventsBoard: View {
     @Binding var focusedEvent: SportsEvent?
@@ -461,7 +422,6 @@ struct LiveEventsBoard: View {
     @ObservedObject private var store = LiveTVStore.shared
     @ObservedObject private var reminders = LiveReminders.shared
     @State private var now = Date()
-    @State private var revealed: Set<String> = []
     @FocusState private var focus: String?
     @State private var columnOpen = false
     @State private var columnOrigin: String?
@@ -495,14 +455,14 @@ struct LiveEventsBoard: View {
         if !live.isEmpty {
             result.append(Row(id: "live", title: L10n.string("live_events_now", fallback: "Live now"), events: live, live: live.count))
         }
-        let horizon = now.addingTimeInterval(7 * 24 * 3600)
+        let horizon = now.addingTimeInterval(8 * 24 * 3600)
+        let showUnwatchable = SportsData.showsUnwatchable
         var bySport: [String: [SportsEvent]] = [:]
         for event in all {
             let state = event.state(at: now)
             guard state == .live || state == .mayHaveEnded || state == .upcoming || state == .postponed,
                   let start = event.start, start < horizon else { continue }
-            // Games nobody shows only appear while they're coming up today.
-            if event.sources.isEmpty, !(Calendar.current.isDateInToday(start) || Calendar.current.isDateInTomorrow(start)) { continue }
+            if event.sources.isEmpty, !showUnwatchable { continue }
             bySport[event.league.isEmpty ? "Other" : event.league, default: []].append(event)
         }
         let sports = bySport.keys.sorted { a, b in
@@ -510,19 +470,13 @@ struct LiveEventsBoard: View {
             return ia != ib ? ia < ib : a < b
         }
         for sport in sports {
+            // Games you can watch by time, then the rest (dimmed) by time.
             let list = (bySport[sport] ?? []).sorted { a, b in
-                // Watchable first within the same start.
-                if a.start != b.start { return (a.start ?? .distantFuture) < (b.start ?? .distantFuture) }
-                return a.sources.count > b.sources.count
+                if a.sources.isEmpty != b.sources.isEmpty { return !a.sources.isEmpty }
+                return (a.start ?? .distantFuture) < (b.start ?? .distantFuture)
             }
-            result.append(Row(id: "sport|\(sport)", title: sport, events: list, live: list.filter(isLive).count))
-        }
-        let recentCutoff = now.addingTimeInterval(-3 * 24 * 3600)
-        let finals = all.filter { $0.game != nil && $0.state(at: now) == .finished && ($0.start ?? .distantPast) > recentCutoff }
-            .sorted { ($0.start ?? .distantPast) > ($1.start ?? .distantPast) }
-        if !finals.isEmpty {
-            result.append(Row(id: "results", title: L10n.string("live_events_results", fallback: "Recent results"),
-                              events: Array(finals.prefix(20)), live: 0))
+            let liveCount = list.filter { isLive($0) && !$0.sources.isEmpty }.count
+            result.append(Row(id: "sport|\(sport)", title: sport, events: list, live: liveCount))
         }
         let untimed = all.filter { $0.state(at: now) == .unknownTime && !$0.sources.isEmpty }
         if !untimed.isEmpty {
@@ -586,12 +540,12 @@ struct LiveEventsBoard: View {
         }
         .onAppear {
             now = Date()
+            CrashRecorder.note("events: open, \(store.sportsEvents.count) events")
             SportsData.shared.refreshIfNeeded()
             store.scheduleSportsRebuild(delay: 0.2)
         }
         .onReceive(ticker) { date in
             now = date
-            SportsData.shared.refreshIfNeeded()
         }
     }
 
@@ -646,7 +600,7 @@ struct LiveEventsBoard: View {
         return Button {
             select(event)
         } label: {
-            LiveEventTile(event: event, focused: isFocused, revealed: revealed.contains(event.id), now: now)
+            LiveEventTile(event: event, focused: isFocused, now: now)
         }
         .buttonStyle(PosterCardButtonStyle())
         .focused($focus, equals: id)
@@ -702,12 +656,11 @@ struct LiveEventsBoard: View {
     }
 
     private func select(_ event: SportsEvent) {
+        CrashRecorder.note("events: select \(event.leagueShort) \(event.state(at: now))")
         switch event.state(at: now) {
         case .live, .mayHaveEnded, .unknownTime:
             if event.sources.isEmpty { onDetail(event) } else { store.watchSportsEvent(event) }
-        case .finished:
-            if revealed.contains(event.id) { revealed.remove(event.id) } else { revealed.insert(event.id) }
-        case .upcoming, .postponed:
+        case .upcoming, .postponed, .finished:
             onDetail(event)
         }
     }
@@ -928,7 +881,7 @@ struct LiveEventDetailCard: View {
                 }
                 .padding(.top, 8)
                 if event.sources.isEmpty {
-                    Text(L10n.string("live_event_none_yet", fallback: "Nothing in your channels lists this game yet. It'll show here when a channel or event feed does."))
+                    Text(notInChannels(event) + ". " + L10n.string("live_event_none_yet", fallback: "If one of your channels or event feeds picks it up, it'll show here."))
                         .font(.system(size: 20))
                         .foregroundColor(.white.opacity(0.6))
                 }
@@ -972,6 +925,8 @@ struct LiveEventDetailCard: View {
         if let venue = event.game?.venue { parts.append(venue) }
         if let source = event.channels.first, let channel = store.sourceChannel(source) {
             parts.append(L10n.format("live_event_on_guide", fallback: "On %@", channel.name))
+        } else if event.feeds.isEmpty, let network = event.game?.networks.first {
+            parts.append(L10n.format("live_event_on_guide", fallback: "On %@", network))
         }
         if !event.feeds.isEmpty {
             parts.append(L10n.format("live_event_provider_feeds", fallback: "%d feeds from your provider", event.feeds.count))
