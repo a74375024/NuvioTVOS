@@ -265,11 +265,11 @@ struct LiveTVGuideView: View {
         case .lineup:
             var rows = store.lineupEntries.map { LiveGuideRow(channel: $0, dimmed: false) }
             if showHidden {
-                rows += store.entries.filter { !store.isInLineup($0) }.map { LiveGuideRow(channel: $0, dimmed: true) }
+                rows += store.browseEntries.filter { !store.isInLineup($0) }.map { LiveGuideRow(channel: $0, dimmed: true) }
             }
             return rows
         case .all:
-            return store.entries.compactMap { entry in
+            return store.browseEntries.compactMap { entry in
                 let hidden = store.isHidden(entry)
                 if hidden && !showHidden { return nil }
                 return LiveGuideRow(channel: entry, dimmed: hidden)
@@ -279,7 +279,7 @@ struct LiveTVGuideView: View {
         case .recent:
             return store.recentChannels.map { LiveGuideRow(channel: $0, dimmed: false) }
         case .group(let name):
-            return store.entries.filter { store.groupName(of: $0) == name }.map { LiveGuideRow(channel: $0, dimmed: false) }
+            return store.browseEntries.filter { store.groupName(of: $0) == name }.map { LiveGuideRow(channel: $0, dimmed: false) }
         }
     }
 

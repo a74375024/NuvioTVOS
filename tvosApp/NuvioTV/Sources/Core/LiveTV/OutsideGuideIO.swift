@@ -48,6 +48,11 @@ enum GuideFiles {
     }
 
     static func download(_ url: URL, userAgent: String = "NuvioTV/1.0 (Apple TV; personal use)") async throws -> URL {
+        // Never start a guide download while video plays: a big file sharing
+        // the connection makes live streams stutter.
+        while OutsideGuidePause.shared.isPaused {
+            try await Task.sleep(nanoseconds: 1_000_000_000)
+        }
         let destination = workFolder().appendingPathComponent(UUID().uuidString + ".gz")
         if url.isFileURL {
             try FileManager.default.copyItem(at: url, to: destination)
@@ -432,6 +437,14 @@ enum StationDirectory {
     private static var cacheURL: URL? {
         FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first?
             .appendingPathComponent("OutsideGuide/stations.json")
+    }
+
+    /// The saved directory, if any (no network). Used to tell real call
+    /// signs from words and to place "FOX 2 LOCAL SAN FRANCISCO" on KTVU.
+    static func cached() -> [OutsideGuide.Station] {
+        guard let url = cacheURL, let data = try? Data(contentsOf: url),
+              let saved = try? JSONDecoder().decode([OutsideGuide.Station].self, from: data) else { return [] }
+        return saved
     }
 
     static func load() async -> [OutsideGuide.Station] {

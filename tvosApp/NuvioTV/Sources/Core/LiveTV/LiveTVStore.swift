@@ -83,6 +83,9 @@ final class LiveTVStore: ObservableObject {
     @Published private(set) var entries: [LiveTVChannel] = []
     /// My Lineup, in lineup-number order.
     @Published private(set) var lineupEntries: [LiveTVChannel] = []
+    /// Entries from the chosen countries (plus favorites and My Lineup): what
+    /// All Channels, groups and Show hidden list. Search covers everything.
+    @Published private(set) var browseEntries: [LiveTVChannel] = []
     @Published private(set) var events: [LiveEvent] = []
     @Published private(set) var families: [EventFamily] = []
     @Published private(set) var prefs = LineupPrefs()
@@ -119,6 +122,10 @@ final class LiveTVStore: ObservableObject {
     private static let firstFrameTimeout: UInt64 = 25
 
     private(set) var entryInfo: [String: LiveTVEntryInfo] = [:]
+    /// Every event and family found; `events` / `families` hold the chosen countries'.
+    private var allEvents: [LiveEvent] = []
+    private var allFamilies: [EventFamily] = []
+    private var lineupRefreshTask: Task<Void, Never>?
     private(set) var traits: [String: ChannelTraits] = [:]
     private var entryOf: [String: String] = [:]
     private var entryIndex: [String: Int] = [:]
@@ -178,6 +185,9 @@ final class LiveTVStore: ObservableObject {
     private var reconnectsOnFeed = 0
     private var recoveries: [Date] = []
     private var startupRetryFeed: String?
+    private var startupRetries: [String: Int] = [:]
+    private var startupErrorTask: Task<Void, Never>?
+    private var stallCause = ""
     private var announceBackup = false
     /// Small note over the player while recovering ("Reconnecting…").
     @Published private(set) var playbackNote: String?
@@ -234,6 +244,9 @@ final class LiveTVStore: ObservableObject {
             lineupEntries = []
             events = []
             families = []
+            allEvents = []
+            allFamilies = []
+            browseEntries = []
             indexByID = [:]
             entryInfo = [:]
             entryOf = [:]
@@ -257,6 +270,7 @@ final class LiveTVStore: ObservableObject {
             hiddenGroups = Self.loadSet(Self.hiddenGroupsKey)
             recentIDs = Self.loadList(Self.recentKey)
             prefs = LineupPrefs.load()
+            ProviderGuide.countries = prefs.guideCountries
         }
         let channelsFresh = channelsLoadedAt.map { Date().timeIntervalSince($0) < Self.channelLifetime } ?? false
         if !force, channelsFresh, signature == loadedSignature, !channels.isEmpty {
@@ -326,7 +340,7 @@ final class LiveTVStore: ObservableObject {
             let isFirstLoad = self.channels.isEmpty
             let annotated = Self.annotated(all)
             let catalog = await Task.detached(priority: .userInitiated) {
-                ChannelCatalog.build(annotated)
+                ChannelCatalog.build(annotated, stations: StationDirectory.cached())
             }.value
             guard !Task.isCancelled else { return }
             self.channelsLoadedAt = Date()
@@ -353,9 +367,33 @@ final class LiveTVStore: ObservableObject {
         traits = catalog.traits
         entryOf = catalog.entryOf
         entryInfo = Dictionary(uniqueKeysWithValues: catalog.entries.map { ($0.id, $0) })
-        events = catalog.events
-        families = catalog.families
+        allEvents = catalog.events
+        allFamilies = catalog.families
+        applyEventFilter()
         rebuildEntries()
+    }
+
+    /// Live Events for the chosen countries (events with no known country stay).
+    private func applyEventFilter() {
+        let countries = prefs.guideCountries
+        func keep(_ market: String?) -> Bool {
+            guard let market else { return true }
+            return countries.contains(market.components(separatedBy: "-").first ?? market)
+        }
+        events = allEvents.filter { keep($0.market) }
+        families = allFamilies.filter { keep($0.market) }
+    }
+
+    /// Re-works My Lineup shortly after guide data lands (several sources can
+    /// finish close together), so suggestions follow what has listings.
+    private func scheduleLineupRefresh() {
+        guard prefs.configured else { return }
+        lineupRefreshTask?.cancel()
+        lineupRefreshTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 600_000_000)
+            guard let self, !Task.isCancelled else { return }
+            self.rebuildEntries()
+        }
     }
 
     /// Recomputes lineup membership, numbering and the entry list.
@@ -365,11 +403,12 @@ final class LiveTVStore: ObservableObject {
         for info in infos {
             let favorite = info.members.contains { indexByID[$0].map { channels[$0].isFavorite } ?? false }
             if prefs.removed.contains(info.id) { continue }
-            if favorite || prefs.added.contains(info.id) || prefs.suggested.contains(info.id) {
+            if favorite || prefs.added.contains(info.id) {
                 lineup.insert(info.id)
-            } else if prefs.configured, info.category == .local,
-                      LineupEngine.suggests(info, prefs: prefs, hasGuide: true, name: info.name) {
-                // Locals for the user's market always join.
+            } else if prefs.configured,
+                      LineupEngine.suggests(info, prefs: prefs, hasGuide: entryHasGuide(info.id), name: info.name) {
+                // Suggestions are worked out live, so channels join as their
+                // listings load (and core networks / market locals always).
                 lineup.insert(info.id)
             }
         }
@@ -399,8 +438,11 @@ final class LiveTVStore: ObservableObject {
         entries = built
         entryIndex = Dictionary(built.enumerated().map { ($1.id, $0) }, uniquingKeysWith: { first, _ in first })
         lineupEntries = built.filter { lineup.contains($0.id) }
+        browseEntries = built.filter { entry in
+            lineup.contains(entry.id) || entry.isFavorite || prefs.includes(market: entryInfo[entry.id]?.market)
+        }
         var counts: [String: Int] = [:]
-        for entry in built { counts[entry.group ?? Self.otherGroup, default: 0] += 1 }
+        for entry in browseEntries { counts[entry.group ?? Self.otherGroup, default: 0] += 1 }
         groups = counts.map { ChannelGroup(name: $0.key, count: $0.value) }
             .sorted { $0.count != $1.count ? $0.count > $1.count : $0.name.localizedStandardCompare($1.name) == .orderedAscending }
         // Entry guides from whatever member data is already here.
@@ -413,7 +455,7 @@ final class LiveTVStore: ObservableObject {
 
     /// The entries the guide starts with: My Lineup once set up, else all.
     func visibleEntries() -> [LiveTVChannel] {
-        prefs.configured ? lineupEntries : entries.filter { !isHidden($0) }
+        prefs.configured ? lineupEntries : browseEntries.filter { !isHidden($0) }
     }
 
     /// Favorites first, then by channel number (numeric where possible), then name.
@@ -719,6 +761,7 @@ final class LiveTVStore: ObservableObject {
         providerNotes = notes
         providerStates = states
         rebuildOutsidePrograms()
+        scheduleLineupRefresh()
         guard !jobs.isEmpty else { return }
         providerTask = Task { [weak self] in
             // Let the guide's first screen load before background work.
@@ -754,6 +797,7 @@ final class LiveTVStore: ObservableObject {
             providerStates[sourceID] = ProviderGuide.State(name: name, status: .ready(
                 matched: saved.programs.count, total: scoped.count, guideChannels: saved.guideChannels, updated: saved.built))
             rebuildOutsidePrograms()
+            scheduleLineupRefresh()
         case .unavailable(let message):
             providerStates[sourceID] = ProviderGuide.State(name: name, status: .unavailable(message))
         case .failed(let message):
@@ -815,8 +859,15 @@ final class LiveTVStore: ObservableObject {
         }
         let shardIDs = OutsideGuide.enabledShards
         let signature = loadedSignature ?? "default"
-        // Event feeds are named per event; listings don't apply to them.
-        let snapshot = channels.filter { traits[$0.id]?.familyKey == nil }
+        // Event feeds are named per event; listings don't apply to them. Only
+        // the chosen countries' channels (or ones of unknown country) take part.
+        let countries = prefs.guideCountries
+        let snapshot = channels.filter { channel in
+            guard let trait = traits[channel.id], trait.familyKey == nil,
+                  trait.kind != .placeholder, trait.kind != .separator else { return false }
+            guard let market = trait.market else { return true }
+            return countries.contains(market.components(separatedBy: "-").first ?? market)
+        }
         let saved = OutsideGuide.loadSaved(signature: signature)
         if let saved, Set(saved.shards) == shardIDs {
             outsideMatches = saved.programs
@@ -824,6 +875,7 @@ final class LiveTVStore: ObservableObject {
             outsideBuiltAt = saved.built
             outsideStatus = .ready(matched: saved.programs.count, total: snapshot.count, updated: saved.built)
             rebuildOutsidePrograms()
+            scheduleLineupRefresh()
         }
         guard force || OutsideGuide.needsRebuild(saved, shards: shardIDs, channelCount: snapshot.count) else { return }
         outsideStatus = .updating("Getting ready…")
@@ -857,6 +909,7 @@ final class LiveTVStore: ObservableObject {
             self.outsideBuiltAt = now
             self.outsideStatus = .ready(matched: built.programs.count, total: snapshot.count, updated: now)
             self.rebuildOutsidePrograms()
+            self.scheduleLineupRefresh()
         }
     }
 
@@ -927,7 +980,8 @@ final class LiveTVStore: ObservableObject {
         var updated = prefs
         if included {
             updated.removed.remove(channel.id)
-            if !updated.suggested.contains(channel.id) { updated.added.insert(channel.id) }
+            // Suggestions change as listings load; a hand-added channel stays.
+            updated.added.insert(channel.id)
         } else {
             updated.added.remove(channel.id)
             updated.removed.insert(channel.id)
@@ -943,9 +997,51 @@ final class LiveTVStore: ObservableObject {
     }
 
     func setPrefs(_ updated: LineupPrefs) {
+        let countriesChanged = updated.countries != prefs.countries
         prefs = updated
         updated.save()
+        if countriesChanged {
+            applyEventFilter()
+            ProviderGuide.countries = updated.guideCountries
+            loadProviderGuide(force: true)
+        }
         rebuildEntries()
+    }
+
+    /// Channels per country / language, for the country picker: US English
+    /// and US Spanish first, then the rest by size.
+    struct MarketCount: Identifiable {
+        let market: String
+        let count: Int
+        var id: String { market }
+    }
+
+    func marketCounts() -> [MarketCount] {
+        var counts: [String: Int] = [:]
+        for info in entryInfo.values where info.kind == .channel {
+            if let market = info.market { counts[market, default: 0] += 1 }
+        }
+        let rank: [String: Int] = ["US": 0, "US-ES": 1]
+        return counts.map { MarketCount(market: $0.key, count: $0.value) }.sorted {
+            let a = rank[$0.market] ?? 2, b = rank[$1.market] ?? 2
+            return a != b ? a < b : $0.count > $1.count
+        }
+    }
+
+    /// "US (English)", "US (Spanish)", "Mexico", "ASIA"…
+    nonisolated static func marketName(_ code: String) -> String {
+        switch code {
+        case "US": return "United States (English)"
+        case "US-ES": return "United States (Spanish)"
+        case "UK": return "United Kingdom"
+        case "ASIA": return "Asia"
+        case "AFR": return "Africa"
+        case "EXYU": return "Ex-Yugoslavia"
+        case "LA": return "Latin America"
+        case "KU": return "Kurdish"
+        default:
+            return Locale(identifier: "en_US").localizedString(forRegionCode: code) ?? code
+        }
     }
 
     /// Category counts for the setup screen: (in the suggested lineup, total).
@@ -968,8 +1064,13 @@ final class LiveTVStore: ObservableObject {
     /// (server and outside), then applies the market and category choices.
     func buildLineup(_ draft: LineupPrefs) async {
         lineupBuild = "Checking which channels have listings…"
-        let ids = entries.map(\.id)
-        await checkGuides(ids: ids, timeout: 150) { [weak self] done, total in
+        if draft.countries != prefs.countries {
+            // Apply the country choice first so the check covers the right channels.
+            var early = prefs
+            early.countries = draft.countries
+            setPrefs(early)
+        }
+        await checkAllGuides(timeout: 120) { [weak self] done, total in
             self?.lineupBuild = "Checking listings: \(done) of \(total) channels…"
         }
         var updated = draft
@@ -994,7 +1095,7 @@ final class LiveTVStore: ObservableObject {
         let start = Self.windowStart()
         var seen = Set<String>()
         var ids: [String] = []
-        for entry in lineupEntries + entries {
+        for entry in lineupEntries + browseEntries {
             guard ids.count < limit else { break }
             guard let member = entryInfo[entry.id]?.members.first ?? (indexByID[entry.id] != nil ? entry.id : nil),
                   traits[member]?.familyKey == nil, !providerCovers(member, from: start),
@@ -1033,6 +1134,10 @@ final class LiveTVStore: ObservableObject {
         let outsideRaw: [OutsideGuide.RawProgram]?
         let providerGuide: String
         let providerRaw: [OutsideGuide.RawProgram]?
+        let kind: String
+        let market: String
+        let core: String
+        let scope: String
     }
 
     /// One row per channel: what it is, what the server's guide has, and
@@ -1094,7 +1199,8 @@ final class LiveTVStore: ObservableObject {
                 provider: names[channel.serverID] ?? "",
                 outsideNote: outsideNotes[channel.id] ?? (outsideMatches[channel.id] == nil ? "no match" : "matched"),
                 outsideRaw: outsideMatches[channel.id],
-                providerGuide: providerGuide, providerRaw: isXtream ? providerMatches[channel.id] : nil
+                providerGuide: providerGuide, providerRaw: isXtream ? providerMatches[channel.id] : nil,
+                kind: trait?.kind.rawValue ?? "", market: trait?.market ?? "", core: trait?.core ?? "", scope: trait?.scope ?? ""
             ))
         }
         let low = Int(start.timeIntervalSince1970 / 60)
@@ -1118,7 +1224,8 @@ final class LiveTVStore: ObservableObject {
                 "callsign_in_name", "station_lookup", "match_key",
                 "server_guide", "server_programs_next_3h", "outside_listing", "outside_programs_next_3h",
                 "now_title", "now_source", "entry", "category", "in_my_lineup", "event_family", "event_text",
-                "provider", "country", "guide_id", "provider_guide", "provider_guide_programs_next_3h"
+                "provider", "country", "guide_id", "provider_guide", "provider_guide_programs_next_3h",
+                "kind", "market", "core_network", "scope"
             ].joined(separator: ",")]
             lines.reserveCapacity(total + 1)
             for (index, row) in rows.enumerated() {
@@ -1136,7 +1243,8 @@ final class LiveTVStore: ObservableObject {
                     cell(row.entryName), cell(row.category), cell(row.inLineup ? "yes" : ""),
                     cell(row.family), cell(row.eventText),
                     cell(row.provider), cell(ProviderGuide.countryPrefix(of: channel.group) ?? ""),
-                    cell(channel.epgID ?? ""), cell(row.providerGuide), cell(isXtream ? String(count(row.providerRaw)) : "")
+                    cell(channel.epgID ?? ""), cell(row.providerGuide), cell(isXtream ? String(count(row.providerRaw)) : ""),
+                    cell(row.kind), cell(row.market), cell(row.core), cell(row.scope)
                 ].joined(separator: ","))
                 if index % 2000 == 1999 {
                     let done = index + 1
@@ -1509,12 +1617,17 @@ final class LiveTVStore: ObservableObject {
     private static let maxRecoveries = 6
     private static let recoveryWindow: TimeInterval = 180
     private static let xtreamRetryDelay: UInt64 = 2
+    /// Engine errors / "ended" during playback: time to get over it alone.
+    private static let errorGrace: UInt64 = 6
+    private static let startupErrorGrace: UInt64 = 3
+    private static let xtreamStartRetries = 2
 
     private func tune(_ display: LiveTVChannel, candidates list: [LiveTVChannel], from startIndex: Int,
                       followFeed: Bool, inPlace: Bool = false, reason: String? = nil, delay: UInt64 = 0) {
         bannerTask?.cancel()
         watchdogTask?.cancel()
         stallTask?.cancel()
+        startupErrorTask?.cancel()
         stallStartedAt = nil
         banner = nil
         tuneGeneration &+= 1
@@ -1527,6 +1640,7 @@ final class LiveTVStore: ObservableObject {
             recoveries = []
             reconnectsOnFeed = 0
             startupRetryFeed = nil
+            startupRetries = [:]
             playbackNote = nil
             var detail = "\(list.count) version(s)"
             if let first = list.first, first.serverID.hasPrefix("xt:"),
@@ -1680,38 +1794,76 @@ final class LiveTVStore: ObservableObject {
         guard let metaID, metaID == playingMetaID, isWatching else { return }
         switch status {
         case "playing":
+            // Playing is a picture even if the first-frame signal was missed.
+            if !sawFirstFrame {
+                startupErrorTask?.cancel()
+                playerStarted(metaID: metaID)
+            }
             guard let began = stallStartedAt else { return }
             stallStartedAt = nil
             stallTask?.cancel()
             playbackNote = nil
-            log("stall ended", detail: String(format: "%.1fs", Date().timeIntervalSince(began)))
+            log("recovered by itself", detail: String(format: "%.1fs after %@", Date().timeIntervalSince(began), stallCause))
         case "buffering":
-            // Before the first picture this is just the start; Startup has its
-            // own timer.
-            guard sawFirstFrame, stallStartedAt == nil else { return }
-            stallStartedAt = Date()
-            log("stall")
-            let generation = tuneGeneration
-            stallTask?.cancel()
-            stallTask = Task { [weak self] in
-                try? await Task.sleep(nanoseconds: Self.stallNoteDelay * 1_000_000_000)
-                guard let self, !Task.isCancelled, generation == self.tuneGeneration, self.stallStartedAt != nil else { return }
-                self.playbackNote = "Buffering…"
-                try? await Task.sleep(nanoseconds: (Self.stallTimeout - Self.stallNoteDelay) * 1_000_000_000)
-                guard !Task.isCancelled, generation == self.tuneGeneration, self.stallStartedAt != nil else { return }
-                self.recover(reason: "stalled for \(Self.stallTimeout)s")
-            }
+            // Before the first picture this is just the start; startup has its own timer.
+            guard sawFirstFrame else { return }
+            beginTrouble(cause: "stall", grace: Self.stallTimeout)
         case "error":
             // Never show or keep a stream link (Xtream links carry the password).
             let text = (message ?? "playback error")
                 .rxReplace("[a-z][a-z0-9+.-]*://\\S+", with: "the stream", caseInsensitive: true)
             log("player error", detail: text)
-            if sawFirstFrame { recover(reason: "error: \(text)") } else { startupFailed(reason: "error: \(text)") }
+            if sawFirstFrame {
+                beginTrouble(cause: "error: \(text)", grace: Self.errorGrace)
+            } else {
+                scheduleStartupFailure(reason: "error: \(text)")
+            }
         case "ended":
             log("stream ended")
-            if sawFirstFrame { recover(reason: "the stream ended") } else { startupFailed(reason: "ended before a picture") }
+            if sawFirstFrame {
+                beginTrouble(cause: "the stream ended", grace: Self.errorGrace)
+            } else {
+                scheduleStartupFailure(reason: "ended before a picture")
+            }
         default:
             break
+        }
+    }
+
+    /// Something's wrong with a playing stream (a stall, an error the engine
+    /// reported, the stream "ending"). Engines often get over these by
+    /// themselves, so wait `grace` seconds; only if it hasn't started
+    /// playing again by then does recovery step in.
+    private func beginTrouble(cause: String, grace: UInt64) {
+        if stallStartedAt != nil {
+            // Already waiting: keep the earlier deadline, note the latest cause.
+            stallCause = cause
+            return
+        }
+        stallStartedAt = Date()
+        stallCause = cause
+        if cause == "stall" { log("stall") }
+        let generation = tuneGeneration
+        stallTask?.cancel()
+        stallTask = Task { [weak self] in
+            let note = min(Self.stallNoteDelay, grace)
+            try? await Task.sleep(nanoseconds: note * 1_000_000_000)
+            guard let self, !Task.isCancelled, generation == self.tuneGeneration, self.stallStartedAt != nil else { return }
+            self.playbackNote = "Buffering…"
+            if grace > note { try? await Task.sleep(nanoseconds: (grace - note) * 1_000_000_000) }
+            guard !Task.isCancelled, generation == self.tuneGeneration, self.stallStartedAt != nil else { return }
+            self.recover(reason: "\(self.stallCause), not recovered after \(grace)s")
+        }
+    }
+
+    /// An error before the first picture: give the engine a moment too.
+    private func scheduleStartupFailure(reason: String) {
+        let generation = tuneGeneration
+        startupErrorTask?.cancel()
+        startupErrorTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: Self.startupErrorGrace * 1_000_000_000)
+            guard let self, !Task.isCancelled, generation == self.tuneGeneration, !self.sawFirstFrame else { return }
+            self.startupFailed(reason: reason)
         }
     }
 
@@ -1719,19 +1871,21 @@ final class LiveTVStore: ObservableObject {
     private func startupFailed(reason: String) {
         guard let display = watching, candidateIndex < candidates.count else { return }
         watchdogTask?.cancel()
+        startupErrorTask?.cancel()
         let feed = candidates[candidateIndex]
         log("start failed", feed, detail: reason)
-        // A quick failure on Xtream is usually the provider's connection
-        // limit (the previous stream hasn't let go yet): wait, try once more.
-        if feed.serverID.hasPrefix("xt:"), startupRetryFeed != feed.id,
-           let presented = feedPresentedAt, Date().timeIntervalSince(presented) < 8 {
-            startupRetryFeed = feed.id
+        // Xtream: retry the same feed (twice) before any backup. A failed start
+        // is often the provider's connection limit while the previous stream
+        // lets go, or a slow first segment.
+        let retries = startupRetries[feed.id] ?? 0
+        if feed.serverID.hasPrefix("xt:"), retries < Self.xtreamStartRetries {
+            startupRetries[feed.id] = retries + 1
             guard allowRecovery() else {
                 giveUp(display, message: "This channel keeps failing to start. Try another version from Choose Feed, or try again later.")
                 return
             }
             playbackNote = "Retrying…"
-            log("retry", feed, detail: "same feed after \(Self.xtreamRetryDelay)s (connection limit?)")
+            log("retry", feed, detail: "same feed in \(Self.xtreamRetryDelay)s (attempt \(retries + 1) of \(Self.xtreamStartRetries))")
             tune(display, candidates: candidates, from: candidateIndex, followFeed: surfStep != 0,
                  inPlace: true, reason: reason, delay: Self.xtreamRetryDelay)
             return
@@ -1740,17 +1894,19 @@ final class LiveTVStore: ObservableObject {
         moveToNext(display, reason: reason)
     }
 
-    /// A playing stream stalled for good, errored or ended: reconnect the
-    /// same feed first, then move to the next version.
+    /// A playing stream that didn't get over a stall / error by itself:
+    /// reconnect the same feed (a few times), then move to the next version.
     private func recover(reason: String) {
         guard let display = watching, candidateIndex < candidates.count else { return }
         stallTask?.cancel()
         stallStartedAt = nil
         let feed = candidates[candidateIndex]
         let played = feedFirstFrameAt.map { Date().timeIntervalSince($0) } ?? 0
-        // A long healthy run earns a fresh set of reconnects.
-        if played > 300 { reconnectsOnFeed = 0 }
-        let allowance = played > 60 ? 2 : 1
+        // A healthy run earns a fresh set of reconnects.
+        if played > 120 { reconnectsOnFeed = 0 }
+        // Xtream links are cheap to reopen and usually come straight back.
+        let isXtream = feed.serverID.hasPrefix("xt:")
+        let allowance = (isXtream ? 2 : 1) + (played > 60 ? 1 : 0)
         if reconnectsOnFeed < allowance {
             guard allowRecovery() else {
                 giveUp(display, message: "This channel keeps dropping. Try another version from Choose Feed, or try again later.")
@@ -1760,7 +1916,7 @@ final class LiveTVStore: ObservableObject {
             playbackNote = "Reconnecting…"
             log("reconnect", feed, detail: "\(reason); attempt \(reconnectsOnFeed) of \(allowance); played \(Int(played))s")
             tune(display, candidates: candidates, from: candidateIndex, followFeed: surfStep != 0,
-                 inPlace: true, reason: reason)
+                 inPlace: true, reason: reason, delay: isXtream ? 1 : 0)
         } else {
             record(feed, worked: false)
             moveToNext(display, reason: reason)

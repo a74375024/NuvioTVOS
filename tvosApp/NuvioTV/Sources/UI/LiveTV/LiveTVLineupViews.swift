@@ -11,6 +11,7 @@ struct LiveTVOptionsView: View {
     @State private var showSources = false
     @State private var showReport = false
     @State private var showLog = false
+    @State private var showCountries = false
     @State private var preferTS = LiveTVStore.xtreamPrefersTS
 
     var body: some View {
@@ -29,6 +30,12 @@ struct LiveTVOptionsView: View {
                             Text(L10n.string("live_show_hidden_detail", fallback: "List channels outside My Lineup too, dimmed"))
                                 .font(.system(size: 20)).foregroundColor(.secondary)
                         }
+                    }
+                    Button { showCountries = true } label: {
+                        row("globe", L10n.string("live_countries_title", fallback: "Countries & Languages"),
+                            store.prefs.countries.count == 1 && store.prefs.countries.contains("US")
+                                ? L10n.string("live_countries_us", fallback: "US English")
+                                : L10n.format("live_countries_n", fallback: "%d selected", store.prefs.countries.count))
                     }
                     Button(action: onSetup) {
                         row("sparkles.tv", store.prefs.configured
@@ -72,6 +79,7 @@ struct LiveTVOptionsView: View {
         .fullScreenCover(isPresented: $showEdit) { LineupEditView() }
         .fullScreenCover(isPresented: $showReport) { LiveTVExportView() }
         .fullScreenCover(isPresented: $showLog) { LiveTVExportView(kind: .playbackLog) }
+        .sheet(isPresented: $showCountries) { LineupCountriesView() }
     }
 
     private func row(_ symbol: String, _ title: String, _ value: String?) -> some View {
@@ -80,6 +88,62 @@ struct LiveTVOptionsView: View {
             Text(title)
             Spacer()
             if let value { Text(value).foregroundColor(.secondary) }
+        }
+    }
+}
+
+// MARK: - Countries & languages
+
+/// Which countries / languages My Lineup, All Channels, Live Events and the
+/// provider guide cover. US English is on by default.
+struct CountryToggles: View {
+    @Binding var selection: Set<String>
+    @ObservedObject private var store = LiveTVStore.shared
+
+    var body: some View {
+        let counts = store.marketCounts()
+        Section {
+            ForEach(counts) { item in
+                Toggle(isOn: Binding(
+                    get: { selection.contains(item.market) },
+                    set: { on in
+                        if on { selection.insert(item.market) } else { selection.remove(item.market) }
+                    }
+                )) {
+                    HStack {
+                        Text(LiveTVStore.marketName(item.market))
+                        Spacer()
+                        Text(L10n.format("live_country_count", fallback: "%d channels", item.count))
+                            .foregroundColor(.secondary)
+                    }
+                }
+            }
+        } header: {
+            Text(L10n.string("live_countries_header", fallback: "Countries & languages"))
+        } footer: {
+            Text(L10n.string("live_countries_footer", fallback: "Channels from the countries you pick join My Lineup, All Channels and Live Events. Everything else is still in Search."))
+        }
+    }
+}
+
+/// Options → Countries & Languages.
+struct LineupCountriesView: View {
+    @ObservedObject private var store = LiveTVStore.shared
+    @State private var selection: Set<String> = []
+
+    var body: some View {
+        NavigationStack {
+            List {
+                CountryToggles(selection: $selection)
+            }
+            .navigationTitle(L10n.string("live_countries_title", fallback: "Countries & Languages"))
+        }
+        .onAppear { selection = store.prefs.countries }
+        .onChange(of: selection) { _, value in
+            guard value != store.prefs.countries else { return }
+            var updated = store.prefs
+            updated.countries = value
+            store.setPrefs(updated)
         }
     }
 }
@@ -250,6 +314,7 @@ struct LineupSetupView: View {
             .padding(.vertical, 80)
 
             List {
+                CountryToggles(selection: $draft.countries)
                 Section {
                     ForEach(LineupCategory.allCases) { category in
                         Toggle(isOn: Binding(

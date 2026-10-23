@@ -197,7 +197,7 @@ struct LiveTVViewPicker: View {
             List {
                 Section {
                     option(.lineup, count: store.lineupEntries.count, symbol: "sparkles.tv")
-                    option(.all, count: store.entries.count, symbol: "square.grid.3x3")
+                    option(.all, count: store.browseEntries.count, symbol: "square.grid.3x3")
                     option(.favorites, count: store.entries.filter(\.isFavorite).count, symbol: "star")
                     option(.recent, count: store.recentChannels.count, symbol: "clock")
                 }
