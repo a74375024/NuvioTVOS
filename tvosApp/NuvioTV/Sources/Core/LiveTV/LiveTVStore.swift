@@ -100,7 +100,27 @@ final class LiveTVStore: ObservableObject {
     /// All Channels, groups and Show hidden list. Search covers everything.
     @Published private(set) var browseEntries: [LiveTVChannel] = []
     @Published private(set) var events: [LiveEvent] = [] {
-        didSet { scheduleSportsRebuild(delay: 1) }
+        didSet {
+            plainEventsMemo = nil
+            scheduleSportsRebuild(delay: 1)
+        }
+    }
+    private var plainEventsMemo: [SportsEvent]?
+
+    /// Until the first match finishes: the provider's events as plain tiles,
+    /// so Live Events is never just the event channels.
+    var plainSportsEvents: [SportsEvent] {
+        if let plainEventsMemo { return plainEventsMemo }
+        let value = events.map { event in
+            SportsEvent(
+                id: event.id, title: event.title, league: event.league, leagueShort: SportsMatcher.shortLeague(event.league),
+                start: event.start, game: nil,
+                sources: event.feeds.map { EventSource(channelID: $0, kind: .provider, spanish: event.market == "US-ES", detail: "") },
+                family: event.family
+            )
+        }
+        plainEventsMemo = value
+        return value
     }
     /// Live Events: TheSportsDB games joined with guide channels and
     /// provider event feeds (see SportsMatcher).

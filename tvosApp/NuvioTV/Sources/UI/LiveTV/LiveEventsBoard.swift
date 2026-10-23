@@ -446,7 +446,7 @@ struct LiveEventsBoard: View {
                                      "MLS", "Soccer", "Fighting", "Motorsport", "Golf", "Tennis"]
 
     private var rows: [Row] {
-        let all = store.sportsEvents
+        let all = store.sportsEvents.isEmpty ? store.plainSportsEvents : store.sportsEvents
         func isLive(_ event: SportsEvent) -> Bool {
             let state = event.state(at: now)
             return state == .live || state == .mayHaveEnded
