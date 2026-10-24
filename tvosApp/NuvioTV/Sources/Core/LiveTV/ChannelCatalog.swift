@@ -1106,9 +1106,14 @@ enum ChannelCatalog {
             ("Hockey", ["hockey"]),
             ("Baseball", ["baseball"]),
             ("MLS", ["mls"]),
+        ]
+        for (league, words) in rules where words.contains(where: { text.contains($0) }) { return league }
+        // Fights before soccer, as whole words: soccer's "fc " also matches
+        // the end of "ufc " (UFC cards were landing in Soccer).
+        if RX.test(Self.fightWords, text) { return "Fighting" }
+        let laterRules: [(String, [String])] = [
             ("Soccer", ["uefa", "premier league", "champions league", "la liga", "laliga", "serie a", "bundesliga", "ligue1", "ligue 1", "football event", "soccer", "fc ", " united", "liga", "eredivisie", "a-league", "concacaf", "nwsl"]),
             ("Motorsport", ["f1", "formula", "nascar", "indycar", "motogp", "rally", "wrc", "supercross", "motocross"]),
-            ("Fighting", ["ufc", "boxing", "mma", "fight night", "pfl", "one fight", "wwe", "aew", "bellator"]),
             ("Tennis", ["wta", "atp", "tennis"]),
             ("Golf", ["pga", "lpga", "golf", "liv "]),
             ("Darts", ["pdc", "darts"]),
@@ -1116,7 +1121,12 @@ enum ChannelCatalog {
             ("Rugby", ["rugby", "nrl"]),
             ("Volleyball", ["volleyball"])
         ]
-        for (league, words) in rules where words.contains(where: { text.contains($0) }) { return league }
+        for (league, words) in laterRules where words.contains(where: { text.contains($0) }) { return league }
         return "Other"
     }
+
+    /// Fight promotions and terms, as whole words.
+    /// ("ufc_ppv" and "ufc333" count; "Boxing Day" football doesn't.)
+    static let fightWords = "\\b(ufc|bkfc|pfl)(\\b|_|\\d)|\\b(mma|bellator|wwe|aew|kickboxing|muay thai)\\b|\\bboxing\\b(?! day)"
+        + "|fight night|one fight|combat fc|fight pass|fightpass"
 }

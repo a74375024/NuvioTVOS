@@ -21,6 +21,8 @@ enum SportsNames {
     }
 
     static func title(_ game: SportsGame) -> String {
+        // A fight card part: "UFC 333 Prelims".
+        if let custom = game.customTitle { return custom }
         let away = short(game.away, soccer: game.isSoccer), home = short(game.home, soccer: game.isSoccer)
         return game.isSoccer ? "\(home) vs \(away)" : "\(away) at \(home)"
     }

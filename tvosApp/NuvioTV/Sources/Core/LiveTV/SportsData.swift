@@ -46,9 +46,16 @@ struct SportsGame: Codable, Hashable, Identifiable {
     var postponed = false
     /// Already over when the schedule was fetched.
     var completed = false
+    /// A fight card part's own title ("UFC 333: Pereira vs. Hill",
+    /// "UFC 333 Prelims"); its two sides are the headline fighters.
+    var customTitle: String? = nil
+    /// Fight cards: "ufc|333|main" (promotion, event number or empty for a
+    /// Fight Night, part of the card or empty when the card isn't split).
+    var cardKey: String? = nil
 
     var title: String {
-        isSoccer ? "\(home.name) vs \(away.name)" : "\(away.name) at \(home.name)"
+        if let customTitle { return customTitle }
+        return isSoccer ? "\(home.name) vs \(away.name)" : "\(away.name) at \(home.name)"
     }
 }
 
@@ -78,6 +85,8 @@ final class SportsData: ObservableObject {
         /// Words in provider event titles that mean this league (for
         /// suggestions); empty means the row group decides.
         var keywords: [String] = []
+        /// A fight promotion: events are cards of many bouts, not games.
+        var fights = false
         var college: Bool { group.hasPrefix("College") }
     }
 
@@ -117,13 +126,21 @@ final class SportsData: ObservableObject {
         League(path: "soccer/usa.nwsl", group: "Soccer", short: "NWSL", name: "NWSL", sport: "Soccer", soccer: true, keywords: ["nwsl"])
     ]
 
+    /// Fight schedules, looked up when "UFC, boxing & wrestling" is picked.
+    /// Not in `leagues`: setup offers fights as one pick, not per promotion.
+    static let fightLeagues: [League] = [
+        League(path: "mma/ufc", group: "Fighting", short: "UFC", name: "UFC", sport: "Fighting", soccer: false, fights: true)
+    ]
+
+    static var allLeagues: [League] { leagues + fightLeagues }
+
     /// The leagues looked up: My Sports' picks, or the standard set until
     /// it's set up.
     static var activeLeagues: [League] {
         let prefs = MySports.current
         guard prefs.configured else { return leagues.filter(\.standard) }
         let picked = Set(prefs.leagues)
-        return leagues.filter { picked.contains($0.short) }
+        return leagues.filter { picked.contains($0.short) } + (picked.contains("S:Fighting") ? fightLeagues : [])
     }
 
     static let enabledKey = "nuvio.tv.livetv.gameSchedule"
@@ -222,7 +239,14 @@ final class SportsData: ObservableObject {
             await self?.loading?.value
             guard let self, Self.isEnabled, self.task == nil else { return }
             if let fetched = self.saved.fetchedAt, Calendar.current.isDateInToday(fetched),
-               Date().timeIntervalSince(fetched) < 20 * 3600 { return }
+               Date().timeIntervalSince(fetched) < 20 * 3600 {
+                // Already fetched today, but a league added since (an update
+                // brought the fight schedule) is looked up now.
+                let known = Set(self.saved.leagueSet ?? [])
+                let missing = Set(Self.activeLeagues.map(\.short).filter { !known.contains($0) })
+                if !missing.isEmpty, self.saved.failedAt == nil { self.start(force: false, only: missing) }
+                return
+            }
             if self.saved.failureBuild != Self.appBuild { self.saved.failures = 0 }
             let failures = self.saved.failures ?? 0
             if let failed = self.saved.failedAt {
@@ -362,7 +386,7 @@ final class SportsData: ObservableObject {
         dayFormat.dateFormat = "yyyyMMdd"
 
         // A given list may include leagues Setup is showing but hasn't saved.
-        let active = only.map { set in Self.leagues.filter { set.contains($0.short) } } ?? Self.activeLeagues
+        let active = only.map { set in Self.allLeagues.filter { set.contains($0.short) } } ?? Self.activeLeagues
         let needsSchoolsFor = Self.activeLeagues + active
         var succeeded: [String] = []
         let configured = MySports.current.configured
@@ -377,7 +401,11 @@ final class SportsData: ObservableObject {
             requests += 1
             var queries: [String]
             switch league.mode {
-            case .month: queries = months.map { "dates=\($0)" }
+            case .month:
+                queries = months.map { "dates=\($0)" }
+                // Fight cards: also the default listing (the next cards), in
+                // case the month form leaves some out.
+                if league.fights { queries.append("") }
             case .days(let count): queries = (0..<count).map { "dates=" + dayFormat.string(from: calendar.date(byAdding: .day, value: $0, to: now) ?? now) }
             case .week: queries = [""]
             }
@@ -522,6 +550,15 @@ final class SportsData: ObservableObject {
             return nil
         }
         let data = result.data
+        if league.fights {
+            let cards = await Task.detached(priority: .utility) { () -> (games: [SportsGame], summary: String)? in
+                autoreleasepool { SportsParse.fightCards(data, league: league) }
+            }.value
+            // What the schedule gave (no links): events, card parts, networks.
+            CrashRecorder.note("schedule \(league.short) \(query): \(data.count / 1024) KB, \(cards?.summary ?? "unreadable")")
+            guard let cards else { return nil }
+            return LeagueResult(games: cards.games.filter { $0.start >= from && $0.start <= to }, teams: [], total: cards.games.count)
+        }
         let parsed = await Task.detached(priority: .utility) { () -> LeagueResult? in
             // Only the fields used are decoded; the full object tree is the
             // fallback if that ever fails. Only the week ahead is kept.
@@ -724,6 +761,123 @@ private struct ScoreboardStatus: Decodable { let type: Lenient<ScoreboardStatusT
 private struct ScoreboardStatusType: Decodable {
     let name: LenientText?
     let completed: LenientBool?
+}
+
+// MARK: - Fight cards
+
+extension SportsParse {
+    /// "early", "prelims", "main" from a bout's card segment or type, or nil.
+    static func cardPart(_ competition: [String: Any]) -> String? {
+        var texts: [String] = []
+        if let segment = competition["cardSegment"] as? [String: Any] {
+            texts += ["description", "name", "abbreviation", "shortName"].compactMap { text(segment[$0]) }
+        } else if let segment = text(competition["cardSegment"]) {
+            texts.append(segment)
+        }
+        if let type = competition["type"] as? [String: Any] {
+            texts += ["text", "abbreviation", "slug", "description"].compactMap { text(type[$0]) }
+        }
+        return cardPart(text: texts.joined(separator: " "))
+    }
+
+    static func cardPart(text: String) -> String? {
+        let value = text.lowercased()
+        if value.contains("early") && value.contains("prelim") { return "early" }
+        if value.contains("prelim") { return "prelims" }
+        if value.contains("main") { return "main" }
+        return nil
+    }
+
+    private static func fighter(_ competitor: [String: Any]) -> SportsTeam? {
+        let athlete = (competitor["athlete"] as? [String: Any]) ?? (competitor["team"] as? [String: Any])
+        guard let athlete, let name = text(athlete["displayName"]) ?? text(athlete["fullName"]) ?? text(athlete["name"]) else { return nil }
+        let id = text(athlete["id"]) ?? text(competitor["id"]) ?? name
+        let headshot = (athlete["headshot"] as? [String: Any]).flatMap { text($0["href"]) }
+            ?? (athlete["flag"] as? [String: Any]).flatMap { text($0["href"]) }
+        var alternates: [String] = []
+        if let short = text(athlete["shortName"]), short != name { alternates.append(short) }
+        return SportsTeam(id: "f\(id)", name: name, short: nil, alternates: alternates, badge: headshot)
+    }
+
+    /// One game per part of each card (early prelims, prelims, main card),
+    /// at its first bout's time, with the networks of its bouts. A card with
+    /// no parts in the data is one game. The summary goes to the log.
+    static func fightCards(_ data: Data, league: SportsData.League) -> (games: [SportsGame], summary: String)? {
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let events = object["events"] as? [[String: Any]] else { return nil }
+        let org = league.short.lowercased()
+        let partOrder = ["early": 0, "prelims": 1, "main": 2]
+        let label = ["early": "Early Prelims", "prelims": "Prelims", "main": "Main Card"]
+        var games: [SportsGame] = []
+        var lines: [String] = []
+        var keysSeen = Set<String>()
+        let clock = DateFormatter()
+        clock.locale = Locale(identifier: "en_US_POSIX")
+        clock.dateFormat = "EEE HH:mm"
+        for event in events {
+            guard let id = text(event["id"]), let name = text(event["name"]) ?? text(event["shortName"]) else { continue }
+            let eventStart = date(text(event["date"]))
+            let bouts = event["competitions"] as? [[String: Any]] ?? []
+            if let first = bouts.first { keysSeen.formUnion(first.keys) }
+            struct Part {
+                var start: Date?
+                var networks: [String] = []
+                var bouts: [(SportsTeam, SportsTeam)] = []
+                var done = 0
+                var count = 0
+                var venue: String?
+            }
+            var parts: [String: Part] = [:]
+            let anyPart = bouts.contains { cardPart($0) != nil }
+            for bout in bouts {
+                let key = anyPart ? (cardPart(bout) ?? "main") : ""
+                var part = parts[key] ?? Part()
+                part.count += 1
+                if let start = date(text(bout["startDate"])) ?? date(text(bout["date"])) {
+                    if part.start.map({ start < $0 }) ?? true { part.start = start }
+                }
+                for network in networks(bout) where !part.networks.contains(where: { $0.caseInsensitiveCompare(network) == .orderedSame }) {
+                    part.networks.append(network)
+                }
+                let competitors = (bout["competitors"] as? [[String: Any]] ?? []).compactMap(fighter)
+                if competitors.count == 2 { part.bouts.append((competitors[0], competitors[1])) }
+                let status = ((bout["status"] as? [String: Any])?["type"] as? [String: Any])
+                if (status?["completed"] as? Bool) == true { part.done += 1 }
+                if part.venue == nil { part.venue = venue(bout["venue"] as? [String: Any]) }
+                parts[key] = part
+            }
+            if parts.isEmpty { parts[""] = Part(start: eventStart) }
+            // "UFC 333: Pereira vs. Hill" → "UFC 333"; its number, if any.
+            let head = name.components(separatedBy: ":").first?.trimmingCharacters(in: .whitespaces) ?? name
+            let number = RX.range("(?<=\\b\(league.short) )\\d{2,4}\\b", in: head, caseInsensitive: true).map { String(head[$0]) } ?? ""
+            let lowered = SportsMatcher.normalized(name)
+            var described: [String] = []
+            for (key, part) in parts.sorted(by: { (partOrder[$0.key] ?? 3) < (partOrder[$1.key] ?? 3) }) {
+                guard let start = part.start ?? eventStart else { continue }
+                // The headline bout: the one the card is named after, else the
+                // last listed (bouts are usually listed in running order).
+                let headline = part.bouts.first { bout in
+                    let a = SportsMatcher.normalized(bout.0.name.components(separatedBy: " ").last ?? "")
+                    let b = SportsMatcher.normalized(bout.1.name.components(separatedBy: " ").last ?? "")
+                    return lowered.contains(a) && lowered.contains(b)
+                } ?? part.bouts.last
+                let sides = headline ?? (SportsTeam(id: "f\(id)a", name: head), SportsTeam(id: "f\(id)b", name: name))
+                let title = key.isEmpty || key == "main" ? name : "\(head) \(label[key] ?? key)"
+                games.append(SportsGame(
+                    id: "\(league.short)|\(id)|\(key)", league: league.group, leagueShort: league.short, isSoccer: true,
+                    weekLabel: nil, home: sides.0, away: sides.1, start: start, networks: part.networks, venue: part.venue,
+                    completed: part.count > 0 && part.done == part.count,
+                    customTitle: title, cardKey: "\(org)|\(number)|\(key)"
+                ))
+                described.append("\(key.isEmpty ? "card" : key) \(part.count) bouts \(clock.string(from: start))"
+                                 + (part.networks.isEmpty ? "" : " (\(part.networks.joined(separator: ", ")))"))
+            }
+            lines.append("\(head): " + described.joined(separator: ", "))
+        }
+        let keys = keysSeen.sorted().joined(separator: ",")
+        return (games, "\(events.count) cards, \(games.count) parts; " + lines.prefix(4).joined(separator: "; ")
+                + (keys.isEmpty ? "" : "; bout fields [\(keys)]"))
+    }
 }
 
 extension SportsParse {

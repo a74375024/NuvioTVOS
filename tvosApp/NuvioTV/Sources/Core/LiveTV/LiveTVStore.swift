@@ -2813,17 +2813,27 @@ final class LiveTVStore: ObservableObject {
         let lineup = lineupIDs
         let markets = stationMarkets()
         var subsetMap: [String: [LiveTVProgram]] = [:]
+        // The saved listings beyond the guide's window (the guide keeps about
+        // 14 h; games are looked for 48 h ahead). Shared arrays, not copies.
+        var savedMap: [String: (outside: [OutsideGuide.RawProgram]?, provider: [OutsideGuide.RawProgram]?)] = [:]
         var metaMap: [String: (inLineup: Bool, spanish: Bool, rank: Int)] = [:]
         // Every such channel you have, not only My Lineup's: any station
         // whose guide shows the game is a way to watch it.
         for id in lineup.union(browseEntries.map(\.id)) {
-            guard let info = entryInfo[id], kinds.contains(info.category), let list = programs[id] else { continue }
-            subsetMap[id] = list
+            guard let info = entryInfo[id], kinds.contains(info.category) else { continue }
+            let list = programs[id]
+            // Saved listings are kept per provider channel (the entry's members).
+            let outside = info.members.prefix(2).lazy.compactMap { self.outsideMatches[$0] }.first
+            let provider = info.members.prefix(2).lazy.compactMap { self.providerMatches[$0] }.first
+            guard list != nil || outside != nil || provider != nil else { continue }
+            subsetMap[id] = list ?? []
+            if outside != nil || provider != nil { savedMap[id] = (outside, provider) }
             let inLineup = lineup.contains(id)
             metaMap[id] = (inLineup, info.category == .spanish || info.market == "US-ES",
                            Self.stationRank(info, markets: markets, inLineup: inLineup))
         }
         let subset = subsetMap
+        let savedListings = savedMap
         let meta = metaMap
         let mainMS = Int(Date().timeIntervalSince(started) * 1000)
         // Nothing to read yet (guide still loading): try again later.
@@ -2833,45 +2843,72 @@ final class LiveTVStore: ObservableObject {
         }
         listingsProgramsRevision = programsRevision
         let now = Date()
-        let extracted = await Task.detached(priority: .utility) { () -> [SportsMatcher.GuideListing] in
+        let extracted = await Task.detached(priority: .utility) { () -> (listings: [SportsMatcher.GuideListing], ahead: Int) in
             let low = now.addingTimeInterval(-5 * 3600), high = now.addingTimeInterval(48 * 3600)
             var listings: [SportsMatcher.GuideListing] = []
+            var ahead = 0
+            func consider(_ id: String, _ info: (inLineup: Bool, spanish: Bool, rank: Int), title rawTitle: String, subtitle: String?,
+                          overview: String?, sports: Bool, start: Date, end: Date) -> Bool {
+                let title = subtitle.map { "\(rawTitle) \($0)" } ?? rawTitle
+                if SportsMatcher.looksLikeGame(title) {
+                    listings.append(SportsMatcher.GuideListing(entryID: id, inLineup: info.inLineup, spanish: info.spanish,
+                                                               title: title, start: start, end: end, rank: info.rank))
+                    return true
+                }
+                if let overview, overview.count > 12, sports || SportsMatcher.isGenericSportsTitle(rawTitle),
+                   SportsMatcher.isGenericSportsTitle(title) {
+                    // "NBA Basketball": the description names the venue
+                    // ("From Chase Center in San Francisco"), or sometimes the teams.
+                    var listing = SportsMatcher.GuideListing(entryID: id, inLineup: info.inLineup, spanish: info.spanish,
+                                                             title: title, start: start, end: end, rank: info.rank)
+                    if let place = SportsMatcher.venueOf(overview) {
+                        listing.venue = place.venue
+                        listing.city = place.city
+                    } else {
+                        listing.detail = String(overview.prefix(120))
+                    }
+                    listings.append(listing)
+                    return true
+                }
+                return false
+            }
+            let highMinute = Int(high.timeIntervalSince1970 / 60)
             for (id, list) in subset {
                 autoreleasepool {
                     guard let info = meta[id] else { return }
+                    var guideEnd = low
                     for program in list where program.end > low && program.start < high {
-                        let title = program.episodeTitle.map { "\(program.title) \($0)" } ?? program.title
-                        if SportsMatcher.looksLikeGame(title) {
-                            listings.append(SportsMatcher.GuideListing(entryID: id, inLineup: info.inLineup, spanish: info.spanish,
-                                                                       title: title, start: program.start, end: program.end,
-                                                                       rank: info.rank))
-                        } else if let overview = program.overview, overview.count > 12,
-                                  program.isSports || SportsMatcher.isGenericSportsTitle(program.title),
-                                  SportsMatcher.isGenericSportsTitle(title) {
-                            // "NBA Basketball": the description names the venue
-                            // ("From Chase Center in San Francisco"), or sometimes the teams.
-                            var listing = SportsMatcher.GuideListing(entryID: id, inLineup: info.inLineup, spanish: info.spanish,
-                                                                     title: title, start: program.start, end: program.end, rank: info.rank)
-                            if let place = SportsMatcher.venueOf(overview) {
-                                listing.venue = place.venue
-                                listing.city = place.city
-                            } else {
-                                listing.detail = String(overview.prefix(120))
+                        if program.end > guideEnd { guideEnd = program.end }
+                        _ = consider(id, info, title: program.title, subtitle: program.episodeTitle, overview: program.overview,
+                                     sports: program.isSports, start: program.start, end: program.end)
+                    }
+                    // Then the saved listings past what the guide holds.
+                    guard let saved = savedListings[id] else { return }
+                    let fromMinute = Int(guideEnd.timeIntervalSince1970 / 60)
+                    var seen = Set<Int>()
+                    for raw in [saved.outside, saved.provider] {
+                        for item in raw ?? [] where item.s >= fromMinute && item.s < highMinute && seen.insert(item.s).inserted {
+                            let start = Date(timeIntervalSince1970: TimeInterval(item.s * 60))
+                            let end = Date(timeIntervalSince1970: TimeInterval((item.s + item.m) * 60))
+                            if consider(id, info, title: item.t, subtitle: item.st, overview: item.d, sports: item.f & 2 != 0,
+                                        start: start, end: end) {
+                                ahead += 1
                             }
-                            listings.append(listing)
                         }
                     }
                 }
             }
-            return listings.sorted { $0.start != $1.start ? $0.start < $1.start : ($0.entryID != $1.entryID ? $0.entryID < $1.entryID : $0.title < $1.title) }
+            let sorted = listings.sorted { $0.start != $1.start ? $0.start < $1.start : ($0.entryID != $1.entryID ? $0.entryID < $1.entryID : $0.title < $1.title) }
+            return (sorted, ahead)
         }.value
         listingsExtractedAt = Date()
         sportsListingsReady = true
-        let changed = extracted != sportsListings
-        CrashRecorder.note("sports listings (\(reason)): \(extracted.count) from \(subset.count) channels, "
+        let changed = extracted.listings != sportsListings
+        CrashRecorder.note("sports listings (\(reason)): \(extracted.listings.count) from \(subset.count) channels "
+                           + "(\(extracted.ahead) from saved listings past the guide), "
                            + "\(Int(Date().timeIntervalSince(started) * 1000)) ms (main \(mainMS) ms)\(changed ? "" : ", unchanged")")
         guard changed else { return }
-        sportsListings = extracted
+        sportsListings = extracted.listings
         sportsListingsRevision &+= 1
         scheduleSportsRebuild(delay: 0.5, reason: "listings")
     }
@@ -3043,9 +3080,14 @@ final class LiveTVStore: ObservableObject {
                 objects.append(object)
             }
             for game in games {
-                objects.append(["t": "game", "id": game.id, "lg": game.leagueShort, "group": game.league, "start": time(game.start),
-                                "home": team(game.home), "away": team(game.away), "venue": game.venue ?? "",
-                                "nets": game.networks, "done": game.completed])
+                var object: [String: Any] = ["t": "game", "id": game.id, "lg": game.leagueShort, "group": game.league, "start": time(game.start),
+                                             "home": team(game.home), "away": team(game.away), "venue": game.venue ?? "",
+                                             "nets": game.networks, "done": game.completed]
+                if let card = game.cardKey {
+                    object["card"] = card
+                    object["title"] = game.title
+                }
+                objects.append(object)
             }
             for id in ids {
                 guard let info = infos[id], [.sports, .local, .spanish].contains(info.category) else { continue }
@@ -3880,9 +3922,11 @@ enum SportsNetworkMap {
         var regional = 0
         var callsigns = 0
         var teamChannels = 0
+        var fightChannels = 0
 
         var summary: String {
-            "\(byKey.count) keys, \(regional) regional, \(callsigns) stations by call sign, \(teamChannels) team channels"
+            "\(byKey.count) keys, \(regional) regional, \(callsigns) stations by call sign, \(teamChannels) team channels, "
+                + "\(fightChannels) fight card channels"
         }
     }
 
@@ -3934,6 +3978,13 @@ enum SportsNetworkMap {
                    let sign = info.callsign.flatMap({ RegionalNetworks.callsign($0) }) ?? RegionalNetworks.callsignInName(info.name) {
                     add("call:\(sign)")
                     index.callsigns += 1
+                }
+                // A promotion's own channel for a part of its cards ("UFC PPV
+                // Main Card", "UFC PPV Prelims"): no event number in the name.
+                if info.category == .sports, RX.test("^ (ppv )?(ufc|pfl|bkfc) ", SportsMatcher.normalized(info.name)),
+                   let key = SportsMatcher.fightKey(info.name), key.number.isEmpty, let part = key.part {
+                    add("card:\(key.org)|\(part)")
+                    index.fightChannels += 1
                 }
                 if info.category == .sports {
                     var named: [String] = []
@@ -4020,6 +4071,12 @@ enum SportsNetworkMap {
                 take(entries, nearby: false, kind: { _ in .team }, detail: { $0.inLineup ? "Team channel · In My Lineup" : "Team channel" })
                 stats.team += 1
             }
+            // A numbered card's part on the promotion's own channel for it.
+            if let card = game.cardKey?.components(separatedBy: "|"), card.count == 3, !card[1].isEmpty,
+               let entries = index.byKey["card:\(card[0])|\(card[2].isEmpty ? "main" : card[2])"] {
+                take(entries, nearby: false, kind: { _ in .team }, detail: { $0.inLineup ? "Fight channel · In My Lineup" : "Fight channel" })
+                stats.fightCards += 1
+            }
             if !sources.isEmpty { result[game.id] = sources }
         }
         return (result, stats)
@@ -4031,6 +4088,7 @@ enum SportsNetworkMap {
         var regional = 0
         var station = 0
         var team = 0
+        var fightCards = 0
         var split = 0
         /// Broadcaster names that aren't a known network or station.
         var unknown: [String: Int] = [:]
@@ -4042,7 +4100,7 @@ enum SportsNetworkMap {
                 counts.sorted { $0.value != $1.value ? $0.value > $1.value : $0.key < $1.key }.prefix(12)
                     .map { "\($0.key) \($0.value)" }.joined(separator: ", ")
             }
-            return "\(national) national, \(regional) regional, \(station) by call sign, \(team) team channel links, "
+            return "\(national) national, \(regional) regional, \(station) by call sign, \(team) team channel links, \(fightCards) fight card channel links, "
                 + "\(split) regional splits waiting for the guide; not in your channels: [\(top(missing))]; unknown names: [\(top(unknown))]"
         }
     }
