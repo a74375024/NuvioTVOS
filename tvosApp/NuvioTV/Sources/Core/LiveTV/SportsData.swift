@@ -110,7 +110,17 @@ final class SportsData: ObservableObject {
         /// Requests made today, for the log.
         var requestDay: String?
         var requestCount: Int?
+        /// App build the failure count belongs to (reset on update).
+        var failureBuild: String?
     }
+
+    private static var appBuild: String {
+        Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?"
+    }
+
+    /// Set when a request fails for network reasons (offline, timeout):
+    /// those don't count toward the backoff.
+    private var networkTrouble = false
 
     private var saved = Saved()
     private var task: Task<Void, Never>?
@@ -154,11 +164,12 @@ final class SportsData: ObservableObject {
             guard let self, Self.isEnabled, self.task == nil else { return }
             if let fetched = self.saved.fetchedAt, Calendar.current.isDateInToday(fetched),
                Date().timeIntervalSince(fetched) < 20 * 3600 { return }
+            if self.saved.failureBuild != Self.appBuild { self.saved.failures = 0 }
             let failures = self.saved.failures ?? 0
-            if failures > 0, let failed = self.saved.failedAt {
-                guard failures <= 3 else { return }   // only Refresh from here
-                let wait: [TimeInterval] = [3600, 6 * 3600, 24 * 3600]
-                if Date().timeIntervalSince(failed) < wait[min(failures - 1, 2)] { return }
+            if let failed = self.saved.failedAt {
+                // 1 h → 6 h → 24 h, then weekly; network trouble waits 1 h.
+                let wait: [TimeInterval] = [3600, 3600, 6 * 3600, 24 * 3600, 7 * 86_400]
+                if Date().timeIntervalSince(failed) < wait[min(failures, 4)] { return }
             }
             self.start(force: false)
         }
@@ -220,6 +231,7 @@ final class SportsData: ObservableObject {
 
     private func fetch(force: Bool) async {
         let now = Date()
+        networkTrouble = false
         let calendar = Calendar.current
         // Date ranges stopped working (HTTP 400) in Sept 2026; a whole month
         // still does. The week ahead is one month, or two near month's end.
@@ -254,7 +266,10 @@ final class SportsData: ObservableObject {
         CrashRecorder.note("schedule: \(requests) leagues, ok=\(fetchedAny), \(saved.requestCount ?? 0) requests today")
         guard fetchedAny || requests == 0 else {
             saved.failedAt = now
-            saved.failures = (saved.failures ?? 0) + 1
+            if !networkTrouble {
+                saved.failures = (saved.failures ?? 0) + 1
+                saved.failureBuild = Self.appBuild
+            }
             save()
             return
         }
@@ -294,6 +309,7 @@ final class SportsData: ObservableObject {
             let result = try await URLSession.shared.data(for: request)
             return ((result.1 as? HTTPURLResponse)?.statusCode ?? 0, result.0)
         } catch {
+            networkTrouble = true
             CrashRecorder.note("schedule: request failed (\((error as NSError).code))")
             return nil
         }
@@ -321,7 +337,7 @@ final class SportsData: ObservableObject {
         }
         let data = result.data
         // Parsed off the main thread (a week of college football is a few MB).
-        let games = await Task.detached(priority: .utility) { () -> [SportsGame]? in
+        let parsed = await Task.detached(priority: .utility) { () -> (games: [SportsGame], total: Int)? in
             // Only the fields used are decoded; the full object tree is the
             // fallback if that ever fails. Only the week ahead is kept.
             let list = SportsParse.decode(data, league: league) ?? autoreleasepool { () -> [SportsGame]? in
@@ -329,9 +345,14 @@ final class SportsData: ObservableObject {
                       let events = object["events"] as? [[String: Any]] else { return nil }
                 return events.compactMap { SportsParse.game($0, league: league) }
             }
-            return list?.filter { $0.start >= from && $0.start <= to }
+            guard let list else { return nil }
+            return (list.filter { $0.start >= from && $0.start <= to }, list.count)
         }.value
-        CrashRecorder.note("schedule \(league.short) \(month): \(data.count / 1024) KB, \(games.map { String($0.count) } ?? "unreadable") games")
+        if parsed?.total == 100 {
+            CrashRecorder.note("schedule \(league.short) \(month): exactly 100 games, may be cut off")
+        }
+        let games = parsed?.games
+        CrashRecorder.note("schedule \(league.short) \(month): \(data.count / 1024) KB, \(parsed.map { "\($0.total) in month, \($0.games.count) this week" } ?? "unreadable")")
         return games
     }
 }

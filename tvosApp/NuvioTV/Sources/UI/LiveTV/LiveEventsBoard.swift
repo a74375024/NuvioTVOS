@@ -148,7 +148,8 @@ final class LiveEventsModel: ObservableObject {
     private(set) var places: [String: EventWhere] = [:]
 
     private var pending: (rows: [Row], hero: SportsEvent?, places: [String: EventWhere])?
-    private var focusedID: String?
+    /// The focused tile's key: row id + "|" + event id.
+    private var focusedKey: String?
     private var lastInput = Date()
     private var sinks: [AnyCancellable] = []
     private var ticker: AnyCancellable?
@@ -167,7 +168,8 @@ final class LiveEventsModel: ObservableObject {
         sinks = [
             store.$sportsEvents.dropFirst().sink { [weak self] _ in self?.scheduleRecompute() },
             store.$events.dropFirst().sink { [weak self] _ in self?.scheduleRecompute() },
-            store.$families.dropFirst().sink { [weak self] _ in self?.scheduleRecompute() }
+            store.$families.dropFirst().sink { [weak self] _ in self?.scheduleRecompute() },
+            store.$logosRevision.dropFirst().sink { [weak self] _ in self?.scheduleRecompute() }
         ]
         ticker = Timer.publish(every: 30, on: .main, in: .common).autoconnect().sink { [weak self] date in
             guard let self else { return }
@@ -194,12 +196,19 @@ final class LiveEventsModel: ObservableObject {
         event.flatMap { places[$0.id] } ?? EventWhere()
     }
 
-    /// From the board: which tile is focused (nil when none).
-    func focusChanged(to id: String?) {
+    /// From the board: which tile is focused (its key; nil when none).
+    func focusChanged(to key: String?) {
         lastInput = Date()
-        let old = focusedID
-        focusedID = id
-        if pending != nil, id != old { applyPending() }
+        let old = focusedKey
+        focusedKey = key
+        if pending != nil, key != old { applyPending() }
+    }
+
+    /// The latest version of a game shown (a focused copy can be older).
+    func current(_ event: SportsEvent?) -> SportsEvent? {
+        guard let event else { return nil }
+        for row in rows { if let match = row.events.first(where: { $0.id == event.id }) { return match } }
+        return event
     }
 
     /// Settings changed (e.g. games not in my channels).
@@ -285,7 +294,7 @@ final class LiveEventsModel: ObservableObject {
         buildMS += Int(Date().timeIntervalSince(started) * 1000)
 
         // Keep the focused tile until you move (or 5 s pass).
-        if let focusedID, contains(rows, focusedID), !contains(result, focusedID), Date().timeIntervalSince(lastInput) < 5 {
+        if let focusedKey, contains(rows, focusedKey), !contains(result, focusedKey), Date().timeIntervalSince(lastInput) < 5 {
             pending = (result, newHero, newPlaces)
             DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
                 guard let self, self.pending != nil, Date().timeIntervalSince(self.lastInput) >= 5 else { return }
@@ -307,8 +316,11 @@ final class LiveEventsModel: ObservableObject {
         hero = pending.hero
     }
 
-    private func contains(_ rows: [Row], _ id: String) -> Bool {
-        rows.contains { row in row.events.contains { $0.id == id } }
+    private func contains(_ rows: [Row], _ key: String) -> Bool {
+        rows.contains { row in
+            key.hasPrefix(row.id + "|") && (row.events.contains { key == row.id + "|" + $0.id }
+                                            || row.families.contains { key == row.id + "|" + $0.id })
+        }
     }
 }
 
@@ -456,7 +468,7 @@ struct LiveEventsHero: View {
     @ObservedObject private var model = LiveEventsModel.shared
 
     var body: some View {
-        let event = focused ?? model.hero
+        let event = model.current(focused) ?? model.hero
         let place = model.place(for: event)
         return VStack(alignment: .leading, spacing: 10) {
             if let event {
@@ -586,7 +598,7 @@ struct LiveEventBackdrop: View {
     @ObservedObject private var model = LiveEventsModel.shared
 
     var body: some View {
-        let event = focused ?? model.hero
+        let event = model.current(focused) ?? model.hero
         return GeometryReader { geo in
             ZStack(alignment: .topTrailing) {
                 if let game = event?.game {
@@ -676,7 +688,7 @@ struct LiveEventsBoard: View {
             .animation(.easeOut(duration: 0.18), value: columnOpen)
             .onChange(of: focus) { old, new in
                 if let new, !new.hasPrefix("h|") { lastFocus = new }
-                model.focusChanged(to: new.flatMap { eventID(fromKey: $0, rows: rows) })
+                model.focusChanged(to: new.flatMap { $0.hasPrefix("h|") ? nil : $0 })
                 handleFocus(old: old, new: new, rows: rows)
             }
             .onChange(of: isEnabled) { _, enabled in
@@ -751,11 +763,6 @@ struct LiveEventsBoard: View {
 
     private func key(_ row: Row, _ id: String) -> String { "\(row.id)|\(id)" }
 
-    /// The event id inside a tile key ("sport|NFL|ev|123" → "ev|123").
-    private func eventID(fromKey key: String, rows: [Row]) -> String? {
-        guard !key.hasPrefix("h|"), let row = rows.first(where: { key.hasPrefix($0.id + "|") }) else { return nil }
-        return String(key.dropFirst(row.id.count + 1))
-    }
 
     private func tileButton(_ event: SportsEvent, row: Row) -> some View {
         let id = key(row, event.id)

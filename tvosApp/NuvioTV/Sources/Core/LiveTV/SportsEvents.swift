@@ -92,7 +92,7 @@ struct SportsEvent: Identifiable, Hashable, Codable {
 /// names) instead of comparing every title with every game; temporary
 /// Foundation objects are released per item.
 enum SportsMatcher {
-    struct GuideListing: Hashable {
+    struct GuideListing: Hashable, Codable {
         let entryID: String
         let inLineup: Bool
         let spanish: Bool
@@ -253,21 +253,7 @@ enum SportsMatcher {
         lap("2 listings")
         if let reason = shouldStop() { stats.aborted = reason; CrashRecorder.note("sports match: \(stats.summary)"); return nil }
 
-        // 3. Games no channel shows still appear (dimmed). Ids stay stable:
-        // last time's id, else the provider event it was first shown as.
-        var used = Set<String>()
-        var result: [SportsEvent] = []
-        result.reserveCapacity(games.count + unmatched.count + plain.count)
-        for gameIndex in games.indices {
-            let value = entry(gameIndex)
-            let game = games[gameIndex]
-            var id = previousIDs[game.id] ?? firstProviderID[gameIndex] ?? value.id
-            if used.contains(id) { id = "sev|\(game.id)" }
-            guard used.insert(id).inserted else { continue }
-            result.append(value.with(id: id))
-        }
-
-        // 4. Provider events that matched no game: grouped by matchup
+        // 3. Provider events that matched no game: grouped by matchup
         // (either team order, start within 90 minutes) through a key lookup.
         var loose: [SportsEvent] = []
         var byPair: [String: [Int]] = [:]
@@ -285,8 +271,24 @@ enum SportsMatcher {
                 if let key { byPair[key, default: []].append(loose.count - 1) }
             }
         }
+        var used = Set<String>()
+        var result: [SportsEvent] = []
+        result.reserveCapacity(games.count + loose.count + plain.count)
         for event in loose + plain.map({ plainEvent($0) }) where used.insert(event.id).inserted {
             result.append(event)
+        }
+
+        // 4. Games (no channel showing them: dimmed). Ids stay stable: last
+        // time's id, else the provider event it was first shown as — unless
+        // a provider tile above already uses it.
+        for gameIndex in games.indices {
+            let value = entry(gameIndex)
+            let game = games[gameIndex]
+            var id = previousIDs[game.id] ?? firstProviderID[gameIndex] ?? value.id
+            if used.contains(id) { id = firstProviderID[gameIndex] ?? value.id }
+            if used.contains(id) { id = value.id }
+            guard used.insert(id).inserted else { continue }
+            result.append(value.with(id: id))
         }
         lap("3 assemble")
 
@@ -334,14 +336,15 @@ enum SportsMatcher {
     /// Two sides: "A vs B", "A v B", "A @ B", "A at B", "A - B" (after a
     /// "Network:" style prefix).
     static func looksLikeGame(_ title: String) -> Bool {
-        var text = " " + title.lowercased() + " "
-        if let colon = text.firstIndex(of: ":"), text.distance(from: text.startIndex, to: colon) < 30 {
-            text = " " + String(text[text.index(after: colon)...])
+        let full = " " + title.lowercased() + " "
+        if full.contains("@") { return true }
+        for separator in [" vs ", " vs. ", " v ", " v. ", " at "] where full.contains(separator) { return true }
+        // " - " only counts after a "Network:" style prefix.
+        if let colon = full.firstIndex(of: ":"), full.distance(from: full.startIndex, to: colon) < 30 {
+            let rest = " " + String(full[full.index(after: colon)...])
+            return rest.contains(" - ")
         }
-        for separator in [" vs ", " vs. ", " v ", " v. ", " @ ", " at ", " - "] where text.contains(separator) {
-            return true
-        }
-        return text.contains("@")
+        return false
     }
 
     /// Team names of a set of games, looked up by their first word.
@@ -390,7 +393,10 @@ enum SportsMatcher {
             let words = SportsMatcher.normalized(title).split(separator: " ").map(String.init)
             guard words.count >= 2 else { return [] }
             // Words as written, for "abbreviations count only in capitals".
-            let written = Set(title.split(whereSeparator: { !($0.isLetter || $0.isNumber) }).map(String.init))
+            // In an all-capitals title every word looks like an abbreviation,
+            // so none counts on its own there.
+            let allCaps = !title.contains(where: { $0.isLowercase })
+            let written: Set<String> = allCaps ? [] : Set(title.split(whereSeparator: { !($0.isLetter || $0.isNumber) }).map(String.init))
             var hits: [Hit] = []
             for position in words.indices {
                 guard let names = byFirstWord[words[position]] else { continue }
@@ -414,7 +420,10 @@ enum SportsMatcher {
             for (game, list) in byGame {
                 let home = list.filter { $0.name.side == 0 }
                 let away = list.filter { $0.name.side == 1 }
-                func strong(_ hit: Hit) -> Bool { hit.name.abbreviation.map { written.contains($0) } ?? true }
+                func strong(_ hit: Hit) -> Bool {
+                    guard let abbreviation = hit.name.abbreviation else { return true }
+                    return abbreviation.count >= 3 && written.contains(abbreviation)
+                }
                 func full(_ hit: Hit) -> Bool { hit.name.abbreviation == nil }
                 var found = false
                 for h in home where !found {

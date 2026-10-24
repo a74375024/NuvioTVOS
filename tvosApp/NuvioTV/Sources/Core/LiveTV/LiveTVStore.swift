@@ -2581,6 +2581,11 @@ final class LiveTVStore: ObservableObject {
     private var sportsBackupIndex: [String: [Int]] = [:]
     private var sportsPersistLoaded = false
     private var sportsPersistedFingerprint: String?
+    /// The guide had game listings to read at least once this session (until
+    /// then a result would miss local-station games, so it isn't saved).
+    private var sportsListingsReady = false
+    private var listingsProgramsRevision = -1
+    private var sportsAbortUntil: Date?
 
     private static var sportsCacheFile: URL {
         let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
@@ -2635,10 +2640,17 @@ final class LiveTVStore: ObservableObject {
     /// Live Events opened: fresh sports listings if they're over 10 minutes
     /// old, and a rebuild if anything changed.
     func sportsOpened() {
-        if listingsExtractedAt.map({ Date().timeIntervalSince($0) > 600 }) ?? true {
-            Task { [weak self] in await self?.extractSportsListings(reason: "open") }
+        let stale = listingsExtractedAt.map { Date().timeIntervalSince($0) > 600 } ?? true
+        let guideMoved = programsRevision != listingsProgramsRevision
+            && (listingsExtractedAt.map { Date().timeIntervalSince($0) > 60 } ?? true)
+        guard stale || guideMoved else {
+            scheduleSportsRebuild(delay: 0.2, reason: "open")
+            return
         }
-        scheduleSportsRebuild(delay: 0.2, reason: "open")
+        Task { [weak self] in
+            await self?.extractSportsListings(reason: "open")
+            self?.scheduleSportsRebuild(delay: 0.2, reason: "open")
+        }
     }
 
     /// Live Events' 30-second tick: only rebuilds when the 30-minute time
@@ -2689,6 +2701,12 @@ final class LiveTVStore: ObservableObject {
         let subset = subsetMap
         let meta = metaMap
         let mainMS = Int(Date().timeIntervalSince(started) * 1000)
+        // Nothing to read yet (guide still loading): try again later.
+        guard !subset.isEmpty else {
+            CrashRecorder.note("sports listings (\(reason)): guide not loaded yet")
+            return
+        }
+        listingsProgramsRevision = programsRevision
         let now = Date()
         let extracted = await Task.detached(priority: .utility) { () -> [SportsMatcher.GuideListing] in
             let low = now.addingTimeInterval(-5 * 3600), high = now.addingTimeInterval(16 * 3600)
@@ -2707,6 +2725,7 @@ final class LiveTVStore: ObservableObject {
             return listings.sorted { $0.start != $1.start ? $0.start < $1.start : ($0.entryID != $1.entryID ? $0.entryID < $1.entryID : $0.title < $1.title) }
         }.value
         listingsExtractedAt = Date()
+        sportsListingsReady = true
         let changed = extracted != sportsListings
         CrashRecorder.note("sports listings (\(reason)): \(extracted.count) from \(subset.count) channels, "
                            + "\(Int(Date().timeIntervalSince(started) * 1000)) ms (main \(mainMS) ms)\(changed ? "" : ", unchanged")")
@@ -2721,12 +2740,13 @@ final class LiveTVStore: ObservableObject {
         let games = SportsData.shared.games
         let preferSpanish = prefs.countries.contains("US-ES")
         let bucket = Int(now.timeIntervalSince1970 / 1800)
-        let fingerprint = [eventsRevision, SportsData.shared.revision, entriesRevision, hiddenGroups.count,
+        let fingerprint = [eventsRevision, SportsData.shared.revision, entriesRevision,
                            sportsListingsRevision, bucket].map { String($0) }.joined(separator: "|")
-            + "|\(preferSpanish)|\(SportsData.isEnabled)"
+            + "|\(hiddenGroups.sorted().joined(separator: ","))|\(preferSpanish)|\(SportsData.isEnabled)"
         guard fingerprint != sportsFingerprint else { return }
+        if let until = sportsAbortUntil, until > now { return }
         let available = os_proc_available_memory()
-        guard available == 0 || available > 400 * 1_048_576 else {
+        guard available == 0 || available > 200 * 1_048_576 else {
             CrashRecorder.note("sports rebuild (\(reason)) skipped: only \(available / 1_048_576) MB free")
             return
         }
@@ -2765,18 +2785,21 @@ final class LiveTVStore: ObservableObject {
                 preferSpanish: preferSpanish, now: now, previousIDs: previousIDs,
                 shouldStop: {
                     let free = os_proc_available_memory()
-                    if free != 0, free < 300 * 1_048_576 { return "only \(free / 1_048_576) MB free" }
+                    if free != 0, free < 150 * 1_048_576 { return "only \(free / 1_048_576) MB free" }
                     let grown = CrashRecorder.memoryMB() - memoryBefore
-                    if grown > 150 { return "memory grew \(grown) MB" }
+                    if grown > 250 { return "memory grew \(grown) MB" }
                     return nil
                 }
             )
         }.value
         let memoryAfter = CrashRecorder.memoryMB()
         guard let result else {
-            CrashRecorder.note("sports rebuild (\(reason)) stopped; keeping the last result")
+            // Don't retry on every tick: wait a few minutes.
+            sportsAbortUntil = Date().addingTimeInterval(300)
+            CrashRecorder.note("sports rebuild (\(reason)) stopped; keeping the last result, retry in 5 min")
             return
         }
+        sportsAbortUntil = nil
         sportsFingerprint = fingerprint
         let built = result.events
         CrashRecorder.note("sports rebuild (\(reason)): \(built.count) shown, \(built.filter { !$0.sources.isEmpty }.count) watchable, "
@@ -2807,12 +2830,18 @@ final class LiveTVStore: ObservableObject {
         var events: [SportsEvent]
         /// Provider feed id → the matchup it was showing when saved.
         var feedKeys: [String: String]
+        /// The guide's game listings, so the next launch's first rebuild
+        /// still finds games on local stations.
+        var listings: [SportsMatcher.GuideListing]? = nil
     }
 
     private func saveSportsEvents(_ value: [SportsEvent], rawEvents: [LiveEvent]) {
         let games = value.filter { $0.game != nil && !$0.sources.isEmpty }
-        let fingerprint = games.map { "\($0.id):\($0.sources.count)" }.joined(separator: ",")
+        // Never save an empty or listing-less (weaker) result over a good one.
+        guard !games.isEmpty, sportsListingsReady || sportsListings.isEmpty == false else { return }
+        let fingerprint = games.map { "\($0.id):" + $0.sources.map(\.channelID).joined(separator: "+") }.joined(separator: ",")
         guard fingerprint != sportsPersistedFingerprint else { return }
+        let listings = sportsListings
         sportsPersistedFingerprint = fingerprint
         let file = Self.sportsCacheFile
         Task.detached(priority: .background) {
@@ -2826,7 +2855,7 @@ final class LiveTVStore: ObservableObject {
                     }
                 }
             }
-            let saved = SavedSportsEvents(savedAt: Date(), events: games, feedKeys: keys)
+            let saved = SavedSportsEvents(savedAt: Date(), events: games, feedKeys: keys, listings: listings)
             if let data = try? JSONEncoder().encode(saved) { try? data.write(to: file, options: .atomic) }
         }
     }
@@ -2840,7 +2869,7 @@ final class LiveTVStore: ObservableObject {
         let file = Self.sportsCacheFile
         let rawEvents = events
         Task { [weak self] in
-            let checked = await Task.detached(priority: .utility) { () -> (events: [SportsEvent], age: Int, dropped: Int)? in
+            let checked = await Task.detached(priority: .utility) { () -> (events: [SportsEvent], listings: [SportsMatcher.GuideListing], age: Int, dropped: Int)? in
                 guard let data = try? Data(contentsOf: file),
                       let saved = try? JSONDecoder().decode(SavedSportsEvents.self, from: data), saved.version == 1 else { return nil }
                 var current: [String: String] = [:]
@@ -2863,17 +2892,27 @@ final class LiveTVStore: ObservableObject {
                     }
                     return copy
                 }
-                return (events, Int(now.timeIntervalSince(saved.savedAt) / 60), dropped)
+                let listings = (saved.listings ?? []).filter { $0.end > now && $0.start < now.addingTimeInterval(16 * 3600) }
+                return (events, listings, Int(now.timeIntervalSince(saved.savedAt) / 60), dropped)
             }.value
-            guard let self, let checked, self.sportsEvents.isEmpty else { return }
+            guard let self, let checked, SportsData.isEnabled else { return }
+            if self.sportsListings.isEmpty, !checked.listings.isEmpty {
+                self.sportsListings = checked.listings
+                self.sportsListingsRevision &+= 1
+                self.scheduleSportsRebuild(delay: 0.3, reason: "saved listings")
+            }
+            // Only fills in when there's no matched result yet.
+            guard !self.sportsEvents.contains(where: { $0.game != nil }) else { return }
             let resolvable = checked.events.map { event -> SportsEvent in
                 guard !self.browseEntries.isEmpty else { return event }
                 var copy = event
                 copy.sources = event.sources.filter { self.sourceChannel($0) != nil }
                 return copy
             }
-            self.setSportsEvents(resolvable)
-            CrashRecorder.note("sports saved result: \(resolvable.count) games, \(checked.age) min old, \(checked.dropped) stale feeds dropped")
+            let savedIDs = Set(resolvable.map(\.id))
+            self.setSportsEvents(resolvable + self.sportsEvents.filter { $0.game == nil && !savedIDs.contains($0.id) })
+            CrashRecorder.note("sports saved result: \(resolvable.count) games, \(checked.listings.count) listings, "
+                               + "\(checked.age) min old, \(checked.dropped) stale feeds dropped")
         }
     }
 
