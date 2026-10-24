@@ -213,6 +213,7 @@ struct LiveTVGuideView: View {
     @State private var genreCounts: (channels: [LineupCategory: Int], now: [LiveNowGenre: Int])?
     @State private var rowsMemo = LiveRowsMemo()
     @State private var showSetup = false
+    @State private var showSportsSetup = false
     @State private var feedPicker: LiveFeedPicker?
     @State private var now = Date()
 
@@ -298,6 +299,10 @@ struct LiveTVGuideView: View {
                                 closePanel()
                                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { showSetup = true }
                             },
+                            onSports: {
+                                closePanel()
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { showSportsSetup = true }
+                            },
                             onClose: { closePanel() }
                         )
                     }
@@ -372,6 +377,9 @@ struct LiveTVGuideView: View {
         }
         .fullScreenCover(isPresented: $showSetup) {
             LineupSetupView { showSetup = false; chosenView = nil }
+        }
+        .fullScreenCover(isPresented: $showSportsSetup) {
+            MySportsSetupView { showSportsSetup = false }
         }
         .sheet(item: $feedPicker) { picker in
             LiveFeedPickerView(picker: picker) { feedPicker = nil }
@@ -550,7 +558,13 @@ struct LiveTVGuideView: View {
                             feedPicker = LiveFeedPicker(title: family.name, channel: nil, family: family)
                         },
                         onDetail: { event in eventDetail = event },
-                        onWhere: { event in eventWhere = event }
+                        onWhere: { event in eventWhere = event },
+                        onFirstOpen: {
+                            // Offer My Sports once, the first time Live Events opens.
+                            guard !MySports.shared.prefs.prompted, !ScreenTour.isActive else { return }
+                            MySports.shared.markPrompted()
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { showSportsSetup = true }
+                        }
                     )
                 } else {
                     hero.frame(width: max(0, proxy.size.width - LiveGuideMetrics.sideInset * 2), height: LiveGuideMetrics.heroHeight).clipped()

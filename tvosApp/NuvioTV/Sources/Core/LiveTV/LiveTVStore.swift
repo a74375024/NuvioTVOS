@@ -2738,11 +2738,12 @@ final class LiveTVStore: ObservableObject {
     private func rebuildSportsEvents(reason: String) async {
         let now = Date()
         let games = SportsData.shared.games
+        let schools = SportsData.shared.schools
         let preferSpanish = prefs.countries.contains("US-ES")
         let bucket = Int(now.timeIntervalSince1970 / 1800)
         let fingerprint = [eventsRevision, SportsData.shared.revision, entriesRevision,
                            sportsListingsRevision, bucket].map { String($0) }.joined(separator: "|")
-            + "|\(hiddenGroups.sorted().joined(separator: ","))|\(preferSpanish)|\(SportsData.isEnabled)"
+            + "|\(hiddenGroups.sorted().joined(separator: ","))|\(preferSpanish)|\(SportsData.isEnabled)|\(schools.count)"
         guard fingerprint != sportsFingerprint else { return }
         if let until = sportsAbortUntil, until > now { return }
         let available = os_proc_available_memory()
@@ -2782,7 +2783,7 @@ final class LiveTVStore: ObservableObject {
                                                             browse: browse, entryInfo: entryInfo, hidden: hidden)
             return SportsMatcher.build(
                 games: games, channelSources: channelSources, events: providerEvents, listings: listings,
-                preferSpanish: preferSpanish, now: now, previousIDs: previousIDs,
+                preferSpanish: preferSpanish, now: now, previousIDs: previousIDs, schools: schools,
                 shouldStop: {
                     let free = os_proc_available_memory()
                     if free != 0, free < 150 * 1_048_576 { return "only \(free / 1_048_576) MB free" }

@@ -30,7 +30,11 @@ enum SportsNames {
         case "NFL", "College Football": return "football.fill"
         case "NBA", "WNBA", "College Basketball": return "basketball.fill"
         case "MLB": return "baseball.fill"
-        case "NHL": return "hockey.puck.fill"
+        case "NHL", "Hockey": return "hockey.puck.fill"
+        case "Field Hockey": return "figure.field.hockey"
+        case "Volleyball": return "volleyball.fill"
+        case "Baseball", "Softball", "MiLB": return "baseball.fill"
+        case "Lacrosse": return "figure.lacrosse"
         case "Soccer", "MLS": return "soccerball"
         case "Fighting": return "figure.boxing"
         case "Motorsport": return "flag.checkered"
@@ -237,33 +241,71 @@ final class LiveEventsModel: ObservableObject {
             return state == .live || state == .mayHaveEnded
         }
         var result: [Row] = []
-        let live = all.filter { isLive($0) && !$0.sources.isEmpty }
-        if !live.isEmpty {
-            result.append(Row(id: "live", title: L10n.string("live_events_now", fallback: "Live now"), events: live, live: live.count))
-        }
         let horizon = now.addingTimeInterval(8 * 24 * 3600)
         let showUnwatchable = SportsData.showsUnwatchable
-        var bySport: [String: [SportsEvent]] = [:]
-        for event in all {
+        func shown(_ event: SportsEvent) -> Bool {
             let state = states[event.id]
             guard state == .live || state == .mayHaveEnded || state == .upcoming || state == .postponed,
-                  let start = event.start, start < horizon else { continue }
-            if event.sources.isEmpty, !showUnwatchable { continue }
-            bySport[event.league.isEmpty ? "Other" : event.league, default: []].append(event)
+                  let start = event.start, start < horizon else { return false }
+            return !event.sources.isEmpty || showUnwatchable
         }
-        let sports = bySport.keys.sorted { a, b in
-            let ia = Self.sportOrder.firstIndex(of: a) ?? 99, ib = Self.sportOrder.firstIndex(of: b) ?? 99
-            return ia != ib ? ia < ib : a < b
-        }
-        for sport in sports {
-            // Games you can watch by time, then the rest (dimmed) by time.
-            let list = (bySport[sport] ?? []).sorted { a, b in
+        // Games you can watch by time, then the rest (dimmed) by time.
+        func ordered(_ list: [SportsEvent]) -> [SportsEvent] {
+            list.sorted { a, b in
                 if a.sources.isEmpty != b.sources.isEmpty { return !a.sources.isEmpty }
                 let x = a.start ?? .distantFuture, y = b.start ?? .distantFuture
                 return x != y ? x < y : a.id < b.id
             }
+        }
+        let mySports = MySports.shared
+        let picked = mySports.prefs.configured ? Set(mySports.pickedGroups) : nil
+
+        // My Sports: your teams first.
+        if picked != nil {
+            let mine = all.filter { event in event.game.map { mySports.isFavorite($0) } == true && shown(event) }
+            if !mine.isEmpty {
+                result.append(Row(id: "teams", title: L10n.string("live_events_your_teams", fallback: "Your teams"),
+                                  events: ordered(mine), live: mine.filter { isLive($0) && !$0.sources.isEmpty }.count))
+            }
+        }
+        let live = all.filter { isLive($0) && !$0.sources.isEmpty && (picked?.contains($0.league) ?? true) }
+        if !live.isEmpty {
+            result.append(Row(id: "live", title: L10n.string("live_events_now", fallback: "Live now"), events: live, live: live.count))
+        }
+        var bySport: [String: [SportsEvent]] = [:]
+        var more: [SportsEvent] = []
+        for event in all where shown(event) {
+            let group = event.league.isEmpty ? "Other" : event.league
+            if let picked, !picked.contains(group) {
+                // Other sports fold into "More events" (only what you can watch).
+                if !event.sources.isEmpty { more.append(event) }
+                continue
+            }
+            bySport[group, default: []].append(event)
+        }
+        let sports: [String]
+        if picked != nil {
+            sports = mySports.pickedGroups.filter { bySport[$0] != nil }
+        } else {
+            sports = bySport.keys.sorted { a, b in
+                let ia = Self.sportOrder.firstIndex(of: a) ?? 99, ib = Self.sportOrder.firstIndex(of: b) ?? 99
+                return ia != ib ? ia < ib : a < b
+            }
+        }
+        for sport in sports {
+            let list = ordered(bySport[sport] ?? [])
             let liveCount = list.filter { isLive($0) && !$0.sources.isEmpty }.count
             result.append(Row(id: "sport|\(sport)", title: sport, events: list, live: liveCount))
+        }
+        if !more.isEmpty {
+            let list = more.sorted { a, b in
+                let la = isLive(a), lb = isLive(b)
+                if la != lb { return la }
+                let x = a.start ?? .distantFuture, y = b.start ?? .distantFuture
+                return x != y ? x < y : a.id < b.id
+            }
+            result.append(Row(id: "more", title: L10n.string("live_events_more", fallback: "More events"), events: list,
+                              live: list.filter(isLive).count))
         }
         let untimed = all.filter { states[$0.id] == .unknownTime && !$0.sources.isEmpty }
         if !untimed.isEmpty {
@@ -288,6 +330,7 @@ final class LiveEventsModel: ObservableObject {
                 newPlaces[event.id] = place
             }
         }
+        mySports.scheduleTeamReminders(all)
         let watchable = all.filter { !$0.sources.isEmpty }
         let newHero = watchable.first(where: isLive) ?? watchable.first { states[$0.id] == .upcoming }
         builds += 1
@@ -396,6 +439,14 @@ struct LiveEventTile: View {
                 Spacer()
                 TeamBadge(team: right, size: 64, focused: focused)
             }
+        } else if let teams = event.teams, teams.count == 2 {
+            HStack {
+                TeamBadge(team: teams[0], size: 64, focused: focused)
+                Spacer()
+                Text("vs").font(.system(size: 26, weight: .bold)).opacity(0.85)
+                Spacer()
+                TeamBadge(team: teams[1], size: 64, focused: focused)
+            }
         } else {
             HStack {
                 Image(systemName: SportsNames.symbol(event.league))
@@ -484,6 +535,9 @@ struct LiveEventsHero: View {
                     if let game = event.game {
                         TeamBadge(team: game.isSoccer ? game.home : game.away, size: 62)
                         TeamBadge(team: game.isSoccer ? game.away : game.home, size: 62)
+                    } else if let teams = event.teams, teams.count == 2 {
+                        TeamBadge(team: teams[0], size: 62)
+                        TeamBadge(team: teams[1], size: 62)
                     }
                     Text(event.game.map(SportsNames.title) ?? event.title)
                         .font(.system(size: 44, weight: .bold))
@@ -599,18 +653,20 @@ struct LiveEventBackdrop: View {
 
     var body: some View {
         let event = model.current(focused) ?? model.hero
+        let pair: (SportsTeam, SportsTeam)? = event?.game.map { $0.isSoccer ? ($0.home, $0.away) : ($0.away, $0.home) }
+            ?? event?.teams.flatMap { $0.count == 2 ? ($0[0], $0[1]) : nil }
         return GeometryReader { geo in
             ZStack(alignment: .topTrailing) {
-                if let game = event?.game {
+                if let pair {
                     ZStack {
                         RadialGradient(colors: [Color(red: 0.05, green: 0.2, blue: 0.55).opacity(0.85), .clear],
                                        center: .center, startRadius: 40, endRadius: geo.size.width * 0.32)
                         HStack(spacing: 40) {
-                            TeamBadge(team: game.isSoccer ? game.home : game.away, size: geo.size.height * 0.3)
+                            TeamBadge(team: pair.0, size: geo.size.height * 0.3)
                             Text("VS")
                                 .font(.system(size: geo.size.height * 0.08, weight: .heavy))
                                 .foregroundColor(.white.opacity(0.7))
-                            TeamBadge(team: game.isSoccer ? game.away : game.home, size: geo.size.height * 0.3)
+                            TeamBadge(team: pair.1, size: geo.size.height * 0.3)
                         }
                         .opacity(0.45)
                     }
@@ -619,7 +675,7 @@ struct LiveEventBackdrop: View {
                         LinearGradient(colors: [.clear, .black], startPoint: .leading, endPoint: UnitPoint(x: 0.35, y: 0.5))
                             .mask(LinearGradient(colors: [.black, .black, .clear], startPoint: .top, endPoint: .bottom))
                     )
-                    .id(game.id)
+                    .id(pair.0.id + pair.1.id)
                     .transition(.opacity)
                 }
             }
@@ -642,6 +698,7 @@ struct LiveEventsBoard: View {
     let onPickFamily: (EventFamily) -> Void
     let onDetail: (SportsEvent) -> Void
     let onWhere: (SportsEvent) -> Void
+    var onFirstOpen: () -> Void = {}
 
     private let store = LiveTVStore.shared
     @ObservedObject private var model = LiveEventsModel.shared
@@ -713,6 +770,7 @@ struct LiveEventsBoard: View {
             model.start()
             SportsData.shared.refreshIfNeeded()
             store.sportsOpened()
+            onFirstOpen()
         }
         .onDisappear {
             model.stop()

@@ -57,24 +57,73 @@ final class SportsData: ObservableObject {
     static let shared = SportsData()
 
     struct League {
+        enum Mode { case month, week, days(Int) }
         let path: String
+        /// Row group: "NFL", "College Football", "Soccer"…
         let group: String
+        /// Id and chip text: "NFL", "EPL"…
         let short: String
+        /// Name in My Sports: "Premier League".
+        let name: String
+        /// Section in My Sports: "Football", "Basketball"…
+        let sport: String
         let soccer: Bool
         var extra = ""
+        /// How the week ahead is asked for: a month (one or two requests),
+        /// this week and next (college football: a month comes back cut
+        /// short), or day by day (college basketball has too many games).
+        var mode: Mode = .month
+        /// Fetched before My Sports is set up.
+        var standard = false
+        /// Words in provider event titles that mean this league (for
+        /// suggestions); empty means the row group decides.
+        var keywords: [String] = []
+        var college: Bool { group.hasPrefix("College") }
     }
 
     static let leagues: [League] = [
-        League(path: "football/nfl", group: "NFL", short: "NFL", soccer: false),
-        League(path: "football/college-football", group: "College Football", short: "NCAAF", soccer: false, extra: "&groups=80"),
-        League(path: "basketball/nba", group: "NBA", short: "NBA", soccer: false),
-        League(path: "baseball/mlb", group: "MLB", short: "MLB", soccer: false),
-        League(path: "hockey/nhl", group: "NHL", short: "NHL", soccer: false),
-        League(path: "soccer/usa.1", group: "MLS", short: "MLS", soccer: true),
-        League(path: "soccer/eng.1", group: "Soccer", short: "EPL", soccer: true),
-        League(path: "soccer/uefa.champions", group: "Soccer", short: "UCL", soccer: true),
-        League(path: "soccer/esp.1", group: "Soccer", short: "LIGA", soccer: true)
+        League(path: "football/nfl", group: "NFL", short: "NFL", name: "NFL", sport: "Football", soccer: false, standard: true),
+        League(path: "football/college-football", group: "College Football", short: "NCAAF", name: "College Football", sport: "Football",
+               soccer: false, extra: "&groups=80", mode: .week, standard: true),
+        League(path: "basketball/nba", group: "NBA", short: "NBA", name: "NBA", sport: "Basketball", soccer: false, standard: true),
+        League(path: "basketball/wnba", group: "WNBA", short: "WNBA", name: "WNBA", sport: "Basketball", soccer: false),
+        League(path: "basketball/mens-college-basketball", group: "College Basketball", short: "NCAAM", name: "Men's College",
+               sport: "Basketball", soccer: false, extra: "&groups=50", mode: .days(3)),
+        League(path: "basketball/womens-college-basketball", group: "College Basketball", short: "NCAAW", name: "Women's College",
+               sport: "Basketball", soccer: false, extra: "&groups=50", mode: .days(3), keywords: ["women"]),
+        League(path: "baseball/mlb", group: "MLB", short: "MLB", name: "MLB", sport: "Baseball", soccer: false, standard: true),
+        League(path: "hockey/nhl", group: "NHL", short: "NHL", name: "NHL", sport: "Hockey", soccer: false, standard: true),
+        League(path: "soccer/usa.1", group: "MLS", short: "MLS", name: "MLS", sport: "Soccer", soccer: true, standard: true),
+        League(path: "soccer/eng.1", group: "Soccer", short: "EPL", name: "Premier League", sport: "Soccer", soccer: true,
+               standard: true, keywords: ["premier league", "epl"]),
+        League(path: "soccer/uefa.champions", group: "Soccer", short: "UCL", name: "Champions League", sport: "Soccer", soccer: true,
+               standard: true, keywords: ["champions league"]),
+        League(path: "soccer/esp.1", group: "Soccer", short: "LIGA", name: "La Liga", sport: "Soccer", soccer: true,
+               standard: true, keywords: ["laliga", "la liga"]),
+        League(path: "soccer/mex.1", group: "Soccer", short: "LMX", name: "Liga MX", sport: "Soccer", soccer: true, keywords: ["liga mx"]),
+        League(path: "soccer/ita.1", group: "Soccer", short: "SA", name: "Serie A", sport: "Soccer", soccer: true, keywords: ["serie a"]),
+        League(path: "soccer/ger.1", group: "Soccer", short: "BUN", name: "Bundesliga", sport: "Soccer", soccer: true, keywords: ["bundesliga"]),
+        League(path: "soccer/fra.1", group: "Soccer", short: "L1", name: "Ligue 1", sport: "Soccer", soccer: true, keywords: ["ligue 1", "ligue1"]),
+        League(path: "soccer/uefa.europa", group: "Soccer", short: "UEL", name: "Europa League", sport: "Soccer", soccer: true,
+               keywords: ["europa league"]),
+        League(path: "soccer/uefa.europa.conf", group: "Soccer", short: "UECL", name: "Conference League", sport: "Soccer", soccer: true,
+               keywords: ["conference league"]),
+        League(path: "soccer/eng.2", group: "Soccer", short: "EFL", name: "Championship", sport: "Soccer", soccer: true,
+               keywords: ["championship", "efl"]),
+        League(path: "soccer/por.1", group: "Soccer", short: "POR", name: "Liga Portugal", sport: "Soccer", soccer: true,
+               keywords: ["liga portugal", "primeira liga"]),
+        League(path: "soccer/ned.1", group: "Soccer", short: "ERE", name: "Eredivisie", sport: "Soccer", soccer: true, keywords: ["eredivisie"]),
+        League(path: "soccer/usa.nwsl", group: "Soccer", short: "NWSL", name: "NWSL", sport: "Soccer", soccer: true, keywords: ["nwsl"])
     ]
+
+    /// The leagues looked up: My Sports' picks, or the standard set until
+    /// it's set up.
+    static var activeLeagues: [League] {
+        let prefs = MySports.current
+        guard prefs.configured else { return leagues.filter(\.standard) }
+        let picked = Set(prefs.leagues)
+        return leagues.filter { picked.contains($0.short) }
+    }
 
     static let enabledKey = "nuvio.tv.livetv.gameSchedule"
     static var isEnabled: Bool {
@@ -92,6 +141,10 @@ final class SportsData: ObservableObject {
     @Published private(set) var revision = 0
     @Published private(set) var updatedAt: Date?
     @Published private(set) var refreshing = false
+    /// League → its teams (from the month's schedule), for picking favorites.
+    @Published private(set) var rosters: [String: [SportsTeam]] = [:]
+    /// Division I schools, for logos on college events in any sport.
+    @Published private(set) var schools: [SportsTeam] = []
 
     private struct Saved: Codable {
         var games: [SportsGame] = []
@@ -112,6 +165,11 @@ final class SportsData: ObservableObject {
         var requestCount: Int?
         /// App build the failure count belongs to (reset on update).
         var failureBuild: String?
+        var rosters: [String: [SportsTeam]]?
+        var schools: [SportsTeam]?
+        var schoolsFetchedAt: Date?
+        /// The leagues the saved schedule was fetched for.
+        var leagueSet: [String]?
     }
 
     private static var appBuild: String {
@@ -205,10 +263,12 @@ final class SportsData: ObservableObject {
         if changed { save() }
     }
 
-    private func start(force: Bool) {
+    /// - Parameter only: leagues to fetch (nil = all active; [] = none,
+    ///   just the school list).
+    private func start(force: Bool, only: Set<String>? = nil) {
         refreshing = true
         task = Task { [weak self] in
-            await self?.fetch(force: force)
+            await self?.fetch(force: force, only: only)
             self?.task = nil
             self?.refreshing = false
         }
@@ -217,51 +277,106 @@ final class SportsData: ObservableObject {
     private func publish() {
         if Self.isEnabled {
             let cutoff = Date().addingTimeInterval(-12 * 3600)
-            games = saved.games.filter { $0.start > cutoff }.sorted { $0.start < $1.start }
+            let active = Set(Self.activeLeagues.map(\.short))
+            games = saved.games.filter { $0.start > cutoff && active.contains($0.leagueShort) }.sorted { $0.start < $1.start }
             updatedAt = saved.fetchedAt
+            rosters = saved.rosters ?? [:]
+            schools = Self.activeLeagues.contains(where: \.college) ? (saved.schools ?? []) : []
         } else {
             games = []
+            schools = []
         }
         revision &+= 1
+    }
+
+    /// My Sports changed: show the saved games for the new picks right away,
+    /// and look up any newly picked league.
+    func leaguesChanged() {
+        loadCached()
+        Task { [weak self] in
+            await self?.loading?.value
+            guard let self else { return }
+            self.publish()
+            let fetched = Set(self.saved.leagueSet ?? [])
+            let missing = Self.activeLeagues.contains { !fetched.contains($0.short) }
+            let needsSchools = Self.activeLeagues.contains(where: \.college) && (self.saved.schools ?? []).isEmpty
+            if Self.isEnabled, self.task == nil, missing || needsSchools { self.start(force: false, only: missing ? nil : []) }
+        }
     }
 
     private func save() {
         if let data = try? JSONEncoder().encode(saved) { try? data.write(to: file, options: .atomic) }
     }
 
-    private func fetch(force: Bool) async {
+    private func fetch(force: Bool, only: Set<String>? = nil) async {
         let now = Date()
         networkTrouble = false
         let calendar = Calendar.current
-        // Date ranges stopped working (HTTP 400) in Sept 2026; a whole month
-        // still does. The week ahead is one month, or two near month's end.
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = "yyyyMM"
         let from = calendar.date(byAdding: .day, value: -1, to: now) ?? now
         let to = calendar.date(byAdding: .day, value: 8, to: now) ?? now
-        var months = [formatter.string(from: from)]
-        if formatter.string(from: to) != months[0] { months.append(formatter.string(from: to)) }
+        // Date ranges stopped working (HTTP 400) in Sept 2026; a whole month,
+        // a week number or a single day still do.
+        let monthFormat = DateFormatter()
+        monthFormat.locale = Locale(identifier: "en_US_POSIX")
+        monthFormat.dateFormat = "yyyyMM"
+        var months = [monthFormat.string(from: from)]
+        if monthFormat.string(from: to) != months[0] { months.append(monthFormat.string(from: to)) }
+        let dayFormat = DateFormatter()
+        dayFormat.locale = Locale(identifier: "en_US_POSIX")
+        dayFormat.dateFormat = "yyyyMMdd"
+
+        let active = Self.activeLeagues
+        let configured = MySports.current.configured
         var byLeague = Dictionary(grouping: saved.games, by: \.leagueShort)
+        var rosters = saved.rosters ?? [:]
         var fetchedAny = false
         var requests = 0
-        for league in Self.leagues {
-            if !force, skip(league.short, now: now) { continue }
+        for league in active {
+            if let only, !only.contains(league.short) { continue }
+            // Before setup, leagues you can't watch are checked weekly.
+            if !force, !configured, skip(league.short, now: now) { continue }
             if requests > 0 { try? await Task.sleep(nanoseconds: 700_000_000) }
             requests += 1
+            var queries: [String]
+            switch league.mode {
+            case .month: queries = months.map { "dates=\($0)" }
+            case .days(let count): queries = (0..<count).map { "dates=" + dayFormat.string(from: calendar.date(byAdding: .day, value: $0, to: now) ?? now) }
+            case .week: queries = [""]
+            }
             var list: [SportsGame] = []
+            var roster: [String: SportsTeam] = [:]
             var ok = false
-            for (index, month) in months.enumerated() {
+            var index = 0
+            while index < queries.count {
                 if index > 0 { try? await Task.sleep(nanoseconds: 700_000_000) }
-                if let part = await fetchLeague(league, month: month, from: from, to: to) {
-                    list += part
+                if let part = await fetchLeague(league, query: queries[index], from: from, to: to) {
+                    list += part.games
+                    for team in part.teams { roster[team.id] = team }
                     ok = true
+                    // This week's response says which week it is: ask for next week too.
+                    if case .week = league.mode, index == 0, let week = part.week {
+                        queries.append("week=\(week + 1)&seasontype=\(part.seasonType ?? 2)")
+                    }
                 }
+                index += 1
             }
             guard ok else { continue }
-            byLeague[league.short] = list
+            var seen = Set<String>()
+            byLeague[league.short] = list.filter { seen.insert($0.id).inserted }
+            if !roster.isEmpty {
+                rosters[league.short] = roster.values.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+            }
             saved.leagueFetched[league.short] = now
             fetchedAny = true
+        }
+        // School logos for college events, once a month.
+        if active.contains(where: \.college),
+           saved.schoolsFetchedAt.map({ now.timeIntervalSince($0) > 30 * 86_400 }) ?? true || (saved.schools ?? []).isEmpty {
+            if requests > 0 { try? await Task.sleep(nanoseconds: 700_000_000) }
+            if let list = await fetchSchools() {
+                saved.schools = list
+                saved.schoolsFetchedAt = now
+            }
         }
         CrashRecorder.note("schedule: \(requests) leagues, ok=\(fetchedAny), \(saved.requestCount ?? 0) requests today")
         guard fetchedAny || requests == 0 else {
@@ -277,9 +392,29 @@ final class SportsData: ObservableObject {
         saved.failures = 0
         let cutoff = now.addingTimeInterval(-2 * 86_400)
         saved.games = byLeague.values.flatMap { $0 }.filter { $0.start > cutoff }
-        saved.fetchedAt = now
+        saved.rosters = rosters
+        saved.leagueSet = Array(Set((saved.leagueSet ?? []) + active.map(\.short)))
+        if only == nil { saved.fetchedAt = now }
         save()
         publish()
+    }
+
+    /// Division I schools (about 360) with their logos.
+    private func fetchSchools() async -> [SportsTeam]? {
+        guard let result = await get("https://site.api.espn.com/apis/site/v2/sports/basketball/mens-college-basketball/teams?limit=1000"),
+              result.status == 200 else { return nil }
+        let data = result.data
+        let list = await Task.detached(priority: .utility) { () -> [SportsTeam]? in
+            autoreleasepool {
+                guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let sports = object["sports"] as? [[String: Any]],
+                      let leagues = sports.first?["leagues"] as? [[String: Any]],
+                      let teams = leagues.first?["teams"] as? [[String: Any]] else { return nil }
+                return teams.compactMap { SportsParse.team($0["team"] as? [String: Any]) }
+            }
+        }.value
+        CrashRecorder.note("schedule: schools \(data.count / 1024) KB, \(list.map { String($0.count) } ?? "unreadable")")
+        return list
     }
 
     /// A league none of your channels showed in the last week is looked at
@@ -315,8 +450,17 @@ final class SportsData: ObservableObject {
         }
     }
 
-    private func fetchLeague(_ league: League, month: String, from: Date, to: Date) async -> [SportsGame]? {
-        let base = "https://site.api.espn.com/apis/site/v2/sports/\(league.path)/scoreboard?dates=\(month)\(league.extra)"
+    private struct LeagueResult {
+        var games: [SportsGame]
+        var teams: [SportsTeam]
+        var week: Int?
+        var seasonType: Int?
+        var total = 0
+    }
+
+    private func fetchLeague(_ league: League, query: String, from: Date, to: Date) async -> LeagueResult? {
+        var base = "https://site.api.espn.com/apis/site/v2/sports/\(league.path)/scoreboard?"
+        base += [query, String(league.extra.dropFirst())].filter { !$0.isEmpty }.joined(separator: "&")
         // Remember which form works, so a league is asked once, not twice.
         let plainForm = saved.leagueForm?[league.short] == "plain"
         guard var result = await get(plainForm ? base : base + "&limit=1000") else { return nil }
@@ -332,28 +476,27 @@ final class SportsData: ObservableObject {
             }
         }
         guard result.status == 200 else {
-            CrashRecorder.note("schedule \(league.short) \(month): HTTP \(result.status)")
+            CrashRecorder.note("schedule \(league.short) \(query): HTTP \(result.status)")
             return nil
         }
         let data = result.data
-        // Parsed off the main thread (a week of college football is a few MB).
-        let parsed = await Task.detached(priority: .utility) { () -> (games: [SportsGame], total: Int)? in
+        let parsed = await Task.detached(priority: .utility) { () -> LeagueResult? in
             // Only the fields used are decoded; the full object tree is the
             // fallback if that ever fails. Only the week ahead is kept.
-            let list = SportsParse.decode(data, league: league) ?? autoreleasepool { () -> [SportsGame]? in
-                guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                      let events = object["events"] as? [[String: Any]] else { return nil }
-                return events.compactMap { SportsParse.game($0, league: league) }
-            }
-            guard let list else { return nil }
-            return (list.filter { $0.start >= from && $0.start <= to }, list.count)
+            guard let doc = SportsParse.decodeDocument(data, league: league) ?? autoreleasepool(invoking: {
+                SportsParse.serializedDocument(data, league: league)
+            }) else { return nil }
+            var teams: [String: SportsTeam] = [:]
+            for game in doc.games { teams[game.home.id] = game.home; teams[game.away.id] = game.away }
+            return LeagueResult(games: doc.games.filter { $0.start >= from && $0.start <= to }, teams: Array(teams.values),
+                                week: doc.week, seasonType: doc.seasonType, total: doc.games.count)
         }.value
-        if parsed?.total == 100 {
-            CrashRecorder.note("schedule \(league.short) \(month): exactly 100 games, may be cut off")
+        if let parsed, parsed.total == 100 {
+            CrashRecorder.note("schedule \(league.short) \(query): exactly 100 games, may be cut off")
         }
-        let games = parsed?.games
-        CrashRecorder.note("schedule \(league.short) \(month): \(data.count / 1024) KB, \(parsed.map { "\($0.total) in month, \($0.games.count) this week" } ?? "unreadable")")
-        return games
+        CrashRecorder.note("schedule \(league.short) \(query.isEmpty ? "this week" : query): \(data.count / 1024) KB, "
+                           + "\(parsed.map { "\($0.teams.count) teams, \($0.games.count) this week" } ?? "unreadable")")
+        return parsed
     }
 }
 
@@ -386,7 +529,7 @@ private enum SportsParse {
         )
     }
 
-    private static func team(_ item: [String: Any]?) -> SportsTeam? {
+    static func team(_ item: [String: Any]?) -> SportsTeam? {
         guard let item, let id = text(item["id"]), let name = text(item["displayName"]) ?? text(item["name"]) else { return nil }
         var alternates: [String] = []
         for key in ["shortDisplayName", "name"] {
@@ -484,7 +627,12 @@ private struct LenientBool: Decodable {
     init(from decoder: Decoder) { value = try? decoder.singleValueContainer().decode(Bool.self) }
 }
 
-private struct ScoreboardDoc: Decodable { let events: Lenient<[Lenient<ScoreboardEvent>]>? }
+private struct ScoreboardDoc: Decodable {
+    let events: Lenient<[Lenient<ScoreboardEvent>]>?
+    let week: Lenient<ScoreboardWeek>?
+    let season: Lenient<ScoreboardSeason>?
+}
+private struct ScoreboardSeason: Decodable { let type: LenientText? }
 private struct ScoreboardEvent: Decodable {
     let id: LenientText?
     let date: LenientText?
@@ -537,11 +685,28 @@ private struct ScoreboardStatusType: Decodable {
 }
 
 extension SportsParse {
+    struct Document {
+        var games: [SportsGame]
+        var week: Int?
+        var seasonType: Int?
+    }
+
     /// Games from a scoreboard document, decoding only what's used.
-    static func decode(_ data: Data, league: SportsData.League) -> [SportsGame]? {
+    static func decodeDocument(_ data: Data, league: SportsData.League) -> Document? {
         guard let doc = try? JSONDecoder().decode(ScoreboardDoc.self, from: data),
               let events = doc.events?.value else { return nil }
-        return events.compactMap { $0.value.flatMap { game($0, league: league) } }
+        return Document(games: events.compactMap { $0.value.flatMap { game($0, league: league) } },
+                        week: doc.week?.value?.number?.value.flatMap { Int($0) },
+                        seasonType: doc.season?.value?.type?.value.flatMap { Int($0) })
+    }
+
+    /// The same from the full object tree (fallback).
+    static func serializedDocument(_ data: Data, league: SportsData.League) -> Document? {
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let events = object["events"] as? [[String: Any]] else { return nil }
+        let week = (object["week"] as? [String: Any]).flatMap { text($0["number"]) }.flatMap { Int($0) }
+        let season = (object["season"] as? [String: Any]).flatMap { text($0["type"]) }.flatMap { Int($0) }
+        return Document(games: events.compactMap { game($0, league: league) }, week: week, seasonType: season)
     }
 
     private static func game(_ event: ScoreboardEvent, league: SportsData.League) -> SportsGame? {

@@ -16,6 +16,7 @@ enum LiveTabsSetting {
 /// one level. Edit My Lineup, setup and the exports keep their full screens.
 struct LiveTVOptionsPanel: View {
     let onSetup: () -> Void
+    var onSports: () -> Void = {}
     let onClose: () -> Void
 
     private enum Page { case main, countries }
@@ -35,6 +36,15 @@ struct LiveTVOptionsPanel: View {
     @State private var showSources = false
     @State private var showReport = false
     @State private var showLog = false
+
+    @ObservedObject private var mySports = MySports.shared
+
+    private var mySportsSummary: String {
+        let prefs = mySports.prefs
+        guard prefs.configured else { return L10n.string("my_sports_not_set", fallback: "Set up") }
+        let names = prefs.leagues.prefix(4).joined(separator: ", ")
+        return prefs.leagues.count > 4 ? names + " +\(prefs.leagues.count - 4)" : (names.isEmpty ? L10n.string("my_sports_none", fallback: "None") : names)
+    }
 
     private var updatedText: String {
         if schedule.refreshing { return L10n.string("live_schedule_updating", fallback: "Updating…") }
@@ -113,6 +123,11 @@ struct LiveTVOptionsPanel: View {
         }
 
         section(L10n.string("live_events_title", fallback: "Live Events"))
+        LivePanelRow(title: L10n.string("my_sports_title", fallback: "My Sports"),
+                     detail: L10n.string("my_sports_row_detail", fallback: "Leagues and favorite teams"),
+                     accessory: .chevron(mySportsSummary)) {
+            onSports()
+        }
         LivePanelRow(title: L10n.string("live_game_schedule", fallback: "Game schedule"),
                      detail: L10n.string("live_game_schedule_detail", fallback: "Schedule, logos and TV networks"),
                      accessory: .toggle(gameSchedule)) {

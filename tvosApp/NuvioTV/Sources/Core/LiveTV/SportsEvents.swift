@@ -27,9 +27,11 @@ struct SportsEvent: Identifiable, Hashable, Codable {
     var family: String?
     /// The end of the guide listing showing it, when later than usual.
     var listingEnd: Date?
+    /// For an event with no game: the two schools named in it (logos only).
+    var teams: [SportsTeam]?
 
     static func == (lhs: SportsEvent, rhs: SportsEvent) -> Bool {
-        lhs.id == rhs.id && lhs.sources == rhs.sources && lhs.game == rhs.game && lhs.listingEnd == rhs.listingEnd
+        lhs.id == rhs.id && lhs.sources == rhs.sources && lhs.game == rhs.game && lhs.listingEnd == rhs.listingEnd && lhs.teams == rhs.teams
     }
     func hash(into hasher: inout Hasher) { hasher.combine(id) }
 
@@ -39,6 +41,7 @@ struct SportsEvent: Identifiable, Hashable, Codable {
         var copy = SportsEvent(id: newID, title: title, league: league, leagueShort: leagueShort, start: start,
                                game: game, sources: sources, family: family)
         copy.listingEnd = listingEnd
+        copy.teams = teams
         return copy
     }
 
@@ -118,13 +121,14 @@ enum SportsMatcher {
         var listings = 0
         var matchedListings = 0
         var games = 0
+        var schoolPairs = 0
         var milliseconds: [String: Int] = [:]
         var aborted: String?
 
         var summary: String {
             let steps = milliseconds.sorted { $0.key < $1.key }.map { "\($0.key) \($0.value)" }.joined(separator: ", ")
             return "games \(games), events \(events) → \(filtered) game-like, \(matchedEvents) matched, "
-                + "listings \(listings) → \(matchedListings) matched; ms: \(steps)" + (aborted.map { "; ABORTED: \($0)" } ?? "")
+                + "listings \(listings) → \(matchedListings) matched, school pairs \(schoolPairs); ms: \(steps)" + (aborted.map { "; ABORTED: \($0)" } ?? "")
         }
     }
 
@@ -137,6 +141,7 @@ enum SportsMatcher {
     ///     reason stops the build and returns nil.
     static func build(games: [SportsGame], channelSources: [String: [EventSource]], events: [ProviderEvent],
                       listings: [GuideListing], preferSpanish: Bool, now: Date, previousIDs: [String: String],
+                      schools: [SportsTeam] = [],
                       shouldStop: () -> String?) -> (events: [SportsEvent], stats: Stats)? {
         var stats = Stats()
         stats.events = events.count
@@ -183,6 +188,8 @@ enum SportsMatcher {
                 guard !games.isEmpty else { unmatched.append(event); return }
                 let candidates = index.matches(event.title, allowed: { game in
                     compatible(event.league, games[game])
+                }, allowLoose: { game in
+                    sameLeague(event.league, games[game])
                 })
                 // An event of unknown league matching games of more than one
                 // league (Panthers, Rangers, Kings…) is too ambiguous.
@@ -271,10 +278,24 @@ enum SportsMatcher {
                 if let key { byPair[key, default: []].append(loose.count - 1) }
             }
         }
+        // School logos for college events in any sport (volleyball, field
+        // hockey…) that no game matched.
+        var others = loose + plain.map({ plainEvent($0) })
+        if !schools.isEmpty {
+            let schoolIndex = TeamIndex(teams: schools)
+            let pro: Set<String> = ["NFL", "NBA", "WNBA", "MLB", "NHL", "MLS"]
+            for position in others.indices where !pro.contains(others[position].league) {
+                autoreleasepool {
+                    guard looksLikeGame(others[position].title), let pair = schoolIndex.pair(others[position].title) else { return }
+                    others[position].teams = [pair.0, pair.1]
+                    stats.schoolPairs += 1
+                }
+            }
+        }
         var used = Set<String>()
         var result: [SportsEvent] = []
-        result.reserveCapacity(games.count + loose.count + plain.count)
-        for event in loose + plain.map({ plainEvent($0) }) where used.insert(event.id).inserted {
+        result.reserveCapacity(games.count + others.count)
+        for event in others where used.insert(event.id).inserted {
             result.append(event)
         }
 
@@ -347,36 +368,60 @@ enum SportsMatcher {
         return false
     }
 
-    /// Team names of a set of games, looked up by their first word.
+    /// Team names, looked up by their first word. Built from games (two
+    /// sides each) or from a plain list of teams (school logos).
     struct TeamIndex {
         struct Name {
-            let game: Int
+            /// The game index (or team index for a plain list).
+            let slot: Int
             let side: Int          // 0 home, 1 away
             let team: String       // team id, to keep one team's names apart from another's
             let words: [String]
             /// The abbreviation as written ("LAR"), for names that are one.
             let abbreviation: String?
+            /// A city name ("Atlanta"): only counts when the league is known.
+            let loose: Bool
         }
 
         private var byFirstWord: [String: [Name]] = [:]
+        private(set) var teams: [SportsTeam] = []
 
         init(games: [SportsGame]) {
             for (gameIndex, game) in games.enumerated() {
                 for (side, team) in [game.home, game.away].enumerated() {
-                    let college = game.league == "College Football"
-                    var seen = Set<String>()
-                    for variant in SportsMatcher.teamVariants(team, college: college) {
-                        let words = variant.split(separator: " ").map(String.init)
-                        guard let first = words.first, seen.insert(variant).inserted else { continue }
-                        byFirstWord[first, default: []].append(Name(game: gameIndex, side: side, team: team.id, words: words, abbreviation: nil))
-                    }
-                    if let short = team.short?.trimmingCharacters(in: .whitespaces), short.count >= 2, short.count <= 5 {
-                        let word = short.lowercased()
-                        if seen.insert(word).inserted {
-                            byFirstWord[word, default: []].append(Name(game: gameIndex, side: side, team: team.id, words: [word],
-                                                                       abbreviation: short.uppercased()))
-                        }
-                    }
+                    add(team, slot: gameIndex, side: side, college: game.league == "College Football" || game.league == "College Basketball")
+                }
+            }
+        }
+
+        /// A plain list (school logos): full names and places only.
+        init(teams list: [SportsTeam]) {
+            teams = list
+            for (index, team) in list.enumerated() {
+                add(team, slot: index, side: 0, college: true, abbreviations: false)
+            }
+        }
+
+        private mutating func add(_ team: SportsTeam, slot: Int, side: Int, college: Bool, abbreviations: Bool = true) {
+            var seen = Set<String>()
+            for variant in SportsMatcher.teamVariants(team, college: college) {
+                let words = variant.split(separator: " ").map(String.init)
+                guard let first = words.first, seen.insert(variant).inserted else { continue }
+                byFirstWord[first, default: []].append(Name(slot: slot, side: side, team: team.id, words: words, abbreviation: nil, loose: false))
+            }
+            // Pro teams' city ("Atlanta vs. Chicago"), only when the league is known.
+            if !college, let location = team.location {
+                let variant = SportsMatcher.normalized(location).trimmingCharacters(in: .whitespaces)
+                let words = variant.split(separator: " ").map(String.init)
+                if let first = words.first, variant.count >= 4, seen.insert(variant).inserted {
+                    byFirstWord[first, default: []].append(Name(slot: slot, side: side, team: team.id, words: words, abbreviation: nil, loose: true))
+                }
+            }
+            if abbreviations, let short = team.short?.trimmingCharacters(in: .whitespaces), short.count >= 2, short.count <= 5 {
+                let word = short.lowercased()
+                if seen.insert(word).inserted {
+                    byFirstWord[word, default: []].append(Name(slot: slot, side: side, team: team.id, words: [word],
+                                                               abbreviation: short.uppercased(), loose: false))
                 }
             }
         }
@@ -388,10 +433,9 @@ enum SportsMatcher {
             var length: Int { end - start }
         }
 
-        /// Games whose two teams both appear in `title`, on separate words.
-        func matches(_ title: String, allowed: (Int) -> Bool) -> [Int] {
+        private func hits(_ title: String, allowed: (Int) -> Bool, allowLoose: (Int) -> Bool) -> (hits: [Hit], written: Set<String>) {
             let words = SportsMatcher.normalized(title).split(separator: " ").map(String.init)
-            guard words.count >= 2 else { return [] }
+            guard words.count >= 2 else { return ([], []) }
             // Words as written, for "abbreviations count only in capitals".
             // In an all-capitals title every word looks like an abbreviation,
             // so none counts on its own there.
@@ -400,13 +444,12 @@ enum SportsMatcher {
             var hits: [Hit] = []
             for position in words.indices {
                 guard let names = byFirstWord[words[position]] else { continue }
-                for name in names where allowed(name.game) {
+                for name in names where allowed(name.slot) && (!name.loose || allowLoose(name.slot)) {
                     let end = position + name.words.count
                     guard end <= words.count, Array(words[position..<end]) == name.words else { continue }
                     hits.append(Hit(name: name, start: position, end: end))
                 }
             }
-            guard hits.count >= 2 else { return [] }
             // The longest name wins its words: "michigan state" keeps
             // "michigan" (another team) from counting.
             let kept = hits.filter { hit in
@@ -414,15 +457,26 @@ enum SportsMatcher {
                     other.name.team != hit.name.team && other.length > hit.length && other.start <= hit.start && other.end >= hit.end
                 }
             }
+            return (kept, written)
+        }
+
+        /// Games whose two teams both appear in `title`, on separate words.
+        /// `allowLoose`: the event's league is the game's, so city names and
+        /// two-letter abbreviations ("NJ") count too.
+        func matches(_ title: String, allowed: (Int) -> Bool, allowLoose: (Int) -> Bool = { _ in false }) -> [Int] {
+            let (kept, written) = hits(title, allowed: allowed, allowLoose: allowLoose)
+            guard kept.count >= 2 else { return [] }
             var byGame: [Int: [Hit]] = [:]
-            for hit in kept { byGame[hit.name.game, default: []].append(hit) }
+            for hit in kept { byGame[hit.name.slot, default: []].append(hit) }
             var result: [Int] = []
             for (game, list) in byGame {
                 let home = list.filter { $0.name.side == 0 }
                 let away = list.filter { $0.name.side == 1 }
+                let loose = allowLoose(game)
                 func strong(_ hit: Hit) -> Bool {
                     guard let abbreviation = hit.name.abbreviation else { return true }
-                    return abbreviation.count >= 3 && written.contains(abbreviation)
+                    guard written.contains(abbreviation) else { return false }
+                    return abbreviation.count >= 3 || loose
                 }
                 func full(_ hit: Hit) -> Bool { hit.name.abbreviation == nil }
                 var found = false
@@ -438,6 +492,18 @@ enum SportsMatcher {
                 if found { result.append(game) }
             }
             return result.sorted()
+        }
+
+        /// Two different teams of a plain list named in `title` (left side
+        /// first), each by a full name or place of 4+ letters.
+        func pair(_ title: String) -> (SportsTeam, SportsTeam)? {
+            let (kept, _) = hits(title, allowed: { _ in true }, allowLoose: { _ in false })
+            let strong = kept.filter { $0.name.words.joined(separator: " ").count >= 4 }.sorted { $0.start < $1.start }
+            // Exactly two schools, on separate words; more is ambiguous.
+            guard Set(strong.map(\.name.team)).count == 2, let first = strong.first,
+                  let second = strong.first(where: { $0.name.team != first.name.team && $0.start >= first.end }),
+                  first.name.slot < teams.count, second.name.slot < teams.count else { return nil }
+            return (teams[first.name.slot], teams[second.name.slot])
         }
     }
 
@@ -489,6 +555,14 @@ enum SportsMatcher {
             .filter { $0.count >= 3 && !genericWords.contains($0) && seen.insert($0).inserted }
     }
 
+    /// The event's league is known and is the game's (soccer and MLS as one).
+    private static func sameLeague(_ league: String, _ game: SportsGame) -> Bool {
+        if league.isEmpty || league == "Other" { return false }
+        if league == game.league { return true }
+        let soccer: Set<String> = ["Soccer", "MLS"]
+        return soccer.contains(league) && soccer.contains(game.league)
+    }
+
     private static func compatible(_ league: String, _ game: SportsGame) -> Bool {
         if league.isEmpty || league == "Other" || league == game.league { return true }
         let soccer: Set<String> = ["Soccer", "MLS"]
@@ -525,6 +599,10 @@ enum SportsMatcher {
         case "College Basketball": return "NCAAB"
         case "Motorsport": return "MOTOR"
         case "Fighting": return "FIGHT"
+        case "Field Hockey": return "FIELD H."
+        case "Volleyball": return "VOLLEY"
+        case "Lacrosse": return "LAX"
+        case "Wrestling": return "WREST."
         case "": return "EVENT"
         default: return league.uppercased()
         }

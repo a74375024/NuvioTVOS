@@ -1009,7 +1009,28 @@ enum ChannelCatalog {
     }
 
     static func leagueFor(family: String, group: String, title: String) -> String {
+        let titleText = title.lowercased()
         let text = "\(family) \(group) \(title)".lowercased()
+        // 1. A sport named at the start of the title ("Football: …",
+        // "volleyball:  …") says more than the channel's group.
+        if let range = RX.range("^\\s*[a-z][a-z ]{1,20}(?=:)", in: titleText) {
+            let sport = titleText[range].trimmingCharacters(in: .whitespaces)
+            switch sport {
+            case "football": return text.contains("nfl") ? "NFL" : "College Football"
+            case "basketball": return text.contains("wnba") ? "WNBA" : (text.contains("nba") ? "NBA" : "College Basketball")
+            case "hockey", "ice hockey": return text.contains("nhl") ? "NHL" : "Hockey"
+            case "field hockey": return "Field Hockey"
+            case "volleyball", "beach volleyball": return "Volleyball"
+            case "soccer", "fc", "football soccer": return "Soccer"
+            case "baseball": return text.contains("mlb") ? "MLB" : "Baseball"
+            case "softball": return "Softball"
+            case "lacrosse": return "Lacrosse"
+            case "wrestling": return "Wrestling"
+            default: break
+            }
+        }
+        // 2. Words anywhere. A "PPV" group says nothing about the sport, so
+        // it no longer makes everything in it "Fighting".
         let rules: [(String, [String])] = [
             ("NFL", ["nfl", "football: good morning football"]),
             ("College Football", ["ncaaf", "college football", "fbs", "fcs"]),
@@ -1017,12 +1038,15 @@ enum ChannelCatalog {
             ("NBA", ["nba", "basketball: nba"]),
             ("College Basketball", ["ncaab", "college basketball", "men's basketball", "women's basketball"]),
             ("MiLB", ["milb"]),
-            ("MLB", ["mlb", "baseball"]),
-            ("NHL", ["nhl", "hockey"]),
+            ("MLB", ["mlb"]),
+            ("Field Hockey", ["field hockey"]),
+            ("NHL", ["nhl"]),
+            ("Hockey", ["hockey"]),
+            ("Baseball", ["baseball"]),
             ("MLS", ["mls"]),
-            ("Soccer", ["uefa", "premier league", "champions league", "la liga", "laliga", "serie a", "bundesliga", "ligue1", "ligue 1", "football event", "soccer", "fc ", " united", "liga", "eredivisie", "a-league", "concacaf"]),
+            ("Soccer", ["uefa", "premier league", "champions league", "la liga", "laliga", "serie a", "bundesliga", "ligue1", "ligue 1", "football event", "soccer", "fc ", " united", "liga", "eredivisie", "a-league", "concacaf", "nwsl"]),
             ("Motorsport", ["f1", "formula", "nascar", "indycar", "motogp", "rally", "wrc", "supercross", "motocross"]),
-            ("Fighting", ["ufc", "boxing", "mma", "fight night", "pfl", "one fight", "wwe", "aew", "bellator", "ppv"]),
+            ("Fighting", ["ufc", "boxing", "mma", "fight night", "pfl", "one fight", "wwe", "aew", "bellator"]),
             ("Tennis", ["wta", "atp", "tennis"]),
             ("Golf", ["pga", "lpga", "golf", "liv "]),
             ("Darts", ["pdc", "darts"]),
