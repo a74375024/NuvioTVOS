@@ -345,8 +345,11 @@ final class XMLTVReader: NSObject, XMLParserDelegate {
         case "sub-title":
             if programmeChannel != nil { subtitle = clean(text) }
         case "desc":
-            // Descriptions only for what's on soon: they're most of the size.
-            if programmeChannel != nil, programmeStart < window.low + 180 + 8 * 60, let value = clean(text) {
+            // Read here; kept at the end of the programme only for what's on
+            // soon or for sports (whose description names the venue, how
+            // Live Events finds which game a station has). Descriptions are
+            // most of the size.
+            if programmeChannel != nil, let value = clean(text) {
                 desc = value.count > 200 ? String(value.prefix(199)) + "…" : value
             }
         case "category":
@@ -356,9 +359,10 @@ final class XMLTVReader: NSObject, XMLParserDelegate {
                 let joined = categories.joined(separator: " ")
                 var f = flags | ProgramGenre.flags(categories: joined)
                 if f & ProgramGenre.genreBits == 0 { f |= ProgramGenre.flags(title: title, episode: subtitle) }
+                let keepDesc = programmeStart < window.low + 180 + 8 * 60 || f & ProgramGenre.sports != 0
                 found[id, default: []].append(OutsideGuide.RawProgram(
                     s: programmeStart, m: max(1, programmeEnd - programmeStart),
-                    t: title, st: subtitle, d: desc, f: f
+                    t: title, st: subtitle, d: keepDesc ? desc : nil, f: f
                 ))
             }
             programmeChannel = nil

@@ -355,7 +355,8 @@ enum ChannelCatalog {
                         id: "ev|\(key)", title: title, league: eventLeague, start: start,
                         feeds: [channel.id], family: family, market: market
                     )
-                    if parsed.guessed { event.startGuessed = true }
+                    // Always set when there's a time (nil means "saved by an older build").
+                    if start != nil { event.startGuessed = parsed.guessed }
                     eventsByKey[key] = event
                 }
             }

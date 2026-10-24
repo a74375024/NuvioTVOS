@@ -1022,6 +1022,15 @@ struct LiveEventWherePanel: View {
                     let spanish = event.sources.filter { $0.spanish }
                     let feeds = event.feeds.filter { !$0.spanish }
                     if !english.isEmpty { section(L10n.string("live_event_your_channels", fallback: "Your channels"), english) }
+                    if let more = event.moreStations, more > 0 {
+                        Text(more == 1
+                             ? L10n.string("live_event_one_more_station", fallback: "1 more station in your channels is showing it")
+                             : L10n.format("live_event_more_stations", fallback: "%d more stations in your channels are showing it", more))
+                            .font(.system(size: 20))
+                            .foregroundColor(.white.opacity(0.55))
+                            .padding(.leading, 4)
+                            .padding(.top, 4)
+                    }
                     if !spanish.isEmpty { section(L10n.string("live_event_spanish", fallback: "Spanish"), spanish) }
                     if !feeds.isEmpty { section(L10n.string("live_event_provider_section", fallback: "Event feeds from your provider"), feeds) }
                     Text(L10n.string("live_event_where_hint", fallback: "Whichever you pick, the others stay as automatic backups."))

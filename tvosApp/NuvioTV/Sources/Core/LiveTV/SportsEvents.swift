@@ -11,6 +11,9 @@ struct EventSource: Hashable, Codable {
     let spanish: Bool
     /// "In your guide at 6:15", "Provider event channel".
     let detail: String
+    /// For a station: 0 My Lineup, 1 your home market, 2 your other
+    /// markets, 3 anywhere else. Orders the list; nil = not ranked.
+    var rank: Int? = nil
 }
 
 /// One game or event for Live Events: a TheSportsDB game with everything
@@ -34,10 +37,12 @@ struct SportsEvent: Identifiable, Hashable, Codable {
     /// When every provider feed that carried it moved on to something else
     /// (the provider's sign it's over).
     var feedsEndedAt: Date? = nil
+    /// Stations also showing it that aren't listed (the list keeps the best few).
+    var moreStations: Int? = nil
 
     static func == (lhs: SportsEvent, rhs: SportsEvent) -> Bool {
         lhs.id == rhs.id && lhs.sources == rhs.sources && lhs.game == rhs.game && lhs.listingEnd == rhs.listingEnd
-            && lhs.teams == rhs.teams && lhs.feedsEndedAt == rhs.feedsEndedAt
+            && lhs.teams == rhs.teams && lhs.feedsEndedAt == rhs.feedsEndedAt && lhs.moreStations == rhs.moreStations
     }
     func hash(into hasher: inout Hasher) { hasher.combine(id) }
 
@@ -49,6 +54,7 @@ struct SportsEvent: Identifiable, Hashable, Codable {
         copy.listingEnd = listingEnd
         copy.teams = teams
         copy.feedsEndedAt = feedsEndedAt
+        copy.moreStations = moreStations
         return copy
     }
 
@@ -59,6 +65,7 @@ struct SportsEvent: Identifiable, Hashable, Codable {
         copy.listingEnd = listingEnd
         copy.teams = teams
         copy.feedsEndedAt = feedsEndedAt
+        copy.moreStations = moreStations
         return copy
     }
 
@@ -121,8 +128,29 @@ enum SportsMatcher {
         let start: Date
         let end: Date
         /// For a plain sports title ("NBA Basketball"): the start of its
-        /// description, which often names the teams.
+        /// description, when it may name the teams.
         var detail: String? = nil
+        /// Where it's played, from the description ("From Chase Center in
+        /// San Francisco"), normalized: identifies the game for titles that
+        /// never name the teams.
+        var venue: String? = nil
+        var city: String? = nil
+        /// 0 My Lineup, 1 your home market, 2 your other markets, 3 elsewhere.
+        var rank: Int? = nil
+    }
+
+    /// The venue and city in a guide description: "From War Memorial Stadium
+    /// in Laramie, Wyo." → ("war memorial stadium", "laramie").
+    static func venueOf(_ description: String) -> (venue: String, city: String)? {
+        guard let regex = RX.get("^\\s*(?:live\\s+)?(?:from|at)\\s+(?:the\\s+)?(.+?)\\s+in\\s+([A-Z][^,.;]+?)(?:,\\s*[A-Z][A-Za-z.]*\\.?)?(?:[.;]|$)",
+                                  caseInsensitive: true),
+              let match = regex.firstMatch(in: description, range: NSRange(description.startIndex..<description.endIndex, in: description)),
+              let venueRange = Range(match.range(at: 1), in: description),
+              let cityRange = Range(match.range(at: 2), in: description) else { return nil }
+        let venue = normalized(String(description[venueRange])).trimmingCharacters(in: .whitespaces)
+        let city = normalized(String(description[cityRange])).trimmingCharacters(in: .whitespaces)
+        guard venue.count >= 4, !city.isEmpty else { return nil }
+        return (venue, city)
     }
 
     /// "NBA Basketball", "Live: College Football": a sport with no teams.
@@ -170,6 +198,9 @@ enum SportsMatcher {
         /// Two teams of a complete league with no game between them.
         var stale = 0
         var guessedMatched = 0
+        var venueListings = 0
+        var describedListings = 0
+        var trimmedStations = 0
         var offsets: [String] = []
         var milliseconds: [String: Int] = [:]
         var aborted: String?
@@ -178,7 +209,8 @@ enum SportsMatcher {
             let steps = milliseconds.sorted { $0.key < $1.key }.map { "\($0.key) \($0.value)" }.joined(separator: ", ")
             return "games \(games), events \(events) → \(filtered) game-like, \(matchedEvents) matched, "
                 + "\(guessedMatched) by day, \(replays) replays and \(stale) stale hidden, "
-                + "listings \(listings) → \(matchedListings) matched, school pairs \(schoolPairs), name pairs \(namePairs)"
+                + "listings \(listings) → \(matchedListings) matched (\(venueListings) by venue, \(describedListings) by description), "
+                + "\(trimmedStations) extra stations folded, school pairs \(schoolPairs), name pairs \(namePairs)"
                 + (offsets.isEmpty ? "" : ", offsets " + offsets.joined(separator: "; "))
                 + "; ms: \(steps)" + (aborted.map { "; ABORTED: \($0)" } ?? "")
         }
@@ -259,7 +291,8 @@ enum SportsMatcher {
 
         // 1b. Each event channel group's clock offset, learned from titles
         // that name a scheduled game: the same whole-hour gap on most of
-        // them means the group writes another time zone (UTC, CET…).
+        // them means the group writes another time zone (UTC, CET…). An
+        // hour early is usually the pregame show, not a time zone: ignored.
         var votes: [String: [Int: Int]] = [:]
         var voteTotals: [String: Int] = [:]
         for item in pending {
@@ -278,7 +311,7 @@ enum SportsMatcher {
         var offsets: [String: TimeInterval] = [:]
         for (family, counts) in votes {
             guard let best = counts.max(by: { $0.value != $1.value ? $0.value < $1.value : abs($0.key) > abs($1.key) }),
-                  best.key != 0, best.value >= 2, best.value * 2 > (voteTotals[family] ?? 0) else { continue }
+                  abs(best.key) >= 2, best.value >= 2, best.value * 2 > (voteTotals[family] ?? 0) else { continue }
             offsets[family] = TimeInterval(best.key) * 3600
         }
         stats.offsets = offsets.sorted { $0.key < $1.key }.prefix(8).map { "\($0.key) \($0.value > 0 ? "+" : "")\(Int($0.value / 3600))h" }
@@ -340,10 +373,24 @@ enum SportsMatcher {
         if let reason = shouldStop() { stats.aborted = reason; CrashRecorder.note("sports match: \(stats.summary)"); return nil }
 
         // 2. Guide listings → games (only the game itself, not the shows
-        // around it). Capped at 2 s.
+        // around it), up to two days ahead. Local and regional listings
+        // rarely name the teams ("Live: NBA Basketball"), but their
+        // description names the venue, which the schedule has too. Capped at 2 s.
         let relevant = Set(games.indices.filter {
-            !games[$0].completed && games[$0].start > now.addingTimeInterval(-5 * 3600) && games[$0].start < now.addingTimeInterval(16 * 3600)
+            !games[$0].completed && games[$0].start > now.addingTimeInterval(-5 * 3600) && games[$0].start < now.addingTimeInterval(48 * 3600)
         })
+        var byVenue: [String: [Int]] = [:]
+        var byCity: [String: [Int]] = [:]
+        for gameIndex in relevant {
+            guard let venue = games[gameIndex].venue else { continue }
+            // "Golden 1 Center, Sacramento": the city follows the last comma.
+            let parts = venue.components(separatedBy: ", ")
+            let name = normalized(parts.count > 1 ? parts.dropLast().joined(separator: ", ") : venue).trimmingCharacters(in: .whitespaces)
+            byVenue[name, default: []].append(gameIndex)
+            if parts.count > 1, let city = parts.last {
+                byCity[normalized(city).trimmingCharacters(in: .whitespaces), default: []].append(gameIndex)
+            }
+        }
         if !relevant.isEmpty {
             let started = Date()
             for listing in listings {
@@ -351,24 +398,48 @@ enum SportsMatcher {
                 autoreleasepool {
                     let text = normalized(listing.title)
                     guard !excluded(text) else { return }
-                    var candidates = index.matches(listing.title, allowed: { relevant.contains($0) })
-                    // A plain title: the description must name one game's two teams.
-                    if candidates.isEmpty, let detail = listing.detail {
+                    func airing(_ gameIndex: Int) -> Bool {
+                        let game = games[gameIndex]
+                        return listing.start < game.start.addingTimeInterval(2 * 3600) && listing.end > game.start.addingTimeInterval(-15 * 60)
+                    }
+                    var candidates = index.matches(listing.title, allowed: { relevant.contains($0) }).filter(airing)
+                    var how = "title"
+                    if candidates.isEmpty, listing.venue != nil || listing.detail != nil {
                         let league = ChannelCatalog.leagueFor(family: "", group: "", title: listing.title)
-                        let found = index.matches(detail, allowed: { relevant.contains($0) && compatible(league, games[$0]) })
-                        if found.count == 1 { candidates = found }
+                        if let venue = listing.venue {
+                            // The venue, at that time, in that sport; else the city
+                            // when only one such game is there.
+                            candidates = (byVenue[venue] ?? []).filter { airing($0) && compatible(league, games[$0]) }
+                            if candidates.isEmpty, let city = listing.city {
+                                let inCity = (byCity[city] ?? []).filter { airing($0) && compatible(league, games[$0]) }
+                                if inCity.count == 1 { candidates = inCity }
+                            }
+                            how = "venue"
+                        } else if let detail = listing.detail {
+                            // The description names one game's two teams.
+                            let found = index.matches(detail, allowed: { relevant.contains($0) && compatible(league, games[$0]) }).filter(airing)
+                            if found.count == 1 { candidates = found }
+                            how = "description"
+                        }
+                    }
+                    if !candidates.isEmpty {
+                        if how == "venue" { stats.venueListings += 1 } else if how == "description" { stats.describedListings += 1 }
                     }
                     for gameIndex in candidates {
-                        let game = games[gameIndex]
-                        guard listing.start < game.start.addingTimeInterval(2 * 3600),
-                              listing.end > game.start.addingTimeInterval(-15 * 60) else { continue }
                         stats.matchedListings += 1
                         var value = entry(gameIndex)
                         if value.listingEnd.map({ listing.end > $0 }) ?? true { value.listingEnd = listing.end }
                         if !value.sources.contains(where: { $0.channelID == listing.entryID }) {
+                            let rank = listing.inLineup ? 0 : (listing.rank ?? 3)
+                            let detail: String
+                            switch rank {
+                            case 0: detail = "In My Lineup"
+                            case 1, 2: detail = "Your local station"
+                            default: detail = "In your channels"
+                            }
                             value.sources.append(EventSource(
                                 channelID: listing.entryID, kind: listing.inLineup ? .lineup : .guide, spanish: listing.spanish,
-                                detail: listing.inLineup ? "In My Lineup" : "In your channels"
+                                detail: detail, rank: rank
                             ))
                         }
                         byGame[gameIndex] = value
@@ -482,16 +553,35 @@ enum SportsMatcher {
 
         // Source order: My Lineup, other channels, provider feeds; Spanish
         // after English unless the viewer picked US Spanish.
+        // Stations beyond the best few (one game can be on 90 CW stations)
+        // are counted, not listed.
         let ordered: [SportsEvent] = result.map { event in
             guard event.sources.count > 1 else { return event }
             var copy = event
-            copy.sources = event.sources.enumerated().sorted { a, b in
+            let sorted = event.sources.enumerated().sorted { a, b in
                 let sa = (preferSpanish ? !a.element.spanish : a.element.spanish) ? 1 : 0
                 let sb = (preferSpanish ? !b.element.spanish : b.element.spanish) ? 1 : 0
                 if a.element.kind != b.element.kind { return a.element.kind.rawValue < b.element.kind.rawValue }
+                let ra = a.element.rank ?? 3, rb = b.element.rank ?? 3
+                if ra != rb { return ra < rb }
                 if sa != sb { return sa < sb }
                 return a.offset < b.offset
             }.map(\.element)
+            var kept: [EventSource] = []
+            var stations = 0
+            var folded = 0
+            for source in sorted {
+                if source.kind == .guide {
+                    stations += 1
+                    if stations > 3 { folded += 1; continue }
+                }
+                kept.append(source)
+            }
+            copy.sources = kept
+            if folded > 0 {
+                copy.moreStations = folded
+                stats.trimmedStations += folded
+            }
             return copy
         }
         let sorted = ordered.sorted { a, b in

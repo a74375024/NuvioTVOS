@@ -97,7 +97,12 @@ enum OutsideGuide {
         var programs: [String: [RawProgram]]
         /// How each channel was matched ("US locals: WNBC-DT, by call sign WNBC").
         var notes: [String: String]?
+        /// Sports descriptions kept for the whole window (2): older builds
+        /// kept only the next few hours', so they're rebuilt once.
+        var detailVersion: Int? = nil
     }
+
+    static let detailVersion = 2
 
     // MARK: Cache
 
@@ -127,6 +132,7 @@ enum OutsideGuide {
         guard let saved else { return true }
         if Date().timeIntervalSince(saved.built) > refreshAge { return true }
         if Set(saved.shards) != shards { return true }
+        if (saved.detailVersion ?? 1) < detailVersion { return true }
         // A much bigger lineup than last time: new channels need matching.
         return channelCount > saved.channelCount + max(25, saved.channelCount / 10)
     }
