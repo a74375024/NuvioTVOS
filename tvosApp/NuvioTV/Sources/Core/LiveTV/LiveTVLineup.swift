@@ -18,6 +18,9 @@ struct LineupPrefs: Codable, Equatable {
     /// "US" (US English), "US-ES" (US Spanish), "MX", "UK"… US English by
     /// default; the rest are opt-in.
     var countries: Set<String> = LineupPrefs.defaultCountries
+    /// The market Live Events treats as home (its stations come first);
+    /// nil = the first market picked.
+    var homeMarket: String? = nil
 
     static let defaultCountries: Set<String> = ["US"]
 
@@ -39,6 +42,7 @@ struct LineupPrefs: Codable, Equatable {
         showHidden = try c.decodeIfPresent(Bool.self, forKey: .showHidden) ?? false
         builtAt = try c.decodeIfPresent(Date.self, forKey: .builtAt)
         countries = try c.decodeIfPresent(Set<String>.self, forKey: .countries) ?? LineupPrefs.defaultCountries
+        homeMarket = try c.decodeIfPresent(String.self, forKey: .homeMarket)
     }
 
     /// Country prefixes the provider's own guide should cover ("US-ES" → "US").

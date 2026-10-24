@@ -46,6 +46,13 @@ struct LiveTVOptionsPanel: View {
         return prefs.leagues.count > 4 ? names + " +\(prefs.leagues.count - 4)" : (names.isEmpty ? L10n.string("my_sports_none", fallback: "None") : names)
     }
 
+    /// "San Francisco–Oakland–San Jose" → "San Francisco".
+    private static func shortMarket(_ name: String?) -> String? {
+        guard let name else { return nil }
+        return name.components(separatedBy: CharacterSet(charactersIn: "–,")).first?
+            .trimmingCharacters(in: .whitespaces) ?? name
+    }
+
     private var updatedText: String {
         if schedule.refreshing { return L10n.string("live_schedule_updating", fallback: "Updating…") }
         guard let date = schedule.updatedAt else { return L10n.string("live_schedule_never", fallback: "Not yet") }
@@ -127,6 +134,13 @@ struct LiveTVOptionsPanel: View {
                      detail: L10n.string("my_sports_row_detail", fallback: "Leagues and favorite teams"),
                      accessory: .chevron(mySportsSummary)) {
             onSports()
+        }
+        if store.prefs.markets.count > 1 {
+            LivePanelRow(title: L10n.string("live_events_home_city", fallback: "Home city"),
+                         detail: L10n.string("live_events_home_city_detail", fallback: "Its stations are listed first on games"),
+                         accessory: .chevron(Self.shortMarket(store.homeMarketName))) {
+                store.cycleHomeMarket()
+            }
         }
         LivePanelRow(title: L10n.string("live_game_schedule", fallback: "Game schedule"),
                      detail: L10n.string("live_game_schedule_detail", fallback: "Schedule, logos and TV networks"),

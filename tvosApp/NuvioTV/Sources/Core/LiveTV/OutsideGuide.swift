@@ -22,6 +22,85 @@ enum OutsideGuide {
         let url: String
         /// A locals file: bare four-letter call signs count as call signs.
         var locals = false
+        /// Only used when a main source for its listings is stale or short
+        /// (it fills hours the main sources don't have).
+        var backup = false
+        /// Also used when these shards are on.
+        var alsoShards: Set<String> = []
+        /// Its times are written this many minutes late (epg.pw writes China
+        /// time as UTC): the starting guess until one is learned.
+        var assumedShift = 0
+        /// Learn its clock shift from listings other sources already have.
+        var calibrate = false
+        /// Channels named by network and city ("5.1 CBS San Francisco"),
+        /// resolved to a station through the station directory.
+        var stationNames = false
+
+        /// File name in the cache and key of its saved state.
+        var id: String {
+            String(name.lowercased().map { $0.isLetter || $0.isNumber ? $0 : "-" })
+        }
+
+        func applies(to shards: Set<String>) -> Bool {
+            shards.contains(shard) || !alsoShards.isDisjoint(with: shards)
+        }
+    }
+
+    /// A user channel a guide channel stands for. `shift`: minutes added to
+    /// its times (a West feed made from the East one: +180).
+    struct Match {
+        let id: String
+        let how: String
+        let shift: Int
+    }
+
+    /// What happened with one source in the last update, for the Guide
+    /// Listings screen, the log and the channel report.
+    struct SourceState: Codable, Equatable {
+        var id: String
+        var name: String
+        var backup: Bool
+        var etag: String?
+        var lastModified: Date?
+        var checkedAt: Date?
+        var downloadedAt: Date?
+        /// 200 downloaded, 304 unchanged, 0 saved copy (download failed).
+        var status: Int?
+        var bytes: Int64?
+        var problem: String?
+        var guideChannels: Int?
+        var matched: Int?
+        /// Half of the matched channels' listings end before this (minutes since 1970).
+        var horizonMedian: Int?
+        var parseSeconds: Double?
+        /// Minutes subtracted from its times (backups), and how that was decided.
+        var shift: Int?
+        var shiftNote: String?
+        var stale: Bool?
+        /// A backup used in the last update, and how many channels have
+        /// listings from it.
+        var used: Bool?
+        var extended: Int?
+
+        /// One line for the Guide Listings screen.
+        func line(now: Date = Date()) -> String {
+            let day = DateFormatter()
+            day.dateFormat = "EEE MMM d, h:mm a"
+            var parts: [String] = [name]
+            if let lastModified { parts.append("file from \(day.string(from: lastModified))") }
+            if let horizonMedian {
+                parts.append("listings to \(day.string(from: Date(timeIntervalSince1970: TimeInterval(horizonMedian * 60))))")
+            }
+            if let matched { parts.append("\(matched) channels") }
+            if let shift, shift != 0 { parts.append("times corrected \(shift / 60) h") }
+            if backup {
+                parts.append(used == true ? "in use" + (extended.map { ", fills \($0) channels" } ?? "") : "standing by")
+            } else if stale == true {
+                parts.append("out of date")
+            }
+            if let problem { parts.append("problem: \(problem)") }
+            return parts.joined(separator: " · ")
+        }
     }
 
     static let shards: [Shard] = [
@@ -43,7 +122,19 @@ enum OutsideGuide {
         Source(name: "Plex", shard: "fast", url: "https://i.mjh.nz/Plex/us.xml.gz"),
         Source(name: "Roku", shard: "fast", url: "https://i.mjh.nz/Roku/all.xml.gz"),
         Source(name: "Canada", shard: "ca", url: "https://epgshare01.online/epgshare01/epg_ripper_CA2.xml.gz"),
-        Source(name: "UK", shard: "uk", url: "https://epgshare01.online/epgshare01/epg_ripper_UK1.xml.gz")
+        Source(name: "UK", shard: "uk", url: "https://epgshare01.online/epgshare01/epg_ripper_UK1.xml.gz"),
+        // Backups, used only while a main source is stale or short. EPGTalk
+        // first (right times, several days ahead), then epg.pw (nearly every
+        // US channel, one day ahead, times written 8 h late).
+        Source(name: "Backup: EPGTalk US", shard: "us",
+               url: "https://raw.githubusercontent.com/acidjesuz/EPGTalk/master/US_lite.xml.gz", backup: true),
+        Source(name: "Backup: EPGTalk sports", shard: "us",
+               url: "https://raw.githubusercontent.com/acidjesuz/EPGTalk/master/Sports_guide.xml.gz", backup: true),
+        Source(name: "Backup: EPGTalk locals", shard: "us-locals",
+               url: "https://raw.githubusercontent.com/acidjesuz/EPGTalk/master/US_local_guide.xml.gz",
+               backup: true, stationNames: true),
+        Source(name: "Backup: epg.pw US", shard: "us-locals", url: "https://epg.pw/xmltv/epg_US.xml.gz",
+               backup: true, alsoShards: ["us"], assumedShift: 480, calibrate: true)
     ]
 
     /// Rebuild when the saved listings are older than this. The sources cover
@@ -97,6 +188,12 @@ enum OutsideGuide {
         var programs: [String: [RawProgram]]
         /// How each channel was matched ("US locals: WNBC-DT, by call sign WNBC").
         var notes: [String: String]?
+        /// Each source's state from the last update (by `Source.id`).
+        var sources: [String: SourceState]? = nil
+        /// When to look again: soon while a source is stale, else a day later.
+        var nextCheck: Date? = nil
+        /// The channel list and shards these listings were matched for.
+        var targetsKey: String? = nil
         /// Sports descriptions kept for the whole window (2): older builds
         /// kept only the next few hours', so they're rebuilt once.
         var detailVersion: Int? = nil
@@ -133,47 +230,312 @@ enum OutsideGuide {
         if Date().timeIntervalSince(saved.built) > refreshAge { return true }
         if Set(saved.shards) != shards { return true }
         if (saved.detailVersion ?? 1) < detailVersion { return true }
+        if let next = saved.nextCheck, Date() >= next { return true }
         // A much bigger lineup than last time: new channels need matching.
         return channelCount > saved.channelCount + max(25, saved.channelCount / 10)
     }
 
     // MARK: Building
 
+    struct BuildResult {
+        var programs: [String: [RawProgram]]
+        var problems: [String]
+        var notes: [String: String]
+        var states: [String: SourceState]
+        var nextCheck: Date
+        var targetsKey: String
+        /// Lines for the log.
+        var log: [String]
+    }
+
+    /// Main sources older than this, or reaching less than `shortHorizon`
+    /// ahead, are stale: backups fill in and the update is retried soon.
+    static let staleAge: TimeInterval = 36 * 3600
+    static let shortHorizon = 12 * 60
+    static let staleRetry: TimeInterval = 2 * 3600
+
     /// Builds listings for `channels` from the enabled sources. Runs on
     /// background threads; `progress` reports a short status line.
+    ///
+    /// Cheap when nothing changed: each file is kept, and the server is asked
+    /// to skip it when unchanged. When every main file is unchanged and the
+    /// channels are the same, the saved listings are reused as they are.
     static func build(
         for channels: [LiveTVChannel],
         shards: Set<String>,
+        previous: Saved?,
         progress: @escaping @Sendable (String) -> Void
-    ) async -> (programs: [String: [RawProgram]], problems: [String], notes: [String: String]) {
+    ) async -> BuildResult {
+        let started = Date()
+        var log: [String] = []
         let targets = await Task.detached(priority: .background) { () -> Targets in
             progress("Getting the station directory…")
             let stations = shards.contains("us-locals") || shards.contains("ca")
                 ? await StationDirectory.load() : []
             return Targets(channels: channels, stations: stations)
         }.value
+        // A stable hash (Hasher is seeded per launch, so it can't be saved).
+        var hash: UInt64 = 0xcbf2_9ce4_8422_2325
+        for channel in channels.map(\.id).sorted() {
+            for byte in channel.utf8 { hash = (hash ^ UInt64(byte)) &* 0x100_0000_01b3 }
+            hash = (hash ^ 0x0a) &* 0x100_0000_01b3
+        }
+        let targetsKey = "\(channels.count)|\(String(hash, radix: 16))|\(shards.sorted().joined(separator: ","))"
 
         var merged: [String: [RawProgram]] = [:]
         var notes: [String: String] = [:]
         var problems: [String] = []
+        var states = previous?.sources ?? [:]
         let now = Int(Date().timeIntervalSince1970 / 60)
         let window = (low: now - 180, high: now + Int(keepHours * 60))
-        let chosen = sources.filter { shards.contains($0.shard) }
-        for (index, source) in chosen.enumerated() {
+        let chosen = sources.filter { $0.applies(to: shards) }
+        let mains = chosen.filter { !$0.backup }
+        let backups = chosen.filter(\.backup)
+
+        func state(_ source: Source) -> SourceState {
+            states[source.id] ?? SourceState(id: source.id, name: source.name, backup: source.backup)
+        }
+
+        // 1. Main sources: ask for each file only if it changed.
+        var files: [String: URL] = [:]
+        for (index, source) in mains.enumerated() {
             if Task.isCancelled { break }
-            progress("Updating listings: \(source.name) (\(index + 1) of \(chosen.count))…")
+            progress("Checking listings: \(source.name) (\(index + 1) of \(mains.count))…")
+            var value = state(source)
+            value.checkedAt = Date()
             do {
-                let found = try await XMLTVReader.read(source: source, targets: targets, window: window)
-                for (channelID, entry) in found {
-                    merged[channelID] = mergePrograms(merged[channelID] ?? [], entry.programs)
-                    let note = "\(source.name): \(entry.note)"
-                    notes[channelID] = notes[channelID].map { "\($0); \(note)" } ?? note
+                let fetched = try await GuideFiles.fetchCached(id: source.id, url: source.url,
+                                                               etag: value.etag, lastModified: value.lastModified)
+                files[source.id] = fetched.file
+                value.status = fetched.status
+                value.bytes = fetched.bytes
+                value.problem = fetched.problem
+                if fetched.changed {
+                    value.etag = fetched.etag
+                    value.lastModified = fetched.lastModified
+                    value.downloadedAt = Date()
                 }
+                log.append("guide \(source.name): \(fetched.status == 304 ? "unchanged" : fetched.status == 0 ? "saved copy (\(fetched.problem ?? "?"))" : "downloaded") "
+                           + "\(fetched.bytes / 1_048_576) MB" + (value.lastModified.map { ", file from \(Int(Date().timeIntervalSince($0) / 3600)) h ago" } ?? ""))
             } catch {
+                value.status = nil
+                value.problem = error.localizedDescription
                 problems.append("\(source.name): \(error.localizedDescription)")
+                log.append("guide \(source.name): failed (\(error.localizedDescription))")
+            }
+            states[source.id] = value
+        }
+
+        // 2. The main listings: reused when nothing changed, else read again.
+        let unchanged = mains.allSatisfy { states[$0.id]?.status == 304 || states[$0.id]?.status == 0 }
+        let reuse = unchanged && previous?.targetsKey == targetsKey && (previous?.detailVersion ?? 1) >= detailVersion
+        if reuse, let previous {
+            for (id, list) in previous.programs {
+                let kept = list.filter { $0.s + $0.m > window.low }
+                if !kept.isEmpty { merged[id] = kept }
+            }
+            notes = previous.notes ?? [:]
+            log.append("guide main sources unchanged: saved listings reused (\(merged.count) channels)")
+        } else {
+            for (index, source) in mains.enumerated() {
+                if Task.isCancelled { break }
+                guard let file = files[source.id] else { continue }
+                progress("Updating listings: \(source.name) (\(index + 1) of \(mains.count))…")
+                do {
+                    let found = try await XMLTVReader.read(source: source, file: file, targets: targets, window: window)
+                    for (channelID, entry) in found.programs {
+                        merged[channelID] = mergePrograms(merged[channelID] ?? [], entry.programs)
+                        let note = "\(source.name): \(entry.note)"
+                        notes[channelID] = notes[channelID].map { "\($0); \(note)" } ?? note
+                    }
+                    var value = state(source)
+                    value.guideChannels = found.guideChannels
+                    value.matched = found.programs.count
+                    value.horizonMedian = found.horizonMedian
+                    value.parseSeconds = found.seconds
+                    states[source.id] = value
+                    log.append("guide \(source.name): \(found.programs.count) of your channels from \(found.guideChannels), "
+                               + "read in \(Int(found.seconds)) s, half end within \(found.horizonMedian.map { ($0 - now) / 60 } ?? 0) h")
+                } catch {
+                    problems.append("\(source.name): \(error.localizedDescription)")
+                }
+            }
+            // Never trade listings for shorter ones: what the last update
+            // had beyond a channel's new end is kept.
+            if let previous {
+                var kept = 0
+                for (id, old) in previous.programs {
+                    let newEnd = merged[id]?.map { $0.s + $0.m }.max() ?? Int.min
+                    let extra = old.filter { $0.s + 5 >= newEnd && $0.s + $0.m > now && $0.s < window.high }
+                    guard !extra.isEmpty else { continue }
+                    merged[id] = mergePrograms(merged[id] ?? [], extra)
+                    kept += 1
+                }
+                if kept > 0 { log.append("guide kept the last update's later listings for \(kept) channels") }
             }
         }
-        return (merged, problems, notes)
+
+        // 3. Which main sources are stale: an old file, or listings that
+        // end soon (or no file at all).
+        // Short listings only count where a backup can help (the free
+        // streaming guides are always short and refresh often).
+        var staleShards = Set<String>()
+        for source in mains {
+            var value = state(source)
+            let old = value.lastModified.map { Date().timeIntervalSince($0) > staleAge } ?? false
+            let backed = backups.contains { $0.applies(to: [source.shard]) }
+            let short = backed && (value.horizonMedian.map { $0 < now + shortHorizon } ?? false)
+            let missing = files[source.id] == nil
+            value.stale = old || short || missing
+            states[source.id] = value
+            if value.stale == true { staleShards.insert(source.shard) }
+        }
+
+        // 4. Backups for the stale shards, each only filling what's missing.
+        for (index, source) in backups.enumerated() {
+            if Task.isCancelled { break }
+            var value = state(source)
+            guard source.applies(to: staleShards) else {
+                value.used = false
+                value.extended = 0
+                states[source.id] = value
+                continue
+            }
+            progress("Filling gaps: \(source.name) (\(index + 1) of \(backups.count))…")
+            value.checkedAt = Date()
+            do {
+                let fetched = try await GuideFiles.fetchCached(id: source.id, url: source.url, etag: value.etag,
+                                                               lastModified: value.lastModified, waitForPlayback: false)
+                value.status = fetched.status
+                value.bytes = fetched.bytes
+                value.problem = fetched.problem
+                if fetched.changed {
+                    value.etag = fetched.etag
+                    value.lastModified = fetched.lastModified
+                    value.downloadedAt = Date()
+                }
+                // A wider window, so times can still be moved into it.
+                let shiftRoom = source.calibrate ? 16 * 60 : 0
+                let found = try await XMLTVReader.read(source: source, file: fetched.file, targets: targets,
+                                                       window: (low: window.low - shiftRoom, high: window.high + shiftRoom))
+                var programs = found.programs.mapValues { $0.programs }
+                var perChannel: [String: Int] = [:]
+                if source.calibrate {
+                    let learned = learnShift(reference: merged, candidate: programs)
+                    let shift = learned.shift ?? value.shift ?? source.assumedShift
+                    value.shift = shift
+                    value.shiftNote = learned.note + (learned.shift == nil ? "; using \(shift / 60) h" : "")
+                    perChannel = learned.perChannel
+                    programs = programs.reduce(into: [String: [RawProgram]]()) { out, item in
+                        let delta = perChannel[item.key] ?? shift
+                        let moved = item.value.compactMap { program -> RawProgram? in
+                            let s = program.s - delta
+                            guard s + program.m > window.low, s < window.high else { return nil }
+                            return RawProgram(s: s, m: program.m, t: program.t, st: program.st, d: program.d, f: program.f)
+                        }
+                        if !moved.isEmpty { out[item.key] = moved }
+                    }
+                    log.append("guide \(source.name) clock: \(value.shiftNote ?? "")")
+                }
+                var extended = 0
+                let tag = "\(source.name):"
+                for (channelID, list) in programs {
+                    let before = merged[channelID]?.map { $0.s + $0.m }.max() ?? Int.min
+                    let after = mergePrograms(merged[channelID] ?? [], list)
+                    guard (after.map { $0.s + $0.m }.max() ?? Int.min) > before + 30 else { continue }
+                    merged[channelID] = after
+                    extended += 1
+                    if let entry = found.programs[channelID] {
+                        let delta = perChannel[channelID] ?? value.shift ?? 0
+                        let note = "\(source.name): \(entry.note)" + (delta != 0 ? ", times −\(delta / 60) h" : "")
+                        notes[channelID] = notes[channelID].map { "\($0); \(note)" } ?? note
+                    }
+                }
+                value.guideChannels = found.guideChannels
+                value.matched = programs.count
+                let appliedShift = value.shift ?? 0
+                value.horizonMedian = found.horizonMedian.map { $0 - appliedShift }
+                value.parseSeconds = found.seconds
+                value.used = true
+                // Counted from the notes, so fills kept from the last update count too.
+                value.extended = notes.values.filter { $0.contains(tag) }.count
+                log.append("guide \(source.name): \(fetched.status == 304 ? "unchanged" : fetched.status == 0 ? "saved copy" : "downloaded") "
+                           + "\(fetched.bytes / 1_048_576) MB, \(programs.count) of your channels, extended \(extended) now, "
+                           + "fills \(value.extended ?? 0) in all, read in \(Int(found.seconds)) s")
+            } catch {
+                value.problem = error.localizedDescription
+                value.used = false
+                log.append("guide \(source.name): failed (\(error.localizedDescription))")
+            }
+            states[source.id] = value
+        }
+        // Sources no longer in use are forgotten.
+        let ids = Set(chosen.map(\.id))
+        states = states.filter { ids.contains($0.key) }
+
+        let retry = !staleShards.isEmpty
+        let nextCheck = Date().addingTimeInterval(retry ? staleRetry : refreshAge)
+        let ahead = merged.values.filter { ($0.map { $0.s + $0.m }.max() ?? 0) > now + shortHorizon }.count
+        log.append("guide update done in \(Int(Date().timeIntervalSince(started))) s: \(merged.count) channels listed, "
+                   + "\(ahead) reach 12 h+ ahead" + (retry ? "; stale: \(staleShards.sorted().joined(separator: ", ")), next check in 2 h" : ""))
+        return BuildResult(programs: merged, problems: problems, notes: notes, states: states,
+                           nextCheck: nextCheck, targetsKey: targetsKey, log: log)
+    }
+
+    /// The whole-hour clock shift (minutes, subtracted) that lines a source's
+    /// titles up with listings already merged. Only titles that occur once
+    /// on both sides of a channel count (a show that repeats would match at
+    /// many offsets), and each channel casts one vote. A channel with a clear
+    /// vote of its own keeps it.
+    static func learnShift(reference: [String: [RawProgram]], candidate: [String: [RawProgram]],
+                           sample: Int = 800) -> (shift: Int?, perChannel: [String: Int], note: String) {
+        func key(_ title: String) -> String {
+            let lowered = title.lowercased().rxReplace("^(live|new)[: ]+", with: "")
+            return String(lowered.filter { $0.isLetter || $0.isNumber }.prefix(12))
+        }
+        var votes: [Int: Int] = [:]
+        var perChannel: [String: Int] = [:]
+        var checked = 0
+        for (channel, programs) in candidate {
+            guard let ref = reference[channel], !ref.isEmpty else { continue }
+            checked += 1
+            if checked > sample { break }
+            autoreleasepool {
+                var refCount: [String: Int] = [:]
+                var refStart: [String: Int] = [:]
+                for program in ref {
+                    let k = key(program.t)
+                    refCount[k, default: 0] += 1
+                    refStart[k] = program.s
+                }
+                var candCount: [String: Int] = [:]
+                for program in programs { candCount[key(program.t), default: 0] += 1 }
+                var local: [Int: Int] = [:]
+                for program in programs {
+                    let k = key(program.t)
+                    guard k.count >= 4, candCount[k] == 1, refCount[k] == 1, let start = refStart[k] else { continue }
+                    let gap = program.s - start
+                    let hours = Int((Double(gap) / 60).rounded())
+                    if abs(gap - hours * 60) <= 10, abs(hours) <= 14 { local[hours, default: 0] += 1 }
+                }
+                let ranked = local.sorted { $0.value > $1.value }
+                guard let top = ranked.first else { return }
+                let second = ranked.dropFirst().first?.value ?? 0
+                if top.value >= 2, top.value > second { votes[top.key, default: 0] += 1 }
+                if top.value >= 3, top.value > 2 * second { perChannel[channel] = top.key * 60 }
+            }
+        }
+        let ranked = votes.sorted { $0.value > $1.value }
+        let summary = ranked.prefix(3).map { "\($0.key) h: \($0.value)" }.joined(separator: ", ")
+        guard let top = ranked.first else {
+            return (nil, [:], "no overlap to check against (\(checked) channels)")
+        }
+        let second = ranked.dropFirst().first?.value ?? 0
+        guard top.value >= 20, top.value >= 3 * max(1, second) else {
+            return (nil, [:], "unclear (\(summary))")
+        }
+        // Channels that disagree with the overall shift only keep theirs when clear.
+        return (top.key * 60, perChannel.filter { $0.value != top.key * 60 }, "learned \(top.key) h from \(top.value) channels (\(summary))")
     }
 
     /// Adds `extra` programs that don't overlap `base` by more than 5 minutes.
@@ -228,9 +590,11 @@ enum OutsideGuide {
     struct Targets {
         var bySign: [String: [String]] = [:]
         var byName: [String: [String]] = [:]
+        var stationsByNetwork: [String: [Station]] = [:]
 
         init(channels: [LiveTVChannel], stations: [Station]) {
             let stationsByNetwork = Dictionary(grouping: stations, by: \.network)
+            self.stationsByNetwork = stationsByNetwork
             for channel in channels {
                 let isLocal = (channel.group ?? "").lowercased().contains("local")
                 var signs = OutsideGuide.callsigns(in: channel.name, strongContext: isLocal)
@@ -256,16 +620,31 @@ enum OutsideGuide {
         }
 
         /// The user's channels a guide channel stands for. Call signs win over
-        /// names, since a call sign can't be ambiguous.
-        func matches(names: [String], xmltvID: String, locals: Bool) -> [(id: String, how: String)] {
-            var found: [(id: String, how: String)] = []
+        /// names, since a call sign can't be ambiguous. `stationNames`: a
+        /// network-and-city name ("5.1 CBS San Francisco") is looked up in the
+        /// station directory, and its channel number must agree. `deriveWest`:
+        /// an East feed also stands for the user's West feed, 3 hours later.
+        func matches(names: [String], xmltvID: String, locals: Bool,
+                     stationNames: Bool = false, deriveWest: Bool = false) -> [Match] {
+            var found: [Match] = []
             for sign in OutsideGuide.callsigns(in: (names + [xmltvID]).joined(separator: " | "), strongContext: locals) {
-                found += (bySign[sign] ?? []).map { ($0, "by call sign \(sign)") }
+                found += (bySign[sign] ?? []).map { Match(id: $0, how: "by call sign \(sign)", shift: 0) }
             }
             if !found.isEmpty { return found }
+            if stationNames, !stationsByNetwork.isEmpty {
+                for name in names {
+                    guard let sign = OutsideGuide.stationCallsign(for: name, stations: stationsByNetwork, requireNumber: true),
+                          let ids = bySign[sign] else { continue }
+                    return ids.map { Match(id: $0, how: "by station \(sign)", shift: 0) }
+                }
+            }
             for name in names {
                 let key = OutsideGuide.normalize(name)
-                if key.count >= 2 { found += (byName[key] ?? []).map { ($0, "by name") } }
+                guard key.count >= 2 else { continue }
+                found += (byName[key] ?? []).map { Match(id: $0, how: "by name", shift: 0) }
+                if deriveWest, !key.hasSuffix("~west") {
+                    found += (byName[key + "~west"] ?? []).map { Match(id: $0, how: "by name, West feed 3 h later", shift: 180) }
+                }
             }
             return found
         }
@@ -280,7 +659,7 @@ enum OutsideGuide {
 
     /// "NBC 5 Chicago" → WMAQ: a network word plus the station's city in the
     /// name (the channel number breaks ties).
-    static func stationCallsign(for name: String, stations: [String: [Station]]) -> String? {
+    static func stationCallsign(for name: String, stations: [String: [Station]], requireNumber: Bool = false) -> String? {
         guard !stations.isEmpty else { return nil }
         let lowered = name.lowercased()
             .rxReplace("^\\s*[^:|]{1,24}[:|]\\s*", with: "")
@@ -295,6 +674,8 @@ enum OutsideGuide {
         let numbers = Set(tokens.filter { $0.allSatisfy(\.isNumber) })
         var best: (sign: String, score: Int)?
         for station in candidates where station.cityTokens.allSatisfy(words.contains) {
+            // Strict: a name with a channel number only matches that channel.
+            if requireNumber, !numbers.isEmpty, !station.channelNumber.isEmpty, !numbers.contains(station.channelNumber) { continue }
             var score = station.cityTokens.count * 10
             if !station.channelNumber.isEmpty, numbers.contains(station.channelNumber) { score += 5 }
             if best == nil || score > best!.score { best = (station.callsign, score) }

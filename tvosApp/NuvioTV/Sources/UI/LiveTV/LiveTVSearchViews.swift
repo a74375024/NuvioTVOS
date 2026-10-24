@@ -382,6 +382,16 @@ struct LiveTVGuideSourcesView: View {
                             }
                         }
                     }
+                    if !store.outsideSources.isEmpty {
+                        // Where listings come from, for checking a gap in the guide.
+                        Section(L10n.string("live_outside_source_status", fallback: "Sources")) {
+                            ForEach(store.outsideSources, id: \.id) { source in
+                                Text(source.line())
+                                    .font(.system(size: 20))
+                                    .foregroundColor(source.stale == true || source.problem != nil ? .orange : .secondary)
+                            }
+                        }
+                    }
                     Section {
                         Button(L10n.string("live_outside_refresh", fallback: "Refresh listings now")) {
                             store.loadOutsideGuide(force: true)
@@ -434,6 +444,12 @@ struct LiveTVGuideSourcesView: View {
                 let f = RelativeDateTimeFormatter()
                 f.unitsStyle = .full
                 text += " " + L10n.format("live_outside_updated", fallback: "Listings updated %@.", f.localizedString(for: updated, relativeTo: Date()))
+            }
+            let stale = store.outsideSources.filter { !$0.backup && $0.stale == true }.map(\.name)
+            if !stale.isEmpty {
+                let backups = store.outsideSources.contains { $0.backup && $0.used == true }
+                text += " " + L10n.format("live_outside_stale", fallback: "Out of date: %@.", stale.joined(separator: ", "))
+                    + (backups ? " " + L10n.string("live_outside_backups", fallback: "Backup listings fill the gaps; checking again every 2 hours.") : "")
             }
             return text
         }

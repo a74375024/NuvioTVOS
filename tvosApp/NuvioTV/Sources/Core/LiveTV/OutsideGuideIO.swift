@@ -71,13 +71,99 @@ enum GuideFiles {
         return destination
     }
 
+    /// A guide file kept between updates (Caches), with what the server said
+    /// about its version, so an unchanged file is never downloaded again.
+    struct Fetched {
+        let file: URL
+        /// 200 downloaded, 304 not changed, 0 the saved copy after a failure.
+        let status: Int
+        let etag: String?
+        let lastModified: Date?
+        let bytes: Int64
+        var changed: Bool { status == 200 }
+        /// Set when the download failed and the saved copy is used instead.
+        var problem: String?
+    }
+
+    static func cacheFolder() -> URL {
+        let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
+        let folder = base.appendingPathComponent("OutsideGuide/files", isDirectory: true)
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        return folder
+    }
+
+    private static let httpDate: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(identifier: "GMT")
+        formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss 'GMT'"
+        return formatter
+    }()
+
+    /// Downloads `url` into the cache as `id`, asking the server to skip it
+    /// when unchanged (ETag / Last-Modified). A failed request falls back to
+    /// the saved copy, if there is one. `waitForPlayback`: big files wait
+    /// while video plays; small backups don't need to.
+    static func fetchCached(id: String, url urlString: String, etag: String?, lastModified: Date?,
+                            waitForPlayback: Bool = true,
+                            userAgent: String = "NuvioTV/1.0 (Apple TV; personal use)") async throws -> Fetched {
+        guard let url = URL(string: urlString) else { throw URLError(.badURL) }
+        let cached = cacheFolder().appendingPathComponent(id + ".gz")
+        let haveCopy = FileManager.default.fileExists(atPath: cached.path)
+        if url.isFileURL {
+            try? FileManager.default.removeItem(at: cached)
+            try FileManager.default.copyItem(at: url, to: cached)
+            return Fetched(file: cached, status: 200, etag: nil, lastModified: nil, bytes: size(of: cached))
+        }
+        while waitForPlayback, OutsideGuidePause.shared.isPaused {
+            try await Task.sleep(nanoseconds: 1_000_000_000)
+        }
+        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 180)
+        request.networkServiceType = .background
+        request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+        if haveCopy {
+            if let etag { request.setValue(etag, forHTTPHeaderField: "If-None-Match") }
+            if let lastModified { request.setValue(httpDate.string(from: lastModified), forHTTPHeaderField: "If-Modified-Since") }
+        }
+        func saved(_ problem: String) throws -> Fetched {
+            guard haveCopy else { throw URLError(.cannotLoadFromNetwork) }
+            return Fetched(file: cached, status: 0, etag: etag, lastModified: lastModified, bytes: size(of: cached), problem: problem)
+        }
+        let result: (URL, URLResponse)
+        do {
+            result = try await URLSession.shared.download(for: request)
+        } catch {
+            return try saved((error as NSError).localizedDescription)
+        }
+        let temp = result.0, response = result.1
+        guard let http = response as? HTTPURLResponse else {
+            try? FileManager.default.removeItem(at: temp)
+            return try saved("no response")
+        }
+        if http.statusCode == 304, haveCopy {
+            try? FileManager.default.removeItem(at: temp)
+            return Fetched(file: cached, status: 304, etag: etag, lastModified: lastModified, bytes: size(of: cached))
+        }
+        guard (200...299).contains(http.statusCode) else {
+            try? FileManager.default.removeItem(at: temp)
+            if haveCopy { return try saved("HTTP \(http.statusCode)") }
+            throw HTTPStatusError(status: http.statusCode)
+        }
+        try? FileManager.default.removeItem(at: cached)
+        try FileManager.default.moveItem(at: temp, to: cached)
+        let newTag = http.value(forHTTPHeaderField: "ETag")
+        let modified = http.value(forHTTPHeaderField: "Last-Modified").flatMap { httpDate.date(from: $0) }
+        return Fetched(file: cached, status: 200, etag: newTag, lastModified: modified, bytes: size(of: cached))
+    }
+
     static func size(of file: URL) -> Int64 {
         ((try? FileManager.default.attributesOfItem(atPath: file.path))?[.size] as? NSNumber)?.int64Value ?? 0
     }
 
     /// Streams a .gz file to a plain file 1 MB at a time. Plain files are
     /// passed through as they are.
-    static func gunzip(_ source: URL) throws -> URL {
+    static func gunzip(_ source: URL, waitForPlayback: Bool = true) throws -> URL {
         let input = try FileHandle(forReadingFrom: source)
         defer { try? input.close() }
         let header = input.readData(ofLength: 10)
@@ -112,7 +198,7 @@ enum GuideFiles {
         defer { empty.deallocate() }
         var finished = false
         while !finished {
-            OutsideGuidePause.shared.waitWhilePaused()
+            if waitForPlayback { OutsideGuidePause.shared.waitWhilePaused() }
             let chunk = input.readData(ofLength: bufferSize)
             let flags: Int32 = chunk.isEmpty ? Int32(COMPRESSION_STREAM_FINALIZE.rawValue) : 0
             try chunk.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
@@ -146,12 +232,14 @@ final class XMLTVReader: NSObject, XMLParserDelegate {
     private let window: (low: Int, high: Int)
     /// Lower-cased XMLTV channel id → the user's channels with that guide id.
     private let exact: [String: [String]]?
+    private let waitForPlayback: Bool
+    private let stationNames: Bool
     private(set) var guideChannelCount = 0
     private(set) var programmeCount = 0
 
     private var channelNames: [String: [String]] = [:]
     private var currentChannel: String?
-    private var keep: [String: [(id: String, how: String)]]?   // xmltv id → user channels
+    private var keep: [String: [OutsideGuide.Match]]?   // xmltv id → user channels
     private var keepNames: [String: String] = [:]
     private var found: [String: [OutsideGuide.RawProgram]] = [:]   // xmltv id → programmes
 
@@ -167,11 +255,14 @@ final class XMLTVReader: NSObject, XMLParserDelegate {
     private var collecting = false
     private var counter = 0
 
-    private init(targets: OutsideGuide.Targets, locals: Bool, window: (low: Int, high: Int), exact: [String: [String]]? = nil) {
+    private init(targets: OutsideGuide.Targets, locals: Bool, window: (low: Int, high: Int), exact: [String: [String]]? = nil,
+                 waitForPlayback: Bool = true, stationNames: Bool = false) {
         self.targets = targets
         self.locals = locals
         self.window = window
         self.exact = exact
+        self.waitForPlayback = waitForPlayback
+        self.stationNames = stationNames
     }
 
     struct ExactResult {
@@ -201,16 +292,17 @@ final class XMLTVReader: NSObject, XMLParserDelegate {
 
     /// Unzips (if needed) and parses a downloaded file on a background
     /// thread, then deletes the working files.
-    private static func parse(_ compressed: URL, make: @escaping @Sendable () -> XMLTVReader) async throws -> XMLTVReader {
+    private static func parse(_ compressed: URL, keepCompressed: Bool = false, waitForPlayback: Bool = true,
+                              make: @escaping @Sendable () -> XMLTVReader) async throws -> XMLTVReader {
         try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .background).async {
                 var plain: URL?
                 defer {
-                    try? FileManager.default.removeItem(at: compressed)
+                    if !keepCompressed { try? FileManager.default.removeItem(at: compressed) }
                     if let plain, plain != compressed { try? FileManager.default.removeItem(at: plain) }
                 }
                 do {
-                    plain = try GuideFiles.gunzip(compressed)
+                    plain = try GuideFiles.gunzip(compressed, waitForPlayback: waitForPlayback)
                     guard let plain, let stream = InputStream(url: plain) else { throw CocoaError(.fileReadUnknown) }
                     let reader = make()
                     let parser = XMLParser(stream: stream)
@@ -225,18 +317,35 @@ final class XMLTVReader: NSObject, XMLParserDelegate {
         }
     }
 
-    /// User channel id → its programmes from this source.
+    struct SourceResult {
+        var programs: [String: (programs: [OutsideGuide.RawProgram], note: String)]
+        var guideChannels: Int
+        var programmes: Int
+        /// When half of the matched channels' listings have ended (minutes
+        /// since 1970): how far ahead this source really reaches.
+        var horizonMedian: Int?
+        var seconds: Double
+    }
+
+    /// User channel id → its programmes from one source's (cached) file.
     static func read(
         source: OutsideGuide.Source,
+        file: URL,
         targets: OutsideGuide.Targets,
         window: (low: Int, high: Int)
-    ) async throws -> [String: (programs: [OutsideGuide.RawProgram], note: String)] {
-        let compressed = try await GuideFiles.download(source.url)
+    ) async throws -> SourceResult {
+        let started = Date()
         let locals = source.locals
-        let reader = try await parse(compressed) {
-            XMLTVReader(targets: targets, locals: locals, window: window)
+        let wait = !source.backup
+        let stationNames = source.stationNames
+        let reader = try await parse(file, keepCompressed: true, waitForPlayback: wait) {
+            XMLTVReader(targets: targets, locals: locals, window: window, waitForPlayback: wait, stationNames: stationNames)
         }
-        return reader.result()
+        let programs = reader.result()
+        let ends = programs.values.compactMap { $0.programs.map { $0.s + $0.m }.max() }.sorted()
+        return SourceResult(programs: programs, guideChannels: reader.guideChannelCount, programmes: reader.programmeCount,
+                            horizonMedian: ends.isEmpty ? nil : ends[ends.count / 2],
+                            seconds: Date().timeIntervalSince(started))
     }
 
     private func result() -> [String: (programs: [OutsideGuide.RawProgram], note: String)] {
@@ -252,10 +361,16 @@ final class XMLTVReader: NSObject, XMLParserDelegate {
         var bestScore: [String: Int] = [:]
         for (xmltvID, users) in keep ?? [:] {
             guard let programs = found[xmltvID], !programs.isEmpty else { continue }
-            let score = programs.count + (isLowPower(xmltvID) ? 0 : 100_000)
-            for user in users where score > (bestScore[user.id] ?? -1) {
+            let base = programs.count + (isLowPower(xmltvID) ? 0 : 100_000)
+            for user in users {
+                // A feed of its own beats one derived from another (West from East).
+                let score = base + (user.shift == 0 ? 1_000_000 : 0)
+                guard score > (bestScore[user.id] ?? -1) else { continue }
                 bestScore[user.id] = score
-                byUser[user.id] = (programs, "\(keepNames[xmltvID] ?? xmltvID) (\(user.how))")
+                let list = user.shift == 0 ? programs : programs.map {
+                    OutsideGuide.RawProgram(s: $0.s + user.shift, m: $0.m, t: $0.t, st: $0.st, d: $0.d, f: $0.f)
+                }
+                byUser[user.id] = (list, "\(keepNames[xmltvID] ?? xmltvID) (\(user.how))")
             }
         }
         return byUser
@@ -265,14 +380,14 @@ final class XMLTVReader: NSObject, XMLParserDelegate {
     private func settleKeepList() {
         guard keep == nil else { return }
         if let exact {
-            keep = exact.mapValues { ids in ids.map { (id: $0, how: "by guide id") } }
+            keep = exact.mapValues { ids in ids.map { OutsideGuide.Match(id: $0, how: "by guide id", shift: 0) } }
             for (id, names) in channelNames { keepNames[id] = names.first ?? id }
             channelNames = [:]
             return
         }
-        var list: [String: [(id: String, how: String)]] = [:]
+        var list: [String: [OutsideGuide.Match]] = [:]
         for (id, names) in channelNames {
-            let matches = targets.matches(names: names, xmltvID: id, locals: locals)
+            let matches = targets.matches(names: names, xmltvID: id, locals: locals, stationNames: stationNames, deriveWest: true)
             if !matches.isEmpty {
                 list[id] = matches
                 keepNames[id] = names.first ?? id
@@ -301,7 +416,7 @@ final class XMLTVReader: NSObject, XMLParserDelegate {
             settleKeepList()
             counter += 1
             programmeCount += 1
-            if counter % 4000 == 0 { OutsideGuidePause.shared.waitWhilePaused() }
+            if counter % 4000 == 0, waitForPlayback { OutsideGuidePause.shared.waitWhilePaused() }
             let raw = attributes["channel"] ?? ""
             let id = exact != nil ? raw.lowercased() : raw
             guard keep?[id] != nil,

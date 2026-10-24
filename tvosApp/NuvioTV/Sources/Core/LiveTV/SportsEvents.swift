@@ -11,8 +11,9 @@ struct EventSource: Hashable, Codable {
     let spanish: Bool
     /// "In your guide at 6:15", "Provider event channel".
     let detail: String
-    /// For a station: 0 My Lineup, 1 your home market, 2 your other
-    /// markets, 3 anywhere else. Orders the list; nil = not ranked.
+    /// For a station (`LiveTVStore.StationRank`): 0 My Lineup and home,
+    /// 1 My Lineup, 2 home market, 3 your other markets, 4 anywhere else.
+    /// Orders the list; nil = not ranked.
     var rank: Int? = nil
 }
 
@@ -135,7 +136,7 @@ enum SportsMatcher {
         /// never name the teams.
         var venue: String? = nil
         var city: String? = nil
-        /// 0 My Lineup, 1 your home market, 2 your other markets, 3 elsewhere.
+        /// The station's rank (`LiveTVStore.StationRank`).
         var rank: Int? = nil
     }
 
@@ -430,13 +431,8 @@ enum SportsMatcher {
                         var value = entry(gameIndex)
                         if value.listingEnd.map({ listing.end > $0 }) ?? true { value.listingEnd = listing.end }
                         if !value.sources.contains(where: { $0.channelID == listing.entryID }) {
-                            let rank = listing.inLineup ? 0 : (listing.rank ?? 3)
-                            let detail: String
-                            switch rank {
-                            case 0: detail = "In My Lineup"
-                            case 1, 2: detail = "Your local station"
-                            default: detail = "In your channels"
-                            }
+                            let rank = listing.rank ?? (listing.inLineup ? LiveTVStore.StationRank.lineup : LiveTVStore.StationRank.elsewhere)
+                            let detail = LiveTVStore.stationDetail(rank)
                             value.sources.append(EventSource(
                                 channelID: listing.entryID, kind: listing.inLineup ? .lineup : .guide, spanish: listing.spanish,
                                 detail: detail, rank: rank
@@ -562,7 +558,7 @@ enum SportsMatcher {
                 let sa = (preferSpanish ? !a.element.spanish : a.element.spanish) ? 1 : 0
                 let sb = (preferSpanish ? !b.element.spanish : b.element.spanish) ? 1 : 0
                 if a.element.kind != b.element.kind { return a.element.kind.rawValue < b.element.kind.rawValue }
-                let ra = a.element.rank ?? 3, rb = b.element.rank ?? 3
+                let ra = a.element.rank ?? 4, rb = b.element.rank ?? 4
                 if ra != rb { return ra < rb }
                 if sa != sb { return sa < sb }
                 return a.offset < b.offset

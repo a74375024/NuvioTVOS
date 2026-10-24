@@ -204,6 +204,10 @@ final class LiveTVStore: ObservableObject {
     private var outsideBuiltAt: Date?
     private var outsideNotes: [String: String] = [:]
     private var outsideTask: Task<Void, Never>?
+    private var outsideRunning = false
+    private var outsideRunningShards: Set<String> = []
+    /// Each listings source's state after the last update (Guide Listings screen).
+    @Published private(set) var outsideSources: [OutsideGuide.SourceState] = []
     /// The Xtream providers' own full guides (xmltv.php), per channel id.
     private var providerMatches: [String: [OutsideGuide.RawProgram]] = [:]
     private var providerNotes: [String: String] = [:]
@@ -1238,14 +1242,22 @@ final class LiveTVStore: ObservableObject {
     /// Uses saved outside listings right away, then (if they're old, or
     /// `force`) rebuilds them in the background on this Apple TV.
     func loadOutsideGuide(force: Bool = false) {
+        let shardIDs = OutsideGuide.enabledShards
+        // An update already running keeps going (it used to restart each time
+        // the channel list refreshed, so a long one never finished), unless
+        // the listings chosen changed.
+        if outsideRunning, outsideRunningShards == shardIDs, OutsideGuide.isEnabled {
+            if force { CrashRecorder.note("guide update requested; one is already running") }
+            return
+        }
         outsideTask?.cancel()
+        outsideRunning = false
         guard OutsideGuide.isEnabled, !channels.isEmpty else {
             outsideMatches = [:]
             outsideStatus = .off
             rebuildOutsidePrograms()
             return
         }
-        let shardIDs = OutsideGuide.enabledShards
         let signature = loadedSignature ?? "default"
         // Event feeds are named per event; listings don't apply to them. Only
         // the chosen countries' channels (or ones of unknown country) take part.
@@ -1261,6 +1273,7 @@ final class LiveTVStore: ObservableObject {
             outsideMatches = saved.programs
             outsideNotes = saved.notes ?? [:]
             outsideBuiltAt = saved.built
+            outsideSources = OutsideGuide.sources.compactMap { saved.sources?[$0.id] }
             outsideStatus = .ready(matched: saved.programs.count, total: snapshot.count, updated: saved.built)
             rebuildOutsidePrograms()
             scheduleLineupRefresh()
@@ -1268,19 +1281,26 @@ final class LiveTVStore: ObservableObject {
         // Never rebuild from the partial first-screen list.
         guard !catalogPartial, force || OutsideGuide.needsRebuild(saved, shards: shardIDs, channelCount: snapshot.count) else { return }
         outsideStatus = .updating("Getting ready…")
+        outsideRunning = true
+        outsideRunningShards = shardIDs
+        let reason = force ? "refresh" : (saved == nil ? "first" : "due")
         outsideTask = Task { [weak self] in
             // Give the app a moment to settle before starting background work.
             try? await Task.sleep(nanoseconds: force ? 0 : 8_000_000_000)
             // One heavy guide job at a time: the provider's own guide first.
             if let pending = self?.providerTask { await pending.value }
             guard !Task.isCancelled else { return }
-            let built = await OutsideGuide.build(for: snapshot, shards: shardIDs) { line in
+            CrashRecorder.note("guide update started (\(reason)), \(snapshot.count) channels, sources: \(shardIDs.sorted().joined(separator: ", "))")
+            let built = await OutsideGuide.build(for: snapshot, shards: shardIDs, previous: saved) { line in
                 Task { @MainActor in
                     guard let self, case .updating = self.outsideStatus else { return }
                     self.outsideStatus = .updating(line)
                 }
             }
             guard let self, !Task.isCancelled else { return }
+            self.outsideRunning = false
+            for line in built.log { CrashRecorder.note(line) }
+            self.outsideSources = OutsideGuide.sources.compactMap { built.states[$0.id] }
             if built.programs.isEmpty, !built.problems.isEmpty {
                 self.outsideStatus = self.outsideMatches.isEmpty
                     ? .failed(built.problems.joined(separator: "\n"))
@@ -1288,10 +1308,12 @@ final class LiveTVStore: ObservableObject {
                 return
             }
             let now = Date()
-            let saved = OutsideGuide.Saved(built: now, shards: Array(shardIDs), channelCount: snapshot.count,
-                                           programs: built.programs, notes: built.notes, detailVersion: OutsideGuide.detailVersion)
-            Task.detached(priority: .background) { OutsideGuide.save(saved, signature: signature) }
-            self.outsideSavedCache[signature] = saved
+            let newSaved = OutsideGuide.Saved(built: now, shards: Array(shardIDs), channelCount: snapshot.count,
+                                           programs: built.programs, notes: built.notes,
+                                           sources: built.states, nextCheck: built.nextCheck, targetsKey: built.targetsKey,
+                                           detailVersion: OutsideGuide.detailVersion)
+            Task.detached(priority: .background) { OutsideGuide.save(newSaved, signature: signature) }
+            self.outsideSavedCache[signature] = newSaved
             self.outsideSavedTried.insert(signature)
             self.outsideMatches = built.programs
             self.outsideNotes = built.notes
@@ -1619,6 +1641,9 @@ final class LiveTVStore: ObservableObject {
             func cell(_ value: String?) -> String {
                 "\"" + (value ?? "").replacingOccurrences(of: "\"", with: "\"\"") + "\""
             }
+            let endFormatter = DateFormatter()
+            endFormatter.locale = Locale(identifier: "en_US_POSIX")
+            endFormatter.dateFormat = "yyyy-MM-dd HH:mm"
             func count(_ raw: [OutsideGuide.RawProgram]?) -> Int {
                 (raw ?? []).reduce(0) { $0 + ($1.s < high && $1.s + $1.m > low ? 1 : 0) }
             }
@@ -1639,7 +1664,7 @@ final class LiveTVStore: ObservableObject {
                 "provider", "country", "guide_id", "provider_guide", "provider_guide_programs_next_3h",
                 "kind", "market", "core_network", "scope",
                 "server_genre_tagged_next_3h", "outside_genre_tagged_next_3h", "provider_guide_genre_tagged_next_3h", "now_genres",
-                "now_subtitle", "now_description"
+                "now_subtitle", "now_description", "outside_listings_end"
             ].joined(separator: ",")]
             lines.reserveCapacity(total + 1)
             for (index, row) in rows.enumerated() {
@@ -1662,7 +1687,10 @@ final class LiveTVStore: ObservableObject {
                     cell(String(row.serverTagged)), cell(String(tagged(row.outsideRaw))),
                     cell(isXtream ? String(tagged(row.providerRaw)) : ""), cell(row.nowGenres),
                     cell(row.nowSubtitle), cell(row.nowDescription.isEmpty ? "" : row.nowDescription.rxReplace("https?://\\S+", with: "")
-                        .replacingOccurrences(of: "\n", with: " "))
+                        .replacingOccurrences(of: "\n", with: " ")),
+                    cell(row.outsideRaw.flatMap { list in list.map { $0.s + $0.m }.max() }.map { end in
+                        endFormatter.string(from: Date(timeIntervalSince1970: TimeInterval(end * 60)))
+                    } ?? "")
                 ].joined(separator: ","))
                 if index % 2000 == 1999 {
                     let done = index + 1
@@ -2573,6 +2601,14 @@ final class LiveTVStore: ObservableObject {
     private var sportsRebuildTask: Task<Void, Never>?
     private var sportsRebuildDue: Date?
     private var sportsRebuildRunning = false
+    /// Launch pacing: while the first ~40 s of data pour in (schedule, guide,
+    /// channel index), rebuilds run at most every 6 s instead of on every
+    /// arrival. Your own changes (settings, home city) skip the wait.
+    private var sportsFirstRequest: Date?
+    private var sportsLastRebuild: Date?
+    private static let sportsLaunchWindow: TimeInterval = 40
+    private static let sportsLaunchGap: TimeInterval = 6
+    private static let sportsUserReasons: Set<String> = ["setting", "home city", "my sports", "hidden"]
     private var sportsRebuildAgain: String?
     private var sportsFingerprint: String?
     private var sportsRebuildTimes: [Date] = []
@@ -2629,17 +2665,27 @@ final class LiveTVStore: ObservableObject {
             sportsRebuildAgain = reason
             return
         }
-        let due = Date().addingTimeInterval(delay)
+        let now = Date()
+        if sportsFirstRequest == nil { sportsFirstRequest = now }
+        var delay = delay
+        if let first = sportsFirstRequest, now.timeIntervalSince(first) < Self.sportsLaunchWindow,
+           let last = sportsLastRebuild, !Self.sportsUserReasons.contains(reason) {
+            let gap = Self.sportsLaunchGap - now.timeIntervalSince(last)
+            if gap > delay { delay = gap }
+        }
+        let wait = delay
+        let due = now.addingTimeInterval(wait)
         if let pending = sportsRebuildDue, pending <= due { return }
         sportsRebuildTask?.cancel()
         sportsRebuildDue = due
         sportsRebuildTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: UInt64(max(0, delay) * 1_000_000_000))
+            try? await Task.sleep(nanoseconds: UInt64(max(0, wait) * 1_000_000_000))
             guard !Task.isCancelled, let self else { return }
             self.sportsRebuildDue = nil
             self.sportsRebuildRunning = true
             await self.rebuildSportsEvents(reason: reason)
             self.sportsRebuildRunning = false
+            self.sportsLastRebuild = Date()
             if let again = self.sportsRebuildAgain {
                 self.sportsRebuildAgain = nil
                 self.scheduleSportsRebuild(delay: 2, reason: again)
@@ -2693,10 +2739,26 @@ final class LiveTVStore: ObservableObject {
 
     /// Game listings from the guide: sports, local and Spanish channels in
     /// My Lineup or the browse list, titles with two sides, −5 h to +16 h.
-    /// Call signs of your markets (the first is home), for ranking stations.
+    /// Call signs of your markets, for ranking stations: the home market
+    /// (picked in Options, else the first) and the others.
     struct StationMarkets {
         var home: Set<String> = []
         var others: Set<String> = []
+    }
+
+    /// Station ranks, best first. Lower is listed first on a tile.
+    enum StationRank {
+        static let lineupHome = 0
+        static let lineup = 1
+        static let home = 2
+        static let market = 3
+        static let elsewhere = 4
+        /// Ranks that count as "your local station".
+        static func isLocal(_ rank: Int) -> Bool { rank == home || rank == market }
+    }
+
+    var homeMarketName: String? {
+        prefs.homeMarket.flatMap { name in prefs.markets.first { $0.name == name }?.name } ?? prefs.markets.first?.name
     }
 
     func stationMarkets() -> StationMarkets {
@@ -2704,20 +2766,41 @@ final class LiveTVStore: ObservableObject {
             Set(list.map { ($0.split(separator: "-").first.map(String.init) ?? $0).uppercased() })
         }
         var result = StationMarkets()
-        if let home = prefs.markets.first { result.home = bases(home.callsigns) }
-        result.others = bases(prefs.markets.dropFirst().flatMap(\.callsigns)).subtracting(result.home)
+        let homeName = homeMarketName
+        result.home = bases(prefs.markets.first { $0.name == homeName }?.callsigns ?? [])
+        result.others = bases(prefs.markets.filter { $0.name != homeName }.flatMap(\.callsigns)).subtracting(result.home)
         return result
     }
 
-    /// 1 a home-market station, 2 one of your other markets, 3 elsewhere.
-    nonisolated static func stationRank(_ info: LiveTVEntryInfo, markets: StationMarkets) -> Int {
-        guard info.category == .local || info.category == .spanish else { return 3 }
-        let signs = (info.callsign.map { $0.split(whereSeparator: { $0 == " " || $0 == "," }).map(String.init) } ?? [])
-            + (RegionalNetworks.callsignInName(info.name).map { [$0] } ?? [])
-        let bases = Set(signs.map { ($0.split(separator: "-").first.map(String.init) ?? $0).uppercased() })
-        if !bases.isDisjoint(with: markets.home) { return 1 }
-        if !bases.isDisjoint(with: markets.others) { return 2 }
-        return 3
+    /// Live Events' home city: the next of your markets.
+    func cycleHomeMarket() {
+        guard prefs.markets.count > 1 else { return }
+        var updated = prefs
+        let index = prefs.markets.firstIndex { $0.name == homeMarketName } ?? 0
+        updated.homeMarket = prefs.markets[(index + 1) % prefs.markets.count].name
+        prefs = updated
+        updated.save()
+        CrashRecorder.note("live events home city: \(updated.homeMarket ?? "")")
+        // Station ranks are worked out when the guide's game listings are
+        // read, so read them again, then rebuild.
+        Task { [weak self] in
+            await self?.extractSportsListings(reason: "home city")
+            self?.scheduleSportsRebuild(delay: 0.3, reason: "home city")
+        }
+    }
+
+    /// A station's rank: My Lineup (home first), then your home market, your
+    /// other markets, anywhere else.
+    nonisolated static func stationRank(_ info: LiveTVEntryInfo, markets: StationMarkets, inLineup: Bool) -> Int {
+        var place = StationRank.elsewhere
+        if info.category == .local || info.category == .spanish {
+            let signs = (info.callsign.map { $0.split(whereSeparator: { $0 == " " || $0 == "," }).map(String.init) } ?? [])
+                + (RegionalNetworks.callsignInName(info.name).map { [$0] } ?? [])
+            let bases = Set(signs.map { ($0.split(separator: "-").first.map(String.init) ?? $0).uppercased() })
+            if !bases.isDisjoint(with: markets.home) { place = StationRank.home } else if !bases.isDisjoint(with: markets.others) { place = StationRank.market }
+        }
+        guard inLineup else { return place }
+        return place == StationRank.home ? StationRank.lineupHome : StationRank.lineup
     }
 
     private func extractSportsListings(reason: String) async {
@@ -2738,7 +2821,7 @@ final class LiveTVStore: ObservableObject {
             subsetMap[id] = list
             let inLineup = lineup.contains(id)
             metaMap[id] = (inLineup, info.category == .spanish || info.market == "US-ES",
-                           inLineup ? 0 : Self.stationRank(info, markets: markets))
+                           Self.stationRank(info, markets: markets, inLineup: inLineup))
         }
         let subset = subsetMap
         let meta = metaMap
@@ -2931,12 +3014,34 @@ final class LiveTVStore: ObservableObject {
         let lineup = lineupIDs
         let marketList = prefs.markets.map { ["name": $0.name, "callsigns": $0.callsigns] as [String: Any] }
         let ids = lineup.union(browseEntries.map(\.id))
+        let guideSources = outsideSources
         return await Task.detached(priority: .utility) { () -> String in
             func time(_ date: Date?) -> Any { date.map { Int($0.timeIntervalSince1970) } ?? NSNull() }
             func team(_ t: SportsTeam) -> [String: Any] {
                 ["id": t.id, "name": t.name, "short": t.short ?? "", "loc": t.location ?? "", "alt": t.alternates]
             }
             var objects: [[String: Any]] = [["t": "meta", "now": Int(Date().timeIntervalSince1970), "markets": marketList]]
+            for source in guideSources {
+                let mb: Int64 = (source.bytes ?? 0) / 1_048_576
+                let file: Int = source.lastModified.map { Int($0.timeIntervalSince1970) } ?? 0
+                let checked: Int = source.checkedAt.map { Int($0.timeIntervalSince1970) } ?? 0
+                let horizon: Int = (source.horizonMedian ?? 0) * 60
+                var object: [String: Any] = ["t": "guidesource", "id": source.id, "name": source.name, "backup": source.backup]
+                object["status"] = source.status ?? -1
+                object["mb"] = mb
+                object["file"] = file
+                object["checked"] = checked
+                object["matched"] = source.matched ?? 0
+                object["horizon"] = horizon
+                object["stale"] = source.stale ?? false
+                object["used"] = source.used ?? false
+                object["extended"] = source.extended ?? 0
+                object["shift"] = source.shift ?? 0
+                object["shiftNote"] = source.shiftNote ?? ""
+                object["problem"] = source.problem ?? ""
+                object["seconds"] = source.parseSeconds ?? 0
+                objects.append(object)
+            }
             for game in games {
                 objects.append(["t": "game", "id": game.id, "lg": game.leagueShort, "group": game.league, "start": time(game.start),
                                 "home": team(game.home), "away": team(game.away), "venue": game.venue ?? "",
@@ -2976,6 +3081,13 @@ final class LiveTVStore: ObservableObject {
         }.value
     }
 
+    /// How a station shows on a tile, by rank.
+    nonisolated static func stationDetail(_ rank: Int) -> String {
+        if rank <= StationRank.lineup { return "In My Lineup" }
+        if StationRank.isLocal(rank) { return "Your local station" }
+        return "In your channels"
+    }
+
     /// Where the next two days' games can be watched, by kind of source.
     private func noteSportsCoverage(_ events: [SportsEvent], sources: SportsNetworkMap.SourceStats, now: Date) {
         var games = 0, lineup = 0, local = 0, elsewhere = 0, team = 0, feedsOnly = 0, none = 0, folded = 0
@@ -2985,8 +3097,8 @@ final class LiveTVStore: ObservableObject {
             games += 1
             let channels = event.channels
             if channels.contains(where: { $0.kind == .lineup }) { lineup += 1 }
-            if channels.contains(where: { $0.kind == .guide && ($0.rank ?? 3) <= 2 }) { local += 1 }
-            if channels.contains(where: { $0.kind == .guide && ($0.rank ?? 3) > 2 }) { elsewhere += 1 }
+            if channels.contains(where: { $0.kind == .guide && StationRank.isLocal($0.rank ?? StationRank.elsewhere) }) { local += 1 }
+            if channels.contains(where: { $0.kind == .guide && ($0.rank ?? StationRank.elsewhere) == StationRank.elsewhere }) { elsewhere += 1 }
             if channels.contains(where: { $0.kind == .team }) { team += 1 }
             if channels.isEmpty { if event.feeds.isEmpty { none += 1 } else { feedsOnly += 1 } }
             folded += event.moreStations ?? 0
@@ -3761,7 +3873,7 @@ enum SportsNetworkMap {
             let id: String
             let inLineup: Bool
             let spanish: Bool
-            /// 0 My Lineup, 1 home market, 2 your other markets, 3 elsewhere.
+            /// `LiveTVStore.StationRank`.
             let rank: Int
         }
         var byKey: [String: [Item]] = [:]
@@ -3777,6 +3889,7 @@ enum SportsNetworkMap {
     /// "core:FS1" / "net:FOX" / "rsn:…" / "call:…" for a network name in the
     /// schedule, or nil (streaming services).
     private static func networkKey(_ name: String) -> String? {
+        if let sign = RegionalNetworks.stationBrand(name) { return "call:\(sign)" }
         let key = ChannelCatalog.coreKey(name).key
         if let alias = networkAliases[key] { return "core:\(alias)" }
         if let core = ChannelCatalog.coreMatch(name) { return "core:\(core.name)" }
@@ -3805,7 +3918,7 @@ enum SportsNetworkMap {
                 let spanish = info.category == .spanish || info.market == "US-ES"
                 let inLineup = lineup.contains(entry.id)
                 let item = ChannelIndex.Item(id: entry.id, inLineup: inLineup, spanish: spanish,
-                                             rank: inLineup ? 0 : LiveTVStore.stationRank(info, markets: markets))
+                                             rank: LiveTVStore.stationRank(info, markets: markets, inLineup: inLineup))
                 func add(_ key: String) { index.byKey[key, default: []].append(item) }
                 if let core = info.core {
                     add("core:\(core)")
@@ -3863,17 +3976,18 @@ enum SportsNetworkMap {
         var result: [String: [EventSource]] = [:]
         for game in games where !game.completed {
             var sources: [EventSource] = []
-            /// Best first (My Lineup, home market, your markets, elsewhere),
-            /// two at most; `nearby` keeps only your own markets' stations.
+            /// Best first (My Lineup, home market, your markets, elsewhere);
+            /// `nearby` keeps only your own markets' stations (three at most),
+            /// otherwise two.
             func take(_ entries: [ChannelIndex.Item], nearby: Bool, kind: (Bool) -> EventSource.Kind, detail: (ChannelIndex.Item) -> String) {
-                let ranked = entries.filter { !nearby || $0.rank <= 2 }.sorted { $0.rank < $1.rank }
-                for item in ranked.prefix(2) where !sources.contains(where: { $0.channelID == item.id }) {
+                let ranked = entries.filter { !nearby || $0.rank <= LiveTVStore.StationRank.market }.sorted { $0.rank < $1.rank }
+                for item in ranked.prefix(nearby ? 3 : 2) where !sources.contains(where: { $0.channelID == item.id }) {
                     sources.append(EventSource(channelID: item.id, kind: kind(item.inLineup), spanish: item.spanish,
                                                detail: detail(item), rank: item.rank))
                 }
             }
             func stationDetail(_ item: ChannelIndex.Item) -> String {
-                item.rank == 0 ? "In My Lineup" : (item.rank <= 2 ? "Your local station" : "In your channels")
+                LiveTVStore.stationDetail(item.rank)
             }
             for network in game.networks {
                 guard let key = cachedKey(network) else {
@@ -3960,7 +4074,7 @@ enum RegionalNetworks {
         (["nbcs bos", "nbc sports boston", "nbcs boston"], "nbcs-bos"),
         (["msg2", "msg 2", "msg plus", "msg+"], "msg2"),
         (["msg sportsnet", "msg sn", "msg network", "msg"], "msg"),
-        (["yes network", "yes hd"], "yes"),
+        (["yes network", "yes hd", "dazn yes"], "yes"),
         (["nesn"], "nesn"), (["sny"], "sny"), (["marquee sports"], "marquee"),
         (["altitude"], "altitude"),
         (["monumental", "mnmt"], "monumental"),
@@ -3979,6 +4093,11 @@ enum RegionalNetworks {
         let text = " " + name.lowercased().replacingOccurrences(of: "&", with: "")
             .map { $0.isLetter || $0.isNumber || $0 == "+" ? String($0) : " " }.joined()
             .split(separator: " ").joined(separator: " ") + " "
+        return keyNormalized(text.replacingOccurrences(of: " sports net ", with: " sportsnet "))
+    }
+
+    /// `text`: lowercased words between spaces (" spectrum sportsnet ").
+    private static func keyNormalized(_ text: String) -> String? {
         // Bare names as the schedule writes them.
         if text == " yes " { return "yes" }
         if text == " marquee " { return "marquee" }
@@ -4022,10 +4141,24 @@ enum RegionalNetworks {
         return nil
     }
 
-    /// "KJZZ" from "KJZZ", "KJZZ-TV" or "kjzz-dt": a station call sign.
+    /// "KJZZ" from "KJZZ", "KJZZ-TV", "kjzz-dt" or "KUNP 16" (with its
+    /// channel number): a station call sign.
     static func callsign(_ name: String) -> String? {
         let upper = name.uppercased().trimmingCharacters(in: .whitespaces)
-        guard let range = RX.range("^[KW][A-Z]{2,3}(?=$|[- ](?:TV|DT|LD|CD|CA)$)", in: upper) else { return nil }
-        return String(upper[range])
+        guard let range = RX.range("^[KW][A-Z]{2,3}(?=$|[- ](?:TV|DT|LD|CD|CA)$|[- ](?:TV |DT )?\\d{1,2}$)", in: upper) else { return nil }
+        let sign = String(upper[range])
+        // "WEST 2" is a word and a number, not a station ("KING 5" is one).
+        if upper.last?.isNumber == true, sign != "KING", notCallsigns.contains(sign) { return nil }
+        return sign
+    }
+
+    /// Stations the schedule names by their brand instead of a call sign.
+    private static let stationBrands: [String: String] = [
+        "arizonasfamilycbs5": "KPHO", "azfamilycbs5": "KPHO", "arizonasfamily3tv": "KTVK", "azfamily3tv": "KTVK",
+    ]
+
+    /// "KPHO" for "Arizona's Family CBS5".
+    static func stationBrand(_ name: String) -> String? {
+        stationBrands[String(name.lowercased().filter { $0.isASCII && ($0.isLetter || $0.isNumber) })]
     }
 }
