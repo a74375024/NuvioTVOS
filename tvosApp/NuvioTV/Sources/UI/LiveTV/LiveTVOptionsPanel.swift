@@ -31,6 +31,7 @@ struct LiveTVOptionsPanel: View {
     @State private var guidePreview = LiveTVStore.guidePreviewEnabled
     @State private var gameSchedule = SportsData.isEnabled
     @State private var showUnwatchable = SportsData.showsUnwatchable
+    @State private var showScores = LiveScores.showsScores
     @ObservedObject private var schedule = SportsData.shared
     @State private var showEdit = false
     @State private var showSources = false
@@ -161,6 +162,13 @@ struct LiveTVOptionsPanel: View {
                 showUnwatchable.toggle()
                 SportsData.showsUnwatchable = showUnwatchable
                 LiveEventsModel.shared.refresh()
+            }
+            LivePanelRow(title: L10n.string("live_show_scores", fallback: "Show scores"),
+                         detail: L10n.string("live_show_scores_detail", fallback: "Off keeps live and final status, without numbers"),
+                         accessory: .toggle(showScores)) {
+                showScores.toggle()
+                LiveScores.showsScores = showScores
+                LiveScores.shared.settingsChanged()
             }
         }
 

@@ -166,6 +166,28 @@ struct EventWhere: Equatable {
     /// A fight card: its parts in order, and the one on now (or next).
     var parts: [CardPart] = []
     var partLabel: String?
+    /// The card's sides are the fight on now, not the headline bout.
+    var boutNow = false
+
+    // From the live scoreboard:
+    /// "Q3 4:12", "Halftime", "Bot 8th", "67'", "Final/OT", "Rain Delay".
+    var clock: String?
+    /// Past its start time but not underway yet.
+    var notStarted = false
+    /// When a finished game ended (shown for a while as Final).
+    var endedAt: Date?
+    /// Scores for the top and bottom lines (only with scores on).
+    var topScore: String?
+    var bottomScore: String?
+    /// Which line has the ball (football), with scores on.
+    var possessionTop: Bool?
+    /// "3rd & 7 at MICH 35", "2 outs · 3-1 count" (scores on).
+    var situation: String?
+    var redZone = false
+    var bases: [Bool]?
+    var lastPlay: String?
+    /// Progress from the game clock, when known (0…1).
+    var liveProgress: Double?
 }
 
 // MARK: - Model
@@ -234,8 +256,10 @@ final class LiveEventsModel: ObservableObject {
             store.$sportsEvents.dropFirst().sink { [weak self] _ in self?.scheduleRecompute() },
             store.$events.dropFirst().sink { [weak self] _ in self?.scheduleRecompute() },
             store.$families.dropFirst().sink { [weak self] _ in self?.scheduleRecompute() },
-            store.$logosRevision.dropFirst().sink { [weak self] _ in self?.scheduleRecompute() }
+            store.$logosRevision.dropFirst().sink { [weak self] _ in self?.scheduleRecompute() },
+            LiveScores.shared.$revision.dropFirst().sink { [weak self] _ in self?.scheduleRecompute() }
         ]
+        LiveScores.shared.start()
         ticker = Timer.publish(every: 30, on: .main, in: .common).autoconnect().sink { [weak self] date in
             guard let self else { return }
             self.now = date
@@ -252,6 +276,7 @@ final class LiveEventsModel: ObservableObject {
 
     func stop() {
         CrashRecorder.liveEventsOpen = false
+        LiveScores.shared.stop()
         sinks = []
         ticker = nil
         pending = nil
@@ -263,8 +288,24 @@ final class LiveEventsModel: ObservableObject {
 
     /// For a fight card tile: the part on now, else the first one.
     func cardCurrent(_ event: SportsEvent, at date: Date = Date()) -> SportsEvent? {
-        guard let parts = cards[event.id], let first = parts.first else { return nil }
-        return parts.last { ($0.start ?? .distantFuture) <= date } ?? first
+        guard let parts = cards[event.id] else { return nil }
+        return Self.currentPart(parts, now: date, statuses: LiveScores.shared.statuses)
+    }
+
+    /// The part on now by its fights' status; without it, by start times.
+    private static func currentPart(_ parts: [SportsEvent], now: Date, statuses: [String: LiveStatus]) -> SportsEvent? {
+        guard let first = parts.first else { return nil }
+        let phases = parts.map { part in part.game.flatMap { statuses[$0.id]?.phase } }
+        if phases.contains(where: { $0 != nil }) {
+            if let index = phases.firstIndex(where: { $0 == .live || $0 == .delayed }) { return parts[index] }
+            // Between parts: the first one not finished yet.
+            if let index = phases.firstIndex(where: { $0 != .final && $0 != .postponed }) {
+                if index > 0 || (parts[index].start ?? .distantFuture) <= now { return parts[index] }
+                return first
+            }
+            return parts.last
+        }
+        return parts.last { ($0.start ?? .distantFuture) <= now } ?? first
     }
 
     /// From the board: which tile is focused (its key; nil when none).
@@ -298,7 +339,8 @@ final class LiveEventsModel: ObservableObject {
     /// A card's parts become one tile: its id "card|UFC|<event>", starting
     /// with the first part, the headline bout's sides, and every part's
     /// sources (the part on now first). Cards that aren't split stay as is.
-    private static func mergingCards(_ events: [SportsEvent], now: Date) -> (events: [SportsEvent], cards: [String: [SportsEvent]]) {
+    private static func mergingCards(_ events: [SportsEvent], now: Date,
+                                     statuses: [String: LiveStatus]) -> (events: [SportsEvent], cards: [String: [SportsEvent]]) {
         var groups: [String: [Int]] = [:]
         for (index, event) in events.enumerated() {
             guard let game = event.game, let key = game.cardKey, !key.hasSuffix("|"),
@@ -311,8 +353,8 @@ final class LiveEventsModel: ObservableObject {
         var dropped = Set<Int>()
         for (card, indices) in groups where indices.count >= 2 {
             let parts = indices.map { events[$0] }.sorted { ($0.start ?? .distantFuture) < ($1.start ?? .distantFuture) }
-            guard let first = parts.first, let main = parts.last, let start = first.start, var game = main.game else { continue }
-            let current = parts.last { ($0.start ?? .distantFuture) <= now } ?? first
+            guard let first = parts.first, let main = parts.last, let start = first.start, var game = main.game,
+                  let current = currentPart(parts, now: now, statuses: statuses) else { continue }
             var seen = Set<String>()
             var sources: [EventSource] = []
             for source in current.sources + parts.flatMap(\.sources) where seen.insert(source.channelID).inserted {
@@ -329,6 +371,19 @@ final class LiveEventsModel: ObservableObject {
                 merged.listingEnd = end
             }
             merged.feedsEndedAt = main.feedsEndedAt
+            // The card's phase from its parts' fights.
+            let phases = parts.compactMap { $0.live }
+            if !phases.isEmpty {
+                if phases.contains(where: { $0 == .live || $0 == .delayed }) {
+                    merged.live = .live
+                } else if phases.count == parts.count, phases.allSatisfy({ $0 == .final || $0 == .postponed }) {
+                    merged.live = phases.contains(.final) ? .final : .postponed
+                } else if phases.contains(.final) {
+                    merged.live = .live   // between parts
+                } else {
+                    merged.live = .pre
+                }
+            }
             cards[id] = parts
             let sortedIndices = indices.sorted()
             replaced[sortedIndices[0]] = merged
@@ -352,7 +407,16 @@ final class LiveEventsModel: ObservableObject {
         let store = LiveTVStore.shared
         let now = self.now
         let raw = store.sportsEvents.isEmpty ? store.plainSportsEvents : store.sportsEvents
-        let merged = Self.mergingCards(raw, now: now)
+        // Where each game stands, from the live scoreboard.
+        let scores = LiveScores.shared
+        let statuses = scores.statuses
+        let withLive: [SportsEvent] = statuses.isEmpty ? raw : raw.map { event in
+            guard let id = event.game?.id, let status = statuses[id] else { return event }
+            var copy = event
+            copy.live = status.phase
+            return copy
+        }
+        let merged = Self.mergingCards(withLive, now: now, statuses: statuses)
         let all = merged.events
         let newCards = merged.cards
         var states: [String: SportsEvent.State] = [:]
@@ -363,9 +427,18 @@ final class LiveEventsModel: ObservableObject {
         var result: [Row] = []
         let horizon = now.addingTimeInterval(8 * 24 * 3600)
         let showUnwatchable = SportsData.showsUnwatchable
+        // A game the scoreboard says is over stays as Final for 30 minutes.
+        func endedAt(_ event: SportsEvent) -> Date? {
+            guard event.live == .final, let id = event.game?.id else { return nil }
+            return scores.finalSeen[id]
+        }
+        func recentFinal(_ event: SportsEvent) -> Bool {
+            guard let ended = endedAt(event) else { return false }
+            return now.timeIntervalSince(ended) < 30 * 60
+        }
         func shown(_ event: SportsEvent) -> Bool {
             let state = states[event.id]
-            guard state == .live || state == .mayHaveEnded || state == .upcoming || state == .postponed,
+            guard state == .live || state == .mayHaveEnded || state == .upcoming || state == .postponed || recentFinal(event),
                   let start = event.start, start < horizon else { return false }
             return !event.sources.isEmpty || showUnwatchable
         }
@@ -377,6 +450,7 @@ final class LiveEventsModel: ObservableObject {
         let labels = (
             live: L10n.string("live_events_group_live", fallback: "Live"),
             earlier: L10n.string("live_events_group_earlier", fallback: "Earlier"),
+            final: L10n.string("live_events_group_final", fallback: "Final"),
             soon: L10n.string("live_events_group_soon", fallback: "Starting Soon"),
             today: L10n.string("live_events_group_today", fallback: "Later Today"),
             tomorrow: L10n.string("live_time_tomorrow", fallback: "Tomorrow"),
@@ -388,19 +462,20 @@ final class LiveEventsModel: ObservableObject {
             if event.sources.isEmpty { return Bucket(order: 90, label: labels.notYours) }
             switch states[event.id] {
             case .live?: return Bucket(order: 0, label: labels.live)
-            case .mayHaveEnded?: return Bucket(order: 1, label: labels.earlier)
+            case .finished?: return Bucket(order: 1, label: labels.final)
+            case .mayHaveEnded?: return Bucket(order: 2, label: labels.earlier)
             case .postponed?: return Bucket(order: 80, label: labels.postponed)
             default: break
             }
             guard let start = event.start else { return Bucket(order: 85, label: "") }
-            if start.timeIntervalSince(now) <= 3600 { return Bucket(order: 2, label: labels.soon) }
+            if start.timeIntervalSince(now) <= 3600 { return Bucket(order: 3, label: labels.soon) }
             let days = calendar.dateComponents([.day], from: today, to: calendar.startOfDay(for: start)).day ?? 0
-            if days <= 0 { return Bucket(order: 3, label: labels.today) }
-            if days == 1 { return Bucket(order: 4, label: labels.tomorrow) }
-            if let label = dayLabels[days] { return Bucket(order: 4 + days, label: label) }
+            if days <= 0 { return Bucket(order: 4, label: labels.today) }
+            if days == 1 { return Bucket(order: 5, label: labels.tomorrow) }
+            if let label = dayLabels[days] { return Bucket(order: 5 + days, label: label) }
             let label = longWeekday.string(from: start)
             dayLabels[days] = label
-            return Bucket(order: 4 + days, label: label)
+            return Bucket(order: 5 + days, label: label)
         }
         func grouped(_ list: [SportsEvent]) -> (events: [SportsEvent], headers: [String: String]) {
             let keyed: [(event: SportsEvent, bucket: Bucket)] = list.map { (event: $0, bucket: bucket($0)) }
@@ -488,6 +563,7 @@ final class LiveEventsModel: ObservableObject {
         for row in result {
             for event in row.events where newPlaces[event.id] == nil {
                 newPlaces[event.id] = describe(event, parts: newCards[event.id], now: now, store: store,
+                                               statuses: statuses, endedAt: endedAt(event),
                                                familyNames: familyNames, mySports: mySports)
             }
         }
@@ -548,6 +624,54 @@ final class LiveEventsModel: ObservableObject {
         return (L10n.string("live_card_main_short", fallback: "Main"), L10n.string("live_card_main", fallback: "Main Card"))
     }
 
+    /// How far into the game the clock says it is (0…1), or nil.
+    private static func clockProgress(_ status: LiveStatus, league: String, isSoccer: Bool) -> Double? {
+        let detail = status.detail
+        if detail == "Halftime" { return 0.5 }
+        let pieces = detail.split(separator: " ")
+        guard let head = pieces.first else { return nil }
+        let digits = Int(head.filter(\.isNumber))
+        if isSoccer {
+            // "67'", "90'+3'".
+            guard let minute = digits.map({ Double($0) }) else { return nil }
+            return min(1, minute / 95)
+        }
+        if league == "MLB" || league == "Baseball" {
+            // "Top 6th", "Mid 5th", "Bot 8th", "End 5th".
+            guard pieces.count >= 2, let inning = Int(pieces[1].filter(\.isNumber)) else { return nil }
+            let half: Double
+            switch head.lowercased() {
+            case "top": half = 0
+            case "mid", "bot": half = 0.5
+            default: half = 1
+            }
+            return min(1, max(0, (Double(inning - 1) + half + 0.25) / 9))
+        }
+        if head.hasSuffix("OT") || head == "SO" { return 1 }
+        guard pieces.count >= 2 else { return nil }
+        let clockParts = pieces[1].split(separator: ":")
+        guard clockParts.count == 2, let minutes = Double(clockParts[0]), let seconds = Double(clockParts[1]) else { return nil }
+        let remaining = minutes * 60 + seconds
+        let count: Double
+        let length: Double
+        if head.hasPrefix("Q") {
+            count = 4
+            switch league {
+            case "NFL", "College Football", "Football": length = 900
+            case "NBA": length = 720
+            default: length = 600
+            }
+        } else if league == "College Basketball" {
+            count = 2
+            length = 1200
+        } else {
+            count = 3
+            length = 1200
+        }
+        let period = min(max(1, digits ?? 1), Int(count))
+        return min(1, max(0, (Double(period - 1) + 1 - min(1, remaining / length)) / count))
+    }
+
     /// The long name of a card part ("Early Prelims", "Prelims", "Main Card").
     static func partName(_ part: SportsEvent) -> String { partNames(part).long }
 
@@ -566,9 +690,10 @@ final class LiveEventsModel: ObservableObject {
     }
 
     private func describe(_ event: SportsEvent, parts: [SportsEvent]?, now: Date, store: LiveTVStore,
+                          statuses: [String: LiveStatus], endedAt: Date?,
                           familyNames: [String: String], mySports: MySports) -> EventWhere {
         var place = EventWhere()
-        let current = parts.flatMap { list in list.last { ($0.start ?? .distantFuture) <= now } ?? list.first }
+        let current = parts.flatMap { Self.currentPart($0, now: now, statuses: statuses) }
         let basis = current ?? event
         place.feeds = basis.feeds.count
         place.favorite = event.game.map { mySports.isFavorite($0) } ?? false
@@ -611,16 +736,66 @@ final class LiveEventsModel: ObservableObject {
             }
         }
 
-        // A fight card's timeline.
+        // A fight card's timeline: by its fights' status when known, else by time.
         if let parts, !parts.isEmpty {
             place.parts = parts.enumerated().map { index, part -> CardPart in
                 let start = part.start ?? now
+                if let status = part.game.flatMap({ statuses[$0.id] }) {
+                    let fill: Double
+                    switch status.phase {
+                    case .final, .postponed: fill = 1
+                    case .live, .delayed:
+                        let total = max(1, status.boutsTotal ?? 1)
+                        fill = max(0.05, Double(status.boutsDone ?? 0) / Double(total))
+                    case .pre: fill = 0
+                    }
+                    return CardPart(label: Self.partNames(part).short, start: start, fill: fill, current: part.id == current?.id)
+                }
                 let next = index + 1 < parts.count ? (parts[index + 1].start ?? start) : start.addingTimeInterval(3 * 3600)
                 let span = max(60, next.timeIntervalSince(start))
                 return CardPart(label: Self.partNames(part).short, start: start,
                                 fill: min(1, max(0, now.timeIntervalSince(start) / span)), current: part.id == current?.id)
             }
-            if let current { place.partLabel = Self.partNames(current).long }
+            if let current {
+                place.partLabel = Self.partNames(current).long
+                if let status = current.game.flatMap({ statuses[$0.id] }) {
+                    if status.phase == .live || status.phase == .delayed, !status.detail.isEmpty {
+                        place.partLabel = Self.partNames(current).long + " · " + status.detail
+                    }
+                    // The fight on now (or next), never a result.
+                    if let a = status.boutA, let b = status.boutB, status.phase != .final {
+                        place.top = SportsTeam(id: "b|" + a, name: a, country: status.boutACountry)
+                        place.bottom = SportsTeam(id: "b|" + b, name: b, country: status.boutBCountry)
+                        place.boutNow = status.phase == .live || status.phase == .delayed
+                    }
+                }
+            }
+        }
+
+        // The live scoreboard: clock, and with scores on, the score and situation.
+        if parts == nil, let game = event.game, let status = statuses[game.id] {
+            if !status.detail.isEmpty { place.clock = status.detail }
+            if status.phase == .pre, let start = event.start, now > start { place.notStarted = true }
+            if status.phase == .final { place.endedAt = endedAt }
+            if status.phase == .live || status.phase == .delayed {
+                place.liveProgress = Self.clockProgress(status, league: game.league, isSoccer: game.isSoccer)
+            }
+            if LiveScores.showsScores, status.phase != .pre {
+                let topIsHome = game.isSoccer
+                place.topScore = topIsHome ? status.homeScore : status.awayScore
+                place.bottomScore = topIsHome ? status.awayScore : status.homeScore
+                if let possession = status.possession {
+                    if possession == (place.top?.id ?? "") { place.possessionTop = true }
+                    else if possession == (place.bottom?.id ?? "") { place.possessionTop = false }
+                }
+                place.situation = status.situation
+                place.redZone = status.redZone
+                place.bases = status.bases
+                place.lastPlay = status.lastPlay
+            }
+        } else if parts != nil, event.live == .final {
+            place.clock = L10n.string("live_events_group_final", fallback: "Final")
+            place.endedAt = endedAt
         }
 
         // Where to watch.
@@ -722,6 +897,29 @@ private func countryChip(_ code: String, focused: Bool, size: CGFloat = 15) -> s
         .overlay(RoundedRectangle(cornerRadius: 5).strokeBorder((focused ? Color.black : Color.white).opacity(0.6), lineWidth: 2))
 }
 
+/// Runners on first, second and third, as a small diamond.
+private struct BasesView: View {
+    let bases: [Bool]
+    let ink: Color
+
+    var body: some View {
+        ZStack {
+            base(on: bases.count > 1 && bases[1]).offset(x: 0, y: -6)
+            base(on: bases.count > 2 && bases[2]).offset(x: -9, y: 3)
+            base(on: !bases.isEmpty && bases[0]).offset(x: 9, y: 3)
+        }
+        .frame(width: 30, height: 24)
+    }
+
+    private func base(on: Bool) -> some View {
+        Rectangle()
+            .fill(on ? ink.opacity(0.9) : Color.clear)
+            .overlay(Rectangle().strokeBorder(ink.opacity(0.8), lineWidth: 1.5))
+            .frame(width: 9, height: 9)
+            .rotationEffect(.degrees(45))
+    }
+}
+
 struct LiveEventTile: View {
     let event: SportsEvent
     let place: EventWhere
@@ -758,13 +956,13 @@ struct LiveEventTile: View {
     /// The card, with the progress edge along the bottom while live.
     private func cardBackground(_ state: SportsEvent.State) -> some View {
         let shape = RoundedRectangle(cornerRadius: 18, style: .continuous)
-        let fill: Color = focused ? .white : Color.white.opacity(watchable ? 0.09 : 0.06)
+        let fill: Color = focused ? .white : Color.white.opacity(watchable && state != .finished ? 0.09 : 0.06)
         return ZStack(alignment: .bottomLeading) {
             fill
             if state == .live, place.parts.isEmpty {
                 Rectangle().fill((focused ? Color.black : Color.white).opacity(focused ? 0.12 : 0.15)).frame(height: 8)
                 Rectangle().fill(focused ? Color.black : Color.white.opacity(0.75))
-                    .frame(width: 400 * CGFloat(event.progress(at: now)), height: 8)
+                    .frame(width: 400 * CGFloat(place.liveProgress ?? event.progress(at: now)), height: 8)
             }
         }
         .clipShape(shape)
@@ -820,7 +1018,9 @@ struct LiveEventTile: View {
         let outline = ink.opacity(0.6)
         switch state {
         case .live:
-            if watchable {
+            if event.live == .delayed {
+                pill(L10n.string("live_event_delayed", fallback: "DELAYED"), fill: Color(red: 0.88, green: 0.63, blue: 0), foreground: .black)
+            } else if watchable {
                 pill(L10n.string("live_badge_live", fallback: "LIVE"), fill: LiveStyle.watching, foreground: .white)
             } else {
                 pill(L10n.string("live_badge_live", fallback: "LIVE"), fill: .clear, foreground: focused ? LiveStyle.watching : Color(red: 0.96, green: 0.7, blue: 0.68),
@@ -831,11 +1031,13 @@ struct LiveEventTile: View {
         case .postponed:
             pill(L10n.string("live_event_postponed", fallback: "POSTPONED"), fill: Color(red: 0.88, green: 0.48, blue: 0.12), foreground: .black)
         case .finished:
-            pill(L10n.string("live_event_ended_short", fallback: "Ended"), fill: .clear, foreground: ink, outline: outline)
+            pill(place.clock ?? L10n.string("live_event_ended_short", fallback: "Ended"), fill: .clear, foreground: ink, outline: outline)
         case .unknownTime:
             pill(L10n.string("live_events_no_time", fallback: "Time not listed"), fill: .clear, foreground: ink, outline: outline)
         case .upcoming:
-            EmptyView()
+            if place.notStarted {
+                pill(L10n.string("live_event_not_started", fallback: "Not started"), fill: .clear, foreground: ink, outline: outline)
+            }
         }
     }
 
@@ -844,7 +1046,10 @@ struct LiveEventTile: View {
         switch state {
         case .live:
             if let part = place.partLabel {
-                Text(part).font(.system(size: 24, weight: .semibold)).opacity(0.8).lineLimit(1)
+                Text(part).font(.system(size: 24, weight: .semibold)).opacity(0.8).lineLimit(1).minimumScaleFactor(0.75)
+            } else if let liveClock = place.clock {
+                Text(liveClock).font(.system(size: 24, weight: .semibold)).opacity(0.85).lineLimit(1).minimumScaleFactor(0.8)
+                if let bases = place.bases { BasesView(bases: bases, ink: ink) }
             } else if let end = endTime {
                 Text(L10n.format("live_event_ends_about", fallback: "ends ~%@", shortClock.string(from: end)))
                     .font(.system(size: 24, weight: .semibold)).opacity(0.8).lineLimit(1)
@@ -855,7 +1060,10 @@ struct LiveEventTile: View {
                     .font(.system(size: 24)).opacity(0.75).lineLimit(1)
             }
         case .upcoming:
-            if let start = event.start {
+            if place.notStarted, let start = event.start {
+                Text(L10n.format("live_event_due_at", fallback: "due %@", shortClock.string(from: start)))
+                    .font(.system(size: 24)).opacity(0.75).lineLimit(1)
+            } else if let start = event.start {
                 HStack(spacing: 10) {
                     Text(clock.string(from: start)).font(.system(size: 24, weight: .heavy)).lineLimit(1)
                     if let until = untilText(start) {
@@ -868,7 +1076,12 @@ struct LiveEventTile: View {
                 Text(L10n.format("live_event_was_at", fallback: "was %@", clock.string(from: start)))
                     .font(.system(size: 24)).opacity(0.7).lineLimit(1)
             }
-        case .finished, .unknownTime:
+        case .finished:
+            if let ended = place.endedAt {
+                Text(L10n.format("live_event_ended_at", fallback: "ended %@", shortClock.string(from: ended)))
+                    .font(.system(size: 24)).opacity(0.7).lineLimit(1)
+            }
+        case .unknownTime:
             EmptyView()
         }
     }
@@ -897,9 +1110,12 @@ struct LiveEventTile: View {
         if !place.parts.isEmpty {
             cardMiddle
         } else if let top = place.top, let bottom = place.bottom {
+            let leader = Self.leader(place.topScore, place.bottomScore)
             VStack(alignment: .leading, spacing: 4) {
-                sideLine(top, home: place.homeIsTop == true)
-                sideLine(bottom, home: place.homeIsTop == false)
+                sideLine(top, home: place.homeIsTop == true, score: place.topScore, leads: leader.map { $0 == 0 },
+                         ball: place.possessionTop == true)
+                sideLine(bottom, home: place.homeIsTop == false, score: place.bottomScore, leads: leader.map { $0 == 1 },
+                         ball: place.possessionTop == false)
             }
         } else {
             HStack(spacing: 16) {
@@ -923,7 +1139,13 @@ struct LiveEventTile: View {
         }
     }
 
-    private func sideLine(_ team: SportsTeam, home: Bool) -> some View {
+    /// 0 when the top line leads, 1 when the bottom does, nil when level or unknown.
+    private static func leader(_ top: String?, _ bottom: String?) -> Int? {
+        guard let a = top.flatMap({ Int($0) }), let b = bottom.flatMap({ Int($0) }), a != b else { return nil }
+        return a > b ? 0 : 1
+    }
+
+    private func sideLine(_ team: SportsTeam, home: Bool, score: String? = nil, leads: Bool? = nil, ball: Bool = false) -> some View {
         HStack(spacing: 14) {
             if let country = team.country {
                 countryChip(country, focused: focused)
@@ -941,6 +1163,17 @@ struct LiveEventTile: View {
             if home {
                 Text(L10n.string("live_event_home", fallback: "home")).font(.system(size: 20)).opacity(0.5)
             }
+            if let score {
+                Spacer(minLength: 6)
+                if ball {
+                    Image(systemName: "arrowtriangle.left.fill").font(.system(size: 13)).opacity(0.85)
+                }
+                Text(score)
+                    .font(.system(size: 34, weight: leads == false ? .bold : .heavy).monospacedDigit())
+                    .opacity(leads == false ? 0.55 : 1)
+                    .lineLimit(1)
+                    .fixedSize()
+            }
         }
         .frame(height: 48)
     }
@@ -954,6 +1187,9 @@ struct LiveEventTile: View {
                 .minimumScaleFactor(0.75)
             if let top = place.top, let bottom = place.bottom {
                 HStack(spacing: 8) {
+                    if place.boutNow {
+                        Text(L10n.string("live_card_now", fallback: "Now:")).opacity(0.6)
+                    }
                     if let country = top.country { countryChip(country, focused: focused, size: 14) }
                     Text(lastName(top)).lineLimit(1)
                     Text("vs.").opacity(0.5)
@@ -1007,7 +1243,14 @@ struct LiveEventTile: View {
             } else if let pill = place.pill {
                 channelPill(pill, outlined: place.pillOutlined)
             }
-            if !place.footer.isEmpty {
+            if let situation = place.situation {
+                Text(situation)
+                    .font(.system(size: 22, weight: .bold))
+                    .foregroundColor(place.redZone ? (focused ? Color(red: 0.75, green: 0.1, blue: 0.15) : LiveStyle.watching) : ink)
+                    .opacity(place.redZone ? 1 : 0.85)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.75)
+            } else if !place.footer.isEmpty {
                 Text(place.footer)
                     .font(.system(size: 22))
                     .opacity(0.75)
@@ -1060,17 +1303,17 @@ struct LiveEventsHero: View {
                         TeamBadge(team: teams[0], size: 62)
                         TeamBadge(team: teams[1], size: 62)
                     }
-                    Text(event.game.map(SportsNames.title) ?? event.title)
-                        .font(.system(size: 44, weight: .bold))
+                    Text(heroTitle(event, place))
+                        .font(.system(size: 44, weight: .bold).monospacedDigit())
                         .foregroundColor(.white)
                         .lineLimit(1)
                         .minimumScaleFactor(0.7)
                 }
-                statusLine(event)
+                statusLine(event, place)
                 if event.state(at: now) == .live {
                     ZStack(alignment: .leading) {
                         Capsule().fill(Color.white.opacity(0.2))
-                        Capsule().fill(Color.white).frame(width: 420 * event.progress(at: now))
+                        Capsule().fill(Color.white).frame(width: 420 * CGFloat(place.liveProgress ?? event.progress(at: now)))
                     }
                     .frame(width: 420, height: 6)
                 }
@@ -1094,17 +1337,31 @@ struct LiveEventsHero: View {
         .padding(.top, 36)
     }
 
+    /// "Indiana 24 – 17 Michigan" with scores; the game's title without.
+    private func heroTitle(_ event: SportsEvent, _ place: EventWhere) -> String {
+        if let a = place.topScore, let b = place.bottomScore, let top = place.top, let bottom = place.bottom, place.parts.isEmpty {
+            let soccer = event.game?.isSoccer ?? true
+            return "\(SportsNames.short(top, soccer: soccer)) \(a)  –  \(b) \(SportsNames.short(bottom, soccer: soccer))"
+        }
+        return event.game.map(SportsNames.title) ?? event.title
+    }
+
     @ViewBuilder
-    private func statusLine(_ event: SportsEvent) -> some View {
+    private func statusLine(_ event: SportsEvent, _ place: EventWhere) -> some View {
         let state = event.state(at: now)
         HStack(spacing: 12) {
             switch state {
             case .live:
-                chipLabel(L10n.string("live_badge_live", fallback: "LIVE"), fill: LiveStyle.watching)
+                if event.live == .delayed {
+                    chipLabel(L10n.string("live_event_delayed", fallback: "DELAYED"), fill: Color(red: 0.88, green: 0.63, blue: 0),
+                              foreground: .black)
+                } else {
+                    chipLabel(L10n.string("live_badge_live", fallback: "LIVE"), fill: LiveStyle.watching)
+                }
             case .upcoming:
                 chipLabel(L10n.string("live_badge_later", fallback: "LATER"), fill: .clear, outlined: true)
             case .finished:
-                chipLabel(L10n.string("live_event_ended", fallback: "ENDED"), fill: Color.white.opacity(0.18))
+                chipLabel(place.clock?.uppercased() ?? L10n.string("live_event_ended", fallback: "ENDED"), fill: Color.white.opacity(0.18))
             case .postponed:
                 chipLabel(L10n.string("live_event_postponed", fallback: "POSTPONED"), fill: Color.orange.opacity(0.85))
             case .mayHaveEnded:
@@ -1112,16 +1369,21 @@ struct LiveEventsHero: View {
             case .unknownTime:
                 EmptyView()
             }
-            Text(statusText(event, state))
+            Text(statusText(event, state, place))
                 .font(.system(size: 24, weight: .semibold))
                 .foregroundColor(.white.opacity(0.85))
                 .lineLimit(1)
         }
     }
 
-    private func statusText(_ event: SportsEvent, _ state: SportsEvent.State) -> String {
+    private func statusText(_ event: SportsEvent, _ state: SportsEvent.State, _ place: EventWhere) -> String {
         var parts: [String] = []
         switch state {
+        case .live where place.partLabel != nil || place.clock != nil:
+            // The hero has room for one status line: clock, then the situation.
+            parts.append(place.partLabel ?? place.clock ?? "")
+            if let situation = place.situation { parts.append(situation) }
+            return parts.joined(separator: "   ·   ")
         case .live, .mayHaveEnded:
             if let start = event.start { parts.append(L10n.format("live_events_started", fallback: "Started %@", clock.string(from: start))) }
         case .upcoming:

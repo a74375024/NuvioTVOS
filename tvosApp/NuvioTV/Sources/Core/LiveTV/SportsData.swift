@@ -1076,3 +1076,227 @@ extension SportsParse {
         )
     }
 }
+
+// MARK: - Live scoreboard (status, clock, score, situation)
+
+/// Today's scoreboard → each game's live status, by game id. Off the main
+/// actor; only the fields used are decoded.
+enum SportsLiveParse {
+    static func statuses(_ data: Data, league: SportsData.League) -> [String: LiveStatus] {
+        league.fights ? SportsParse.liveFightStatuses(data, league: league) : SportsParse.liveStatuses(data, league: league)
+    }
+}
+
+private struct LSDoc: Decodable { let events: Lenient<[Lenient<LSEvent>]>? }
+private struct LSEvent: Decodable {
+    let id: LenientText?
+    let competitions: Lenient<[Lenient<LSCompetition>]>?
+    let status: Lenient<LSStatus>?
+}
+private struct LSCompetition: Decodable {
+    let status: Lenient<LSStatus>?
+    let competitors: Lenient<[Lenient<LSCompetitor>]>?
+    let situation: Lenient<LSSituation>?
+}
+private struct LSCompetitor: Decodable {
+    let id: LenientText?
+    let homeAway: LenientText?
+    let score: LenientText?
+    let team: Lenient<LSTeamRef>?
+}
+private struct LSTeamRef: Decodable { let id: LenientText? }
+private struct LSStatus: Decodable {
+    let period: LenientText?
+    let displayClock: LenientText?
+    let type: Lenient<LSStatusType>?
+}
+private struct LSStatusType: Decodable {
+    let name: LenientText?
+    let state: LenientText?
+    let completed: LenientBool?
+    let shortDetail: LenientText?
+}
+private struct LSSituation: Decodable {
+    let downDistanceText: LenientText?
+    let possession: LenientText?
+    let isRedZone: LenientBool?
+    let balls: LenientText?
+    let strikes: LenientText?
+    let outs: LenientText?
+    let onFirst: LenientBool?
+    let onSecond: LenientBool?
+    let onThird: LenientBool?
+    let lastPlay: Lenient<LSPlay>?
+}
+private struct LSPlay: Decodable { let text: LenientText? }
+
+extension SportsParse {
+    /// "pre" / "in" / "post" and the status name → the phase.
+    static func livePhase(state: String?, name: String) -> LivePhase {
+        let upper = name.uppercased()
+        if upper.contains("POSTPONED") || upper.contains("CANCELED") || upper.contains("CANCELLED")
+            || upper.contains("SUSPENDED") || upper.contains("FORFEIT") {
+            return .postponed
+        }
+        switch state?.lowercased() {
+        case "in": return upper.contains("DELAY") ? .delayed : .live
+        case "post": return .final
+        default: return .pre
+        }
+    }
+
+    /// The tile's clock: "Q3 4:12", "2nd 11:02", "67'", "Bot 8th", "Halftime".
+    static func liveDetail(league: SportsData.League, phase: LivePhase, name: String, period: Int, clock: String, short: String?) -> String {
+        let upper = name.uppercased()
+        switch phase {
+        case .final:
+            let value = short ?? "Final"
+            return ["FT", "FINAL"].contains(value.uppercased()) ? "Final" : value
+        case .delayed, .postponed, .pre:
+            return short ?? ""
+        case .live:
+            break
+        }
+        if upper.contains("HALFTIME") { return "Halftime" }
+        if upper.contains("END_PERIOD") || upper.contains("END_OF"), let short { return short }
+        let path = league.path
+        func ordinal(_ value: Int) -> String {
+            switch value {
+            case 1: return "1st"
+            case 2: return "2nd"
+            case 3: return "3rd"
+            default: return "\(value)th"
+            }
+        }
+        if path.hasPrefix("football/") || path.hasSuffix("/nba") || path.hasSuffix("/wnba")
+            || path.hasSuffix("/womens-college-basketball") {
+            if period > 4 { return (period - 4 > 1 ? "\(period - 4)OT" : "OT") + " " + clock }
+            return "Q\(max(1, period)) \(clock)"
+        }
+        if path.hasSuffix("/mens-college-basketball") {
+            if period > 2 { return (period - 2 > 1 ? "\(period - 2)OT" : "OT") + " " + clock }
+            return "\(ordinal(max(1, period))) \(clock)"
+        }
+        if path.hasPrefix("hockey/") {
+            if period == 4 { return "OT \(clock)" }
+            if period > 4 { return "SO" }
+            return "\(ordinal(max(1, period))) \(clock)"
+        }
+        if path.hasPrefix("soccer/") { return clock.isEmpty ? (short ?? "") : clock }
+        return short ?? clock
+    }
+
+    static func liveStatuses(_ data: Data, league: SportsData.League) -> [String: LiveStatus] {
+        guard let doc = try? JSONDecoder().decode(LSDoc.self, from: data), let events = doc.events?.value else { return [:] }
+        var result: [String: LiveStatus] = [:]
+        for item in events {
+            guard let event = item.value, let id = event.id?.value,
+                  let competition = event.competitions?.value?.first?.value else { continue }
+            let status = competition.status?.value ?? event.status?.value
+            let type = status?.type?.value
+            let name = type?.name?.value ?? ""
+            var phase = livePhase(state: type?.state?.value, name: name)
+            if phase == .pre, type?.completed?.value == true { phase = .final }
+            let period = status?.period?.value.flatMap { Int($0) } ?? 0
+            let clock = status?.displayClock?.value ?? ""
+            var live = LiveStatus(phase: phase,
+                                  detail: liveDetail(league: league, phase: phase, name: name, period: period, clock: clock,
+                                                     short: type?.shortDetail?.value))
+            for competitor in competition.competitors?.value ?? [] {
+                guard let value = competitor.value else { continue }
+                if value.homeAway?.value == "home" { live.homeScore = value.score?.value } else { live.awayScore = value.score?.value }
+            }
+            if phase == .pre { live.homeScore = nil; live.awayScore = nil }
+            if phase == .live || phase == .delayed, let situation = competition.situation?.value {
+                if let text = situation.downDistanceText?.value { live.situation = text }
+                live.possession = situation.possession?.value
+                live.redZone = situation.isRedZone?.value == true
+                if league.path.hasPrefix("baseball/") {
+                    var parts: [String] = []
+                    if let outs = situation.outs?.value.flatMap({ Int($0) }) { parts.append(outs == 1 ? "1 out" : "\(outs) outs") }
+                    if let balls = situation.balls?.value, let strikes = situation.strikes?.value { parts.append("\(balls)-\(strikes) count") }
+                    if !parts.isEmpty { live.situation = parts.joined(separator: " · ") }
+                    live.bases = [situation.onFirst?.value == true, situation.onSecond?.value == true, situation.onThird?.value == true]
+                }
+                if let play = situation.lastPlay?.value?.text?.value {
+                    live.lastPlay = play.count > 110 ? String(play.prefix(107)) + "…" : play
+                }
+            }
+            result["\(league.short)|\(id)"] = live
+        }
+        return result
+    }
+
+    /// A fight card's parts: how many fights are done, and the one on now
+    /// (or next). Part keys and ids match `fightCards`.
+    static func liveFightStatuses(_ data: Data, league: SportsData.League) -> [String: LiveStatus] {
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let events = object["events"] as? [[String: Any]] else { return [:] }
+        var result: [String: LiveStatus] = [:]
+        for event in events {
+            guard let id = text(event["id"]) else { continue }
+            let bouts = event["competitions"] as? [[String: Any]] ?? []
+            let anyPart = bouts.contains { cardPart($0) != nil }
+            var byTime: [Int: String] = [:]
+            if !anyPart {
+                let minutes = Set(bouts.compactMap { bout in
+                    (date(text(bout["startDate"])) ?? date(text(bout["date"]))).map { Int($0.timeIntervalSince1970 / 60) }
+                })
+                if minutes.count >= 2 {
+                    for (position, minute) in minutes.sorted(by: >).enumerated() {
+                        byTime[minute] = position == 0 ? "main" : (position == 1 ? "prelims" : "early")
+                    }
+                }
+            }
+            struct Part {
+                var total = 0
+                var done = 0
+                var postponed = 0
+                var live: [String: Any]?
+                var next: [String: Any]?
+            }
+            var parts: [String: Part] = [:]
+            for bout in bouts {
+                let boutMinute = (date(text(bout["startDate"])) ?? date(text(bout["date"]))).map { Int($0.timeIntervalSince1970 / 60) }
+                let key = anyPart ? (cardPart(bout) ?? "main") : (byTime.isEmpty ? "" : (boutMinute.flatMap { byTime[$0] } ?? "main"))
+                var part = parts[key] ?? Part()
+                part.total += 1
+                let type = (bout["status"] as? [String: Any])?["type"] as? [String: Any]
+                let phase = livePhase(state: text(type?["state"]), name: text(type?["name"]) ?? "")
+                if (type?["completed"] as? Bool) == true || phase == .final {
+                    part.done += 1
+                } else if phase == .postponed {
+                    part.postponed += 1
+                } else if phase == .live || phase == .delayed {
+                    if part.live == nil { part.live = bout }
+                } else if part.next == nil {
+                    part.next = bout
+                }
+                parts[key] = part
+            }
+            for (key, part) in parts where part.total > 0 {
+                let finished = part.done + part.postponed >= part.total
+                let phase: LivePhase = finished ? (part.done == 0 ? .postponed : .final)
+                    : (part.live != nil || part.done > 0 ? .live : .pre)
+                let total = part.total - part.postponed
+                var live = LiveStatus(phase: phase, detail: phase == .final ? "Final" : "")
+                live.boutsDone = part.done
+                live.boutsTotal = total
+                if phase == .live {
+                    live.detail = "fight \(min(part.done + 1, max(1, total))) of \(max(1, total))"
+                }
+                if phase != .final, let bout = part.live ?? part.next {
+                    let fighters = (bout["competitors"] as? [[String: Any]] ?? []).compactMap(fighter)
+                    if fighters.count == 2 {
+                        live.boutA = fighters[0].name
+                        live.boutB = fighters[1].name
+                        live.boutACountry = fighters[0].country
+                        live.boutBCountry = fighters[1].country
+                    }
+                }
+                result["\(league.short)|\(id)|\(key)"] = live
+            }
+        }
+        return result
+    }
+}

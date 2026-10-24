@@ -40,10 +40,14 @@ struct SportsEvent: Identifiable, Hashable, Codable {
     var feedsEndedAt: Date? = nil
     /// Stations also showing it that aren't listed (the list keeps the best few).
     var moreStations: Int? = nil
+    /// Where the game stands from the live scoreboard (Live Events only;
+    /// set on its copies while it's open). Overrides the guesswork in `state`.
+    var live: LivePhase? = nil
 
     static func == (lhs: SportsEvent, rhs: SportsEvent) -> Bool {
         lhs.id == rhs.id && lhs.sources == rhs.sources && lhs.game == rhs.game && lhs.listingEnd == rhs.listingEnd
             && lhs.teams == rhs.teams && lhs.feedsEndedAt == rhs.feedsEndedAt && lhs.moreStations == rhs.moreStations
+            && lhs.live == rhs.live
     }
     func hash(into hasher: inout Hasher) { hasher.combine(id) }
 
@@ -101,6 +105,14 @@ struct SportsEvent: Identifiable, Hashable, Codable {
     /// if later), then "may have ended" for half an hour, then gone.
     func state(at now: Date) -> State {
         if let game, game.postponed { return .postponed }
+        if let live {
+            switch live {
+            case .postponed: return .postponed
+            case .live, .delayed: return .live
+            case .final: return .finished
+            case .pre: if start != nil { return .upcoming }
+            }
+        }
         guard let start else { return .unknownTime }
         if now < start { return .upcoming }
         if let game, game.completed { return .finished }
