@@ -1,6 +1,31 @@
 import SwiftUI
 
 extension PlayerView {
+    private var loadingOverlayFocusEnabled: Bool {
+        (!viewModel.showControls || viewModel.isSwitchingSource)
+            && !viewModel.showSettingsPanel
+            && !viewModel.showScenePanel
+            && !viewModel.isSceneDetailVisible
+            && viewModel.sidePanel == nil
+    }
+
+    private func handleLoadingOverlayMove(_ direction: MoveCommandDirection) {
+        switch direction {
+        case .up:
+            if !viewModel.isSwitchingSource {
+                revealControlsAndFocusSettings()
+            }
+        case .down:
+            if viewModel.isSceneEnabled {
+                viewModel.openScene()
+            } else if !viewModel.isSwitchingSource {
+                revealControlsAndFocusSettings()
+            }
+        default:
+            break
+        }
+    }
+
     @ViewBuilder
     var miniPlayerReturnButton: some View {
         Button {
@@ -70,7 +95,10 @@ extension PlayerView {
                         title: meta.name,
                         message: viewModel.loadingStepMessage,
                         startTime: PlaybackStartupTiming.requestDate(for: viewModel.startupBenchmarkToken),
-                        onDismiss: onBack
+                        onDismiss: onBack,
+                        focusEnabled: loadingOverlayFocusEnabled,
+                        onSelect: { revealControlsAndFocusSettings() },
+                        onMove: handleLoadingOverlayMove
                     )
                     .id(viewModel.startupBenchmarkToken)
                     .transition(.opacity)
@@ -89,7 +117,10 @@ extension PlayerView {
                         title: meta.name,
                         message: viewModel.loadingStepMessage,
                         startTime: PlaybackStartupTiming.requestDate(for: viewModel.startupBenchmarkToken),
-                        onDismiss: onBack
+                        onDismiss: onBack,
+                        focusEnabled: loadingOverlayFocusEnabled,
+                        onSelect: { revealControlsAndFocusSettings() },
+                        onMove: handleLoadingOverlayMove
                     )
                     .id(viewModel.startupBenchmarkToken)
                     .transition(.opacity)

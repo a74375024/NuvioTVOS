@@ -135,17 +135,49 @@ final class JellyfinSessionManager: ObservableObject {
         syncTasks[server.id] = Task { [weak self] in
             guard let self else { return }
             do {
-                var allItems: [JellyfinMediaItem] = []
-                for library in server.selectedLibraryIDs {
+                let selectedIDs = Set(server.selectedLibraryIDs)
+                let connectedLibraries: [JellyfinLibrary]
+                if let state = self.connectionStates[server.id],
+                   case let .connected(libraries) = state {
+                    connectedLibraries = libraries
+                } else {
+                    connectedLibraries = []
+                }
+                let knownLibraries = connectedLibraries.filter { selectedIDs.contains($0.id) }
+                let knownIDs = Set(knownLibraries.map(\.id))
+                // Keep stale configured ids syncable, while making their order
+                // stable and their missing display name explicit.
+                let missingLibraries = selectedIDs.subtracting(knownIDs).sorted().map {
+                    JellyfinLibrary(id: $0, name: $0, collectionType: nil)
+                }
+                let selectedLibraries = knownLibraries + missingLibraries
+                var indexedTitles: [JellyfinIndexedTitle] = []
+                var unmatched: [String] = []
+                var fetchedItemCount = 0
+                for library in selectedLibraries {
                     try Task.checkCancellation()
-                    await MainActor.run { self.syncStates[server.id] = .syncing(found: allItems.count, currentLibrary: library) }
-                    let items = try await client.items(userId: server.userId, libraryId: library)
-                    allItems.append(contentsOf: items)
+                    let foundCount = fetchedItemCount
+                    await MainActor.run {
+                        self.syncStates[server.id] = .syncing(found: foundCount, currentLibrary: library.name)
+                    }
+                    let items = try await client.items(userId: server.userId, libraryId: library.id)
+                    fetchedItemCount += items.count
+                    let resolution = JellyfinLibraryResolver.resolve(
+                        items,
+                        serverID: server.id,
+                        libraryID: library.id,
+                        libraryName: library.name
+                    )
+                    indexedTitles.append(contentsOf: resolution.titles)
+                    unmatched.append(contentsOf: resolution.unmatched)
                 }
                 try Task.checkCancellation()
 
-                let resolution = JellyfinLibraryResolver.resolve(allItems, serverID: server.id)
-                try Task.checkCancellation()
+                let resolution = JellyfinLibraryResolution(
+                    titles: indexedTitles,
+                    unmatched: unmatched,
+                    completedAt: Date()
+                )
 
                 JellyfinLibraryIndex.shared.replace(titles: resolution.titles, forServerID: server.id)
 

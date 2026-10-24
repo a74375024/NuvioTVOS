@@ -295,6 +295,9 @@ final class CatalogDecodingTests: XCTestCase {
         XCTAssertTrue(PosterArtworkCachePolicy.isVolatile(URL(string: "https://api.ratingposterdb.com/poster.jpg")!))
         XCTAssertTrue(PosterArtworkCachePolicy.isVolatile(URL(string: "https://top-posters.com/poster.jpg")!))
         XCTAssertTrue(PosterArtworkCachePolicy.isVolatile(URL(string: "https://postersplus.elfhosted.com/poster.jpg")!))
+        XCTAssertTrue(PosterArtworkCachePolicy.isVolatile(URL(string: "https://postersplus.cc/poster.jpg")!))
+        XCTAssertTrue(PosterArtworkCachePolicy.isVolatile(URL(string: "https://postersplus.slokker.cc/poster.jpg")!))
+        XCTAssertTrue(PosterArtworkCachePolicy.isVolatile(URL(string: "https://postersplus.stremio.ru/poster.jpg")!))
         XCTAssertFalse(PosterArtworkCachePolicy.isVolatile(URL(string: "https://xperience-app.com.evil.test/a.jpg")!))
         XCTAssertFalse(PosterArtworkCachePolicy.isVolatile(URL(string: "https://image.tmdb.org/t/p/w500/poster.jpg")!))
         XCTAssertFalse(PosterArtworkCachePolicy.isVolatile(URL(string: "https://artworks.thetvdb.com/banners/poster.jpg")!))
@@ -1060,6 +1063,69 @@ final class CatalogDecodingTests: XCTestCase {
         // Switch genre
         viewModel.setGenre("Action")
         XCTAssertEqual(viewModel.selectedGenre, "Action")
+    }
+
+    @MainActor
+    func testDiscoverKeepsTVSeparateFromSeriesAndPreservesAddonResourceTypes() {
+        let url = URL(string: "https://example.com/manifest.json")!
+        func option(_ type: String, _ id: String) -> DiscoverCatalogOption {
+            DiscoverCatalogOption(
+                key: "test:\(type):\(id)",
+                addonId: "test",
+                addonName: "Test",
+                manifestURL: url,
+                type: type,
+                catalogId: id,
+                catalogName: id,
+                genreOptions: [],
+                genreRequired: false,
+                supportsPagination: false
+            )
+        }
+
+        let sources = [
+            option("movie", "films"),
+            option("series", "shows"),
+            option("show", "legacy-shows"),
+            option("tv", "nuvio_sports_live"),
+            option("tv", "nuvio_sports_networks"),
+            option("tv", "nuvio_sports_replays"),
+            option("channel", "other_live")
+        ]
+        let selectedTypes = Set(sources.map { DiscoverViewModel.discoverSelectionType($0.type) })
+        XCTAssertTrue(selectedTypes.contains("series"))
+        XCTAssertTrue(selectedTypes.contains("tv"))
+        XCTAssertEqual(DiscoverViewModel.discoverSelectionType("TV"), "tv")
+        XCTAssertEqual(DiscoverViewModel.discoverSelectionType("show"), "series")
+        XCTAssertEqual(DiscoverViewModel.discoverSelectionType("tvshow"), "series")
+
+        let series = DiscoverViewModel.discoverCatalogs(for: "series", in: sources)
+        XCTAssertEqual(series.map(\.catalogId), ["shows", "legacy-shows"])
+        let tv = DiscoverViewModel.discoverCatalogs(for: "tv", in: sources)
+        XCTAssertEqual(tv.map(\.catalogId), [
+            "nuvio_sports_live", "nuvio_sports_networks", "nuvio_sports_replays"
+        ])
+        XCTAssertTrue(tv.allSatisfy { $0.type == "tv" })
+        XCTAssertEqual(DiscoverViewModel.discoverCatalogs(for: "channel", in: sources)
+            .map(\.catalogId), ["other_live"])
+
+        let viewModel = DiscoverViewModel(repository: MockCatalogRepository())
+        XCTAssertEqual(viewModel.typeTitle(for: "tv"), "TV")
+        // The Series label is localized and may differ by device language.
+        XCTAssertNotEqual(viewModel.typeTitle(for: "tv"),
+                          viewModel.typeTitle(for: "series"))
+    }
+
+    @MainActor
+    func testDiscoverLegacyAliasesUseSeriesWithoutCapturingTV() {
+        let aliasTypes = ["series", "show", "shows", "tvshow", "tvshows",
+                          "tv_series", "tv-series", "tv_show", "tv-show"]
+        XCTAssertTrue(aliasTypes.allSatisfy {
+            DiscoverViewModel.discoverSelectionType($0) == "series"
+        })
+        XCTAssertEqual(DiscoverViewModel.discoverSelectionType(" movies "), "movie")
+        XCTAssertEqual(DiscoverViewModel.discoverSelectionType("tv"), "tv")
+        XCTAssertEqual(DiscoverViewModel.discoverSelectionType("anime"), "anime")
     }
 
     func testCinemetaMetaDecodesPosterShapeAndMapsTileShape() throws {

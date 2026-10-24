@@ -242,7 +242,7 @@ struct SpatialAudioBridgeTests {
     func dtsEligibility() {
         let on = ObjectAudioRendering.apac(.l714)
         // FFmpeg names only two of DTS:X's markers, so a plain DTS-HD MA label can still be DTS:X;
-        // LibDTSX decides on the track's first frames.
+        // the DTS:X decoder decides on the track's first frame.
         for profile in [AV_PROFILE_DTS_HD_MA, AV_PROFILE_DTS_HD_MA_X, AV_PROFILE_DTS_HD_MA_X_IMAX] {
             #expect(HLSVideoEngine.spatialRenderingLayout(rendering: on, codecID: AV_CODEC_ID_DTS, profile: profile, sampleRate: 48_000) == .l714)
             #expect(HLSVideoEngine.objectAudioSource(codecID: AV_CODEC_ID_DTS, profile: profile) == .dtsHDMasterAudio)
@@ -801,6 +801,16 @@ struct BedLevelMeterTests {
                                + "Rtr -inf/-inf;"))
     }
 
+    /// An object with elevation not allowed. Only the measurement reference reads that switch; a
+    /// shipped build renders every object as a point, so there it sits on the floor instead.
+    private func elevationNotAllowed(_ heights: Set<SpatialSpeaker>) -> ObjectAudioElementState {
+        #if TrueHDReferenceRender
+        ObjectAudioElementState(position: SIMD3(0.5, 0.5, 1), excluded: heights)
+        #else
+        ObjectAudioElementState(position: SIMD3(0.5, 0.5, 0))
+        #endif
+    }
+
     @Test("objects count as active with gain and as elevated only above ear level with elevation allowed")
     func objectCounts() throws {
         var meter = BedLevelMeter(layout: .l714, sampleRate: 48_000)
@@ -809,7 +819,7 @@ struct BedLevelMeterTests {
         let first = ObjectAudioMetadataUpdate(frameOffset: 0, rampFrames: 0, states: [
             .init(),
             .init(position: SIMD3(0.5, 0.5, 1)),                       // overhead
-            .init(position: SIMD3(0.5, 0.5, 1), excluded: heights),     // elevation not allowed
+            elevationNotAllowed(heights),
             .init(position: SIMD3(0.5, 0.5, 1), gain: 0),               // muted
         ])
         // A later update restates only the muted object; the others keep their last state.

@@ -137,6 +137,14 @@ final class PlaybackSessionCoordinator: ObservableObject {
     var torrentStreamSourceURL: URL?
     private(set) var playbackCompletionTracker: PlaybackCompletionTracker?
 
+    static func shouldUseHybridDiskCache(isEnabled: Bool, request: PlaybackLoadRequest) -> Bool {
+        isEnabled
+            && !request.isLiveStream
+            && !request.isSports
+            && PlaybackBackendPolicy.isRemoteHTTP(request.videoURL.absoluteString)
+            && request.videoURL.pathExtension.lowercased() != "m3u8"
+    }
+
     func beginNewPlaybackCompletionSession(
         identity: PlaybackCompletionIdentity,
         profileID: String?,
@@ -334,9 +342,7 @@ final class PlaybackSessionCoordinator: ObservableObject {
         }
 
         let diskCacheSetting = (ProfileSettings.current.object(forKey: SettingsKey.hybridDiskCacheEnabled) as? Bool) ?? false
-        let cacheEligible = diskCacheSetting
-            && PlaybackBackendPolicy.isRemoteHTTP(request.videoURL.absoluteString)
-            && request.videoURL.pathExtension.lowercased() != "m3u8"
+        let cacheEligible = Self.shouldUseHybridDiskCache(isEnabled: diskCacheSetting, request: request)
         let aetherVersion = selectedBackend == .aether ? AetherEngine.version : "not-active"
         PlaybackDiagnosticLogStore.shared.append(
             source: "Player",
@@ -392,6 +398,10 @@ final class PlaybackSessionCoordinator: ObservableObject {
         guard !userStopped else { return }
         guard let request = lastRequest else { return }
         guard activeBackend == .aether else { return }
+        guard mpvSupportsRequest(request) else {
+            print("[PlaybackCoordinator] MPV handoff suppressed: remote HLS requires native playback")
+            return
+        }
         guard !didFallbackForCurrentURL else {
             print("[PlaybackCoordinator] fallback already used for \(currentURLString ?? "?")")
             return
@@ -402,8 +412,10 @@ final class PlaybackSessionCoordinator: ObservableObject {
         isProgressSaveSuspended = true
         didFallbackForCurrentURL = true
         allowAutomaticFallback = false
-        let captured = resumeSeconds
-            ?? aetherController.coherentSourceTimeSeconds()
+        let hasLiveTimeline = request.isLiveStream || request.isSports
+        let captured = hasLiveTimeline
+            ? 0
+            : (resumeSeconds ?? aetherController.coherentSourceTimeSeconds())
         lastPolicyReason = "AetherEngine → MPVKit: \(reason)"
         print("[PlaybackCoordinator] Aether→MPV handoff: \(reason) @ \(String(format: "%.2f", captured))s")
 
@@ -411,7 +423,9 @@ final class PlaybackSessionCoordinator: ObservableObject {
         aetherController.destroyPlayer()
 
         var mpvRequest = request
-        if captured > 1 {
+        if hasLiveTimeline {
+            mpvRequest.resumePositionSeconds = nil
+        } else if captured > 1 {
             mpvRequest.resumePositionSeconds = captured
         }
         prepareForHandoff?(&mpvRequest)
@@ -434,6 +448,36 @@ final class PlaybackSessionCoordinator: ObservableObject {
         onHandoffToast?("Compatibility player enabled")
         onBackendHandoff?(mpvRequest)
         startLoad(mpvRequest, on: .mpv, generation: generation)
+    }
+
+    /// Startup-only fallback for live and sports requests selected for Aether
+    /// by Auto. The generation and dispatch guards reject callbacks from older
+    /// loads; the ordinary handoff guard still enforces one fallback per URL.
+    @discardableResult
+    func requestLiveStartupFallback(generation expectedGeneration: UInt64) -> Bool {
+        guard !userStopped,
+              !isHandoffInProgress,
+              loadGeneration == expectedGeneration,
+              dispatchedLoadGeneration == expectedGeneration,
+              lastLoadError == nil,
+              activeBackend == .aether,
+              allowAutomaticFallback,
+              !didFallbackForCurrentURL,
+              let request = lastRequest,
+              request.isLiveStream || request.isSports,
+              let aetherController,
+              !aetherController.hasFirstFrameReadyForDisplay,
+              !aetherController.isPlayerPlaying,
+              !aetherController.isTransportPlaying else {
+            return false
+        }
+        guard mpvSupportsRequest(request) else {
+            return false
+        }
+
+        let previousGeneration = loadGeneration
+        handoffToMPV(reason: "Live stream did not start in AetherEngine", resumeSeconds: 0)
+        return activeBackend == .mpv && loadGeneration != previousGeneration
     }
 
     /// Wait for the resume target, or a coherent clock after the seek settle window.
@@ -513,6 +557,15 @@ final class PlaybackSessionCoordinator: ObservableObject {
         }
     }
 
+    private func mpvSupportsRequest(_ request: PlaybackLoadRequest) -> Bool {
+        guard PlaybackBackendPolicy.mpvSupportsURL(request.videoURL.absoluteString),
+              request.httpHeaderSourceURL.map({ PlaybackBackendPolicy.mpvSupportsURL($0.absoluteString) }) ?? true
+        else { return false }
+        // Extensionless playlists may only be identified after the native engine opens them.
+        return PlaybackEngineCapabilities.mpv.supportsRemoteHLS
+            || aetherController?.engine.videoRoute != .remoteBypass
+    }
+
     private func handleAetherTerminalError(_ message: String) {
         guard !userStopped, !isHandoffInProgress else { return }
         guard activeBackend == .aether else { return }
@@ -521,9 +574,7 @@ final class PlaybackSessionCoordinator: ObservableObject {
             lastLoadError = message
             return
         }
-        if let url = lastRequest?.videoURL,
-           PlaybackBackendPolicy.isRemoteHTTP(url.absoluteString),
-           !PlaybackEngineCapabilities.mpv.supportsDirectHTTPS {
+        if let request = lastRequest, !mpvSupportsRequest(request) {
             print("[PlaybackCoordinator] terminal Aether error on remote stream; suppressing MPV fallback: \(message)")
             lastLoadError = message
             return
@@ -558,10 +609,8 @@ final class PlaybackSessionCoordinator: ObservableObject {
         }
 
         let isDiskCacheEnabled = (ProfileSettings.current.object(forKey: SettingsKey.hybridDiskCacheEnabled) as? Bool) ?? false
-        let isHTTP = PlaybackBackendPolicy.isRemoteHTTP(request.videoURL.absoluteString)
-        let isHLS = request.videoURL.pathExtension.lowercased() == "m3u8"
 
-        if isDiskCacheEnabled && isHTTP && !isHLS {
+        if Self.shouldUseHybridDiskCache(isEnabled: isDiskCacheEnabled, request: request) {
             let sessionToken = UUID().uuidString
             let previousToken = currentCacheSessionToken
             currentCacheSessionToken = sessionToken

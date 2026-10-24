@@ -11,10 +11,21 @@ final class WatchPartyAppOwner: ObservableObject {
         let mount: WatchPartyPlayerMount
         let context: WatchPartyPlaybackContext
     }
+    struct IncomingMediaTransition: Identifiable {
+        let id: UUID
+        let context: WatchPartyPlaybackContext
+        let media: WatchPartyMedia
+        let plan: WatchPartyIncomingEpisodePlan?
+        let viewModel: PlayerViewModel
+    }
     @Published private(set) var service: WatchPartyService?
     @Published private(set) var presentation: Presentation?
+    @Published private(set) var incomingMediaTransition: IncomingMediaTransition?
     @Published var message: String?
     private var preservePlayerAfterRoomExit = false
+    private var isChangingRoomMedia = false
+    private var incomingMediaTransitionID: UUID?
+    private var incomingMediaTransitionContext: WatchPartyPlaybackContext?
     private var lease: WatchPartyPlayerRuntime.Lease?
     private var browsingTask: Task<Void, Never>?
     private(set) var runtime: WatchPartyPlayerRuntime?
@@ -62,7 +73,7 @@ final class WatchPartyAppOwner: ObservableObject {
     /// Explicit privacy gate (e.g. who's-watching on return) may revoke the same profile, too.
     func invalidateContext() { service?.invalidateContext() }
 
-    /// Only after an explicit, own-source choice for this exact accepted room/media.
+    /// Only after an explicit local source choice for this exact accepted room/media.
     func preparePlayback(media: WatchPartyMedia) throws -> Presentation {
         guard let service, let room = service.session, room.connection == .ready,
               let context = room.playbackContext, context.mediaKey == media.key,
@@ -82,6 +93,7 @@ final class WatchPartyAppOwner: ObservableObject {
             let result = Presentation(id: id, mount: mount, context: context)
             self.lease = lease
             presentation = result
+            preservePlayerAfterRoomExit = false
             message = nil
             return result
         } catch { runtime.finish(lease); throw error }
@@ -233,6 +245,78 @@ final class WatchPartyAppOwner: ObservableObject {
         return lease.resource.sessionCoordinator === coordinator
     }
 
+    /// Host-selected episode changes invalidate the old media binding. Keep the player
+    /// surface on screen while the caller prepares a fresh lease for the accepted episode.
+    func updateRoomMedia(_ media: WatchPartyMedia) async throws {
+        guard let service, let room = service.session,
+              let presentation, presentation.mount.isCurrent,
+              room.playbackContext == presentation.context,
+              room.party?.media.key != media.key else {
+            throw WatchPartyPlaybackRuntimeError.staleContext
+        }
+        let previousKey = presentation.context.mediaKey
+        isChangingRoomMedia = true
+        defer { isChangingRoomMedia = false }
+        do {
+            try await service.updateMedia(media)
+        } catch {
+            if room.party?.media.key == previousKey { preservePlayerAfterRoomExit = false }
+            throw error
+        }
+        guard service.session === room, room.connection == .ready,
+              room.party?.media.key == media.key else {
+            throw WatchPartyPlaybackRuntimeError.staleContext
+        }
+    }
+
+    func isCurrentIncomingMediaTransition(_ id: UUID, context: WatchPartyPlaybackContext) -> Bool {
+        guard incomingMediaTransitionID == id,
+              incomingMediaTransition?.id == id,
+              incomingMediaTransitionContext == context,
+              let service, service.isCurrent(context.request),
+              let room = service.session, room.playbackContext == context,
+              room.party?.media.key == context.mediaKey else { return false }
+        return true
+    }
+
+    func completeIncomingMediaTransition(_ id: UUID, context: WatchPartyPlaybackContext) {
+        guard isCurrentIncomingMediaTransition(id, context: context) else { return }
+        let oldViewModel = incomingMediaTransition?.viewModel
+        incomingMediaTransitionID = nil
+        incomingMediaTransitionContext = nil
+        incomingMediaTransition = nil
+        preservePlayerAfterRoomExit = false
+        oldViewModel?.shutdownForWatchParty()
+    }
+
+    /// Root invokes this after source resolution fails or the target is not the exact next episode.
+    @discardableResult
+    func showWatchPartyAfterIncomingMediaTransition(_ id: UUID) -> Bool {
+        guard incomingMediaTransitionID == id,
+              let transition = incomingMediaTransition, transition.id == id else { return false }
+        incomingMediaTransitionID = nil
+        incomingMediaTransitionContext = nil
+        incomingMediaTransition = nil
+        transition.viewModel.clearWatchPartyTransitionCallbacks()
+        // Keep the player through the presentation-nil callback; it consumes this flag.
+        guard transition.viewModel.isSceneEnabled else {
+            message = "The room changed episodes. Choose a source from the Watch Party lobby."
+            return false
+        }
+        transition.viewModel.openWatchPartyScene()
+        return true
+    }
+
+    func cancelIncomingMediaTransition(_ id: UUID) {
+        guard incomingMediaTransitionID == id else { return }
+        let oldViewModel = incomingMediaTransition?.viewModel
+        incomingMediaTransitionID = nil
+        incomingMediaTransitionContext = nil
+        incomingMediaTransition = nil
+        preservePlayerAfterRoomExit = false
+        oldViewModel?.shutdownForWatchParty()
+    }
+
     func restorePlayback(for coordinator: PlaybackSessionCoordinator?) -> Presentation? {
         guard owns(coordinator), let presentation, let runtime,
               (try? runtime.restore(context: presentation.context)) != nil,
@@ -278,6 +362,7 @@ final class WatchPartyAppOwner: ObservableObject {
             preservePlayerAfterRoomExit = true
             self.lease = nil
             presentation = nil
+            lease.resource.clearWatchPartyTransitionCallbacks()
             runtime.abandon(lease)
             lease.resource.resumeNextEpisodeStateAfterWatchParty()
         } else {
@@ -296,6 +381,7 @@ final class WatchPartyAppOwner: ObservableObject {
     func stop() {
         subscriptions.removeAll()
         observeRoom(nil)
+        if let id = incomingMediaTransitionID { cancelIncomingMediaTransition(id) }
         finishPlayback(reportBrowsing: false)
         let oldRuntime = runtime
         let oldService = service
@@ -320,7 +406,12 @@ final class WatchPartyAppOwner: ObservableObject {
             MainActor.assumeIsolated { service?.invalidateContext() }
         }.store(in: &subscriptions)
         service.contextDidInvalidate.sink { [weak self] _ in
-            MainActor.assumeIsolated { self?.finishPlayback(reportBrowsing: false) }
+            MainActor.assumeIsolated {
+                if let self, let id = self.incomingMediaTransitionID {
+                    self.cancelIncomingMediaTransition(id)
+                }
+                self?.finishPlayback(reportBrowsing: false)
+            }
         }.store(in: &subscriptions)
         // @Published emits before the new pointer is installed. This also covers explicit
         // leave/replacement outside context invalidation. Do not adopt a new room implicitly.
@@ -341,11 +432,65 @@ final class WatchPartyAppOwner: ObservableObject {
         roomObserverID = room.observeChanges { [weak self, weak room] in
             guard let self, let context = self.runtime?.currentContext else { return }
             if room?.playbackContext != context {
+                if self.isChangingRoomMedia {
+                    self.preservePlayerAfterRoomExit = true
+                    self.finishPlayback(reportBrowsing: false)
+                    return
+                }
+                if let nextContext = room?.playbackContext,
+                   WatchPartyDetailsPresentationPolicy.sameMembership(context, nextContext),
+                   nextContext.mediaKey != context.mediaKey,
+                   let room, let lease = self.lease,
+                   lease.context == context,
+                   let presentation = self.presentation,
+                   presentation.context == context,
+                   let runtime = self.runtime,
+                   let service = self.service,
+                   service.session === room,
+                   let media = room.party?.media,
+                   media.key == nextContext.mediaKey {
+                    self.beginIncomingMediaTransition(
+                        from: context, to: nextContext, media: media,
+                        service: service, room: room, lease: lease,
+                        presentation: presentation, runtime: runtime
+                    )
+                    return
+                }
                 // Membership/media changes close the old player; source resolution is a later,
                 // explicit transition. No automatic reuse of its URL or host-provided link.
                 self.finishPlayback(reportBrowsing: false)
                 if room?.playbackContext != nil { self.message = "The room changed title. Choose your source again." }
             }
         }
+    }
+
+    private func beginIncomingMediaTransition(
+        from oldContext: WatchPartyPlaybackContext,
+        to nextContext: WatchPartyPlaybackContext,
+        media: WatchPartyMedia,
+        service: WatchPartyService,
+        room: WatchPartySession,
+        lease: WatchPartyPlayerRuntime.Lease,
+        presentation: Presentation,
+        runtime: WatchPartyPlayerRuntime
+    ) {
+        let viewModel = lease.resource
+        let plan = viewModel.incomingWatchPartyEpisodePlan(for: media)
+        let transitionID = UUID()
+        incomingMediaTransitionID = transitionID
+        incomingMediaTransitionContext = nextContext
+
+        // Detach synchronously before any source resolution. The old player remains alive,
+        // but can no longer publish or apply room playback state for the previous episode.
+        self.lease = nil
+        preservePlayerAfterRoomExit = true
+        runtime.abandon(lease)
+        viewModel.pause(forBackground: true)
+        viewModel.clearWatchPartyTransitionCallbacks()
+        if self.presentation?.id == presentation.id { self.presentation = nil }
+        incomingMediaTransition = IncomingMediaTransition(
+            id: transitionID, context: nextContext, media: media,
+            plan: plan, viewModel: viewModel
+        )
     }
 }

@@ -18,7 +18,7 @@ final class StreamsRepository: ObservableObject {
 
     /// Bounded per-add-on stream request timeout (seconds). Dead providers
     /// finish as failed without blocking the rest or smart autoplay forever.
-    static let streamRequestTimeout: TimeInterval = 18
+    static let streamRequestTimeout: TimeInterval = 30
 
     @Published private(set) var state = StreamsDiscoveryState()
 

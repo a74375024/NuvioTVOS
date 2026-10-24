@@ -750,81 +750,125 @@ enum CustomPosterScreen: String, CaseIterable, Hashable, Identifiable {
 }
 
 enum CustomPosterURLResolver {
-    private enum Part {
-        case literal(String)
-        case placeholder([String], optional: Bool)
-    }
+    struct ContentIDs: Equatable, Sendable {
+        let id: String
+        let imdbId: String?
+        let tmdbId: String?
+        let tvdbId: String?
+        let kitsuId: String?
+        let anilistId: String?
+        let malId: String?
+        let anidbId: String?
 
-    private final class PreparedTemplate: NSObject {
-        let parts: [Part]
-        let containsShape: Bool
-
-        init(parts: [Part], containsShape: Bool) {
-            self.parts = parts
-            self.containsShape = containsShape
+        init(
+            id: String,
+            imdbId: String? = nil,
+            tmdbId: String? = nil,
+            tvdbId: String? = nil,
+            kitsuId: String? = nil,
+            anilistId: String? = nil,
+            malId: String? = nil,
+            anidbId: String? = nil
+        ) {
+            self.id = id
+            self.imdbId = imdbId
+            self.tmdbId = tmdbId
+            self.tvdbId = tvdbId
+            self.kitsuId = kitsuId
+            self.anilistId = anilistId
+            self.malId = malId
+            self.anidbId = anidbId
         }
     }
 
-    private static let preparedTemplates: NSCache<NSString, PreparedTemplate> = {
-        let cache = NSCache<NSString, PreparedTemplate>()
-        cache.countLimit = 128
-        return cache
+    private static let rpdbDomains = [
+        "ratingposterdb.com",
+        "aioratings.com",
+        "top-posters.com",
+        "btttr.cc"
+    ]
+
+    private static let pipeRegex: NSRegularExpression? = {
+        try? NSRegularExpression(
+            pattern: "\\{([a-zA-Z0-9_]+(?:\\|[a-zA-Z0-9_]+)+)(\\?)?\\}",
+            options: []
+        )
     }()
+
+    static func extractIDs(metaId: String, explicitImdbId: String? = nil) -> ContentIDs {
+        var imdbId: String? = nil
+        var tmdbId: String? = nil
+        var tvdbId: String? = nil
+        var kitsuId: String? = nil
+        var anilistId: String? = nil
+        var malId: String? = nil
+        var anidbId: String? = nil
+
+        let trimmedId = metaId.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmedId.hasPrefix("tt") {
+            imdbId = trimmedId
+        } else if trimmedId.hasPrefix("tmdb:") {
+            tmdbId = String(trimmedId.dropFirst("tmdb:".count))
+        } else if trimmedId.hasPrefix("tvdb:") {
+            tvdbId = String(trimmedId.dropFirst("tvdb:".count))
+        } else if trimmedId.hasPrefix("kitsu:") {
+            kitsuId = String(trimmedId.dropFirst("kitsu:".count))
+        } else if trimmedId.hasPrefix("anilist:") {
+            anilistId = String(trimmedId.dropFirst("anilist:".count))
+        } else if trimmedId.hasPrefix("mal:") {
+            malId = String(trimmedId.dropFirst("mal:".count))
+        } else if trimmedId.hasPrefix("anidb:") {
+            anidbId = String(trimmedId.dropFirst("anidb:".count))
+        }
+
+        if let explicit = explicitImdbId?.trimmingCharacters(in: .whitespacesAndNewlines), !explicit.isEmpty {
+            imdbId = explicit
+        }
+
+        return ContentIDs(
+            id: trimmedId,
+            imdbId: imdbId,
+            tmdbId: tmdbId,
+            tvdbId: tvdbId,
+            kitsuId: kitsuId,
+            anilistId: anilistId,
+            malId: malId,
+            anidbId: anidbId
+        )
+    }
+
+    static func extractIDs(from meta: NuvioMeta) -> ContentIDs {
+        let metaId = meta.id.trimmingCharacters(in: .whitespacesAndNewlines)
+        let extracted = extractIDs(metaId: metaId)
+
+        let explicitImdb = NuvioMeta.canonicalImdbID(from: meta.imdbId ?? "")
+            ?? NuvioMeta.canonicalImdbID(from: metaId)
+        let resolvedImdb = explicitImdb ?? extracted.imdbId
+
+        let explicitTmdb = meta.tmdbId.flatMap { $0 > 0 ? String($0) : nil }
+            ?? namespacedTMDBID(from: metaId)
+        let resolvedTmdb = explicitTmdb ?? extracted.tmdbId
+
+        return ContentIDs(
+            id: extracted.id,
+            imdbId: resolvedImdb,
+            tmdbId: resolvedTmdb,
+            tvdbId: extracted.tvdbId,
+            kitsuId: extracted.kitsuId,
+            anilistId: extracted.anilistId,
+            malId: extracted.malId,
+            anidbId: extracted.anidbId
+        )
+    }
 
     static func resolve(
         pattern: String,
         meta: NuvioMeta,
         shape: String = "poster"
     ) -> String? {
-        let trimmedPattern = pattern.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedPattern.isEmpty,
-              ["poster", "landscape", "square"].contains(shape),
-              let prepared = prepare(trimmedPattern),
-              prepared.containsShape || shape == "poster" else {
-            return nil
-        }
-
-        let imdbID = NuvioMeta.canonicalImdbID(from: meta.imdbId ?? "")
-            ?? NuvioMeta.canonicalImdbID(from: meta.id)
-        let tmdbID = meta.tmdbId.flatMap { $0 > 0 ? String($0) : nil }
-            ?? namespacedTMDBID(from: meta.id)
-        var values = [
-            "type": meta.isSeries ? "series" : "movie",
-            "shape": shape
-        ]
-        if let tmdbID { values["tmdb_id"] = tmdbID }
-        if let imdbID { values["imdb_id"] = imdbID }
-
-        var result = ""
-        for part in prepared.parts {
-            switch part {
-            case .literal(let value):
-                result.append(value)
-            case .placeholder(let keys, let optional):
-                let resolved = keys.lazy.compactMap { key -> String? in
-                    guard let value = values[key], !value.isEmpty else { return nil }
-                    return value
-                }.first
-                if let resolved {
-                    result.append(resolved)
-                } else if optional {
-                    continue
-                } else {
-                    return nil
-                }
-            }
-        }
-
-        guard !result.isEmpty,
-              !result.contains(where: \.isWhitespace),
-              let components = URLComponents(string: result),
-              let scheme = components.scheme?.lowercased(),
-              scheme == "http" || scheme == "https",
-              let host = components.host, !host.isEmpty,
-              components.url != nil else {
-            return nil
-        }
-        return result
+        let ids = extractIDs(from: meta)
+        let contentType = meta.isSeries ? "series" : "movie"
+        return resolve(pattern: pattern, ids: ids, type: contentType, shape: shape)
     }
 
     static func resolve(
@@ -838,51 +882,301 @@ enum CustomPosterURLResolver {
         return resolve(pattern: pattern, meta: meta, shape: shape)
     }
 
-    private static func prepare(_ rawPattern: String) -> PreparedTemplate? {
-        if let cached = preparedTemplates.object(forKey: rawPattern as NSString) {
-            return cached
+    static func sanitizePattern(_ input: String) -> String {
+        var trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "" }
+
+        // Automatically extract pattern from JSON payloads (e.g. copied config exports or backups)
+        if (trimmed.hasPrefix("{") && trimmed.hasSuffix("}")) || (trimmed.hasPrefix("[") && trimmed.hasSuffix("]")) {
+            if let data = trimmed.data(using: .utf8),
+               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                let candidateKeys = [
+                    "pattern",
+                    "custom_poster_url_pattern",
+                    "customPosterURLPattern",
+                    "url",
+                    "poster",
+                    "poster_url",
+                    "posterUrl",
+                    "template",
+                    "custom_poster_url"
+                ]
+                for key in candidateKeys {
+                    if let val = json[key] as? String, !val.isEmpty {
+                        trimmed = val.trimmingCharacters(in: .whitespacesAndNewlines)
+                        break
+                    }
+                }
+                if trimmed.hasPrefix("{") {
+                    for (_, val) in json {
+                        if let str = val as? String {
+                            let candidate = str.trimmingCharacters(in: .whitespacesAndNewlines)
+                            if candidate.lowercased().hasPrefix("http://") || candidate.lowercased().hasPrefix("https://") {
+                                trimmed = candidate
+                                break
+                            }
+                        }
+                    }
+                }
+            }
         }
 
-        let pattern = rawPattern
+        // Strip enclosing quotes if copied with wrapping quotes
+        if (trimmed.hasPrefix("\"") && trimmed.hasSuffix("\"")) || (trimmed.hasPrefix("'") && trimmed.hasSuffix("'")) {
+            trimmed = String(trimmed.dropFirst().dropLast()).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        return trimmed
+    }
+
+    static func resolve(
+        pattern: String,
+        ids: ContentIDs,
+        type: String,
+        shape: String = "poster"
+    ) -> String? {
+        let trimmedPattern = sanitizePattern(pattern)
+        if trimmedPattern.isEmpty { return nil }
+
+        let decoded = decodePatternPlaceholders(trimmedPattern)
+        if !containsPlaceholder(decoded) { return nil }
+
+        if isRPDBFamily(decoded) {
+            return resolveRPDBWithFallback(pattern: decoded, ids: ids, type: type, shape: shape)
+        } else {
+            return resolvePattern(pattern: decoded, ids: ids, type: type, shape: shape)
+        }
+    }
+
+    private static func resolvePattern(
+        pattern: String,
+        ids: ContentIDs,
+        type: String,
+        shape: String
+    ) -> String? {
+        guard ["poster", "landscape", "square"].contains(shape) else { return nil }
+
+        let supportsShape = pattern.contains("{shape}") || pattern.contains("{shape?}")
+        if !supportsShape && shape != "poster" {
+            return nil
+        }
+
+        let (rawId, rawIdType) = extractRawIDAndType(ids: ids)
+        let typedRawId: String
+        if rawIdType == "tmdb", let tmdb = ids.tmdbId, !tmdb.isEmpty {
+            typedRawId = tmdb
+        } else if rawIdType == "tvdb", let tvdb = ids.tvdbId, !tvdb.isEmpty {
+            typedRawId = tvdb
+        } else {
+            typedRawId = rawId
+        }
+        let typedId = formatTypedID(rawID: typedRawId, idType: rawIdType, contentType: type)
+
+        let idLookup: [String: String] = [
+            "id": ids.id,
+            "stremio_id": ids.id,
+            "id_type": rawIdType,
+            "typed_id": typedId,
+            "type": type,
+            "shape": shape,
+            "imdb_id": ids.imdbId ?? "",
+            "tmdb_id": ids.tmdbId ?? "",
+            "tvdb_id": ids.tvdbId ?? "",
+            "kitsu_id": ids.kitsuId ?? "",
+            "anilist_id": ids.anilistId ?? "",
+            "mal_id": ids.malId ?? "",
+            "anidb_id": ids.anidbId ?? ""
+        ]
+
+        guard var url = resolvePipePlaceholders(pattern: pattern, lookup: idLookup) else {
+            return nil
+        }
+
+        for (key, value) in idLookup {
+            let optional = "{\(key)?}"
+            if url.contains(optional) {
+                url = url.replacingOccurrences(of: optional, with: value)
+            }
+            let placeholder = "{\(key)}"
+            if url.contains(placeholder) {
+                if value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    return nil
+                }
+                url = url.replacingOccurrences(of: placeholder, with: value)
+            }
+        }
+
+        // Resolve any remaining optional placeholders {xxx?} to empty string
+        url = url.replacingOccurrences(
+            of: "\\{[a-zA-Z0-9_]+\\?\\}",
+            with: "",
+            options: .regularExpression
+        )
+
+        if url.range(of: "\\{[^}]+\\}", options: .regularExpression) != nil {
+            return nil
+        }
+
+        guard !url.isEmpty,
+              !url.contains(where: \.isWhitespace) else {
+            return nil
+        }
+
+        let validURL: URL?
+        if let components = URLComponents(string: url),
+           let scheme = components.scheme?.lowercased(),
+           scheme == "http" || scheme == "https",
+           let host = components.host, !host.isEmpty,
+           let u = components.url {
+            validURL = u
+        } else if let u = URL(string: url),
+                  let scheme = u.scheme?.lowercased(),
+                  scheme == "http" || scheme == "https",
+                  let host = u.host, !host.isEmpty {
+            validURL = u
+        } else {
+            return nil
+        }
+
+        return validURL?.absoluteString ?? url
+    }
+
+    private static func resolvePipePlaceholders(pattern: String, lookup: [String: String]) -> String? {
+        guard let regex = pipeRegex else { return pattern }
+        var url = pattern
+        while let match = regex.firstMatch(in: url, options: [], range: NSRange(location: 0, length: (url as NSString).length)) {
+            let nsURL = url as NSString
+            let fullToken = nsURL.substring(with: match.range(at: 0))
+            let keysBody = nsURL.substring(with: match.range(at: 1))
+            let isOptional = match.range(at: 2).location != NSNotFound
+            let keys = keysBody.split(separator: "|").map(String.init)
+
+            let resolved = keys.lazy.compactMap { key -> String? in
+                guard let val = lookup[key], !val.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    return nil
+                }
+                return val
+            }.first
+
+            if let resolved {
+                url = url.replacingOccurrences(of: fullToken, with: resolved)
+            } else if isOptional {
+                url = url.replacingOccurrences(of: fullToken, with: "")
+            } else {
+                return nil
+            }
+        }
+        return url
+    }
+
+    private static func extractRawIDAndType(ids: ContentIDs) -> (rawID: String, rawIDType: String) {
+        let metaId = ids.id
+        if metaId.hasPrefix("tt") {
+            return (metaId, "imdb")
+        } else if let colonIndex = metaId.firstIndex(of: ":") {
+            let prefix = String(metaId[..<colonIndex])
+            let rawId = String(metaId[metaId.index(after: colonIndex)...])
+            return (rawId, prefix)
+        } else {
+            return (metaId, "unknown")
+        }
+    }
+
+    private static func formatTypedID(rawID: String, idType: String, contentType: String) -> String {
+        if idType == "imdb" { return rawID }
+        if idType == "tmdb" || idType == "tvdb" {
+            let prefix = contentType == "movie" ? "movie" : "series"
+            return "\(prefix)-\(rawID)"
+        }
+        return rawID
+    }
+
+    private static func isRPDBFamily(_ pattern: String) -> Bool {
+        rpdbDomains.contains { pattern.contains($0) }
+    }
+
+    private static func containsPlaceholder(_ pattern: String) -> Bool {
+        pattern.range(of: "\\{[a-zA-Z0-9_]+[|?]?", options: .regularExpression) != nil
+    }
+
+    private static func decodePatternPlaceholders(_ rawPattern: String) -> String {
+        rawPattern
             .replacingOccurrences(of: "%7B", with: "{", options: .caseInsensitive)
             .replacingOccurrences(of: "%7D", with: "}", options: .caseInsensitive)
             .replacingOccurrences(of: "%7C", with: "|", options: .caseInsensitive)
-        var parts: [Part] = []
-        var containsShape = false
-        var cursor = pattern.startIndex
+    }
 
-        while cursor < pattern.endIndex {
-            guard let open = pattern[cursor...].firstIndex(of: "{") else {
-                let literal = String(pattern[cursor...])
-                guard !literal.contains("}") else { return nil }
-                if !literal.isEmpty { parts.append(.literal(literal)) }
-                cursor = pattern.endIndex
-                break
-            }
-
-            let literal = String(pattern[cursor..<open])
-            guard !literal.contains("}") else { return nil }
-            if !literal.isEmpty { parts.append(.literal(literal)) }
-
-            let bodyStart = pattern.index(after: open)
-            guard let close = pattern[bodyStart...].firstIndex(of: "}") else { return nil }
-            let body = String(pattern[bodyStart..<close])
-            let optional = body.hasSuffix("?")
-            let keyBody = optional ? String(body.dropLast()) : body
-            let keys = keyBody.split(separator: "|", omittingEmptySubsequences: false).map(String.init)
-            let allowed = Set(["type", "shape", "tmdb_id", "imdb_id"])
-            guard !keys.isEmpty,
-                  keys.allSatisfy({ allowed.contains($0) }) else {
-                return nil
-            }
-            containsShape = containsShape || keys.contains("shape")
-            parts.append(.placeholder(keys, optional: optional))
-            cursor = pattern.index(after: close)
+    private static func resolveRPDBWithFallback(
+        pattern: String,
+        ids: ContentIDs,
+        type: String,
+        shape: String
+    ) -> String? {
+        if let direct = resolvePattern(pattern: pattern, ids: ids, type: type, shape: shape) {
+            return direct
         }
 
-        let prepared = PreparedTemplate(parts: parts, containsShape: containsShape)
-        preparedTemplates.setObject(prepared, forKey: rawPattern as NSString)
-        return prepared
+        let typePrefix = type == "movie" ? "movie" : "series"
+        var fallbacks: [String] = []
+
+        if pattern.contains("{imdb_id}") {
+            if let tmdbId = ids.tmdbId, !tmdbId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                fallbacks.append(
+                    pattern
+                        .replacingOccurrences(of: "/imdb/", with: "/tmdb/")
+                        .replacingOccurrences(of: "{imdb_id}", with: "\(typePrefix)-\(tmdbId)")
+                )
+            }
+            if let tvdbId = ids.tvdbId, !tvdbId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                fallbacks.append(
+                    pattern
+                        .replacingOccurrences(of: "/imdb/", with: "/tvdb/")
+                        .replacingOccurrences(of: "{imdb_id}", with: "\(typePrefix)-\(tvdbId)")
+                )
+            }
+        } else if pattern.contains("{tmdb_id}") || pattern.contains("{type}-{tmdb_id}") {
+            if let imdbId = ids.imdbId, !imdbId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                fallbacks.append(
+                    pattern
+                        .replacingOccurrences(of: "/tmdb/", with: "/imdb/")
+                        .replacingOccurrences(of: "\(typePrefix)-{tmdb_id}", with: imdbId)
+                        .replacingOccurrences(of: "{type}-{tmdb_id}", with: imdbId)
+                        .replacingOccurrences(of: "{tmdb_id}", with: imdbId)
+                )
+            }
+            if let tvdbId = ids.tvdbId, !tvdbId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                fallbacks.append(
+                    pattern
+                        .replacingOccurrences(of: "/tmdb/", with: "/tvdb/")
+                        .replacingOccurrences(of: "{tmdb_id}", with: tvdbId)
+                )
+            }
+        } else if pattern.contains("{tvdb_id}") || pattern.contains("{type}-{tvdb_id}") {
+            if let imdbId = ids.imdbId, !imdbId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                fallbacks.append(
+                    pattern
+                        .replacingOccurrences(of: "/tvdb/", with: "/imdb/")
+                        .replacingOccurrences(of: "\(typePrefix)-{tvdb_id}", with: imdbId)
+                        .replacingOccurrences(of: "{type}-{tvdb_id}", with: imdbId)
+                        .replacingOccurrences(of: "{tvdb_id}", with: imdbId)
+                )
+            }
+            if let tmdbId = ids.tmdbId, !tmdbId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                fallbacks.append(
+                    pattern
+                        .replacingOccurrences(of: "/tvdb/", with: "/tmdb/")
+                        .replacingOccurrences(of: "{tvdb_id}", with: tmdbId)
+                )
+            }
+        }
+
+        for fallback in fallbacks {
+            if let resolved = resolvePattern(pattern: fallback, ids: ids, type: type, shape: shape) {
+                return resolved
+            }
+        }
+
+        return nil
     }
 
     private static func namespacedTMDBID(from rawID: String) -> String? {
@@ -2615,7 +2909,9 @@ enum ContinueWatchingStore {
             return
         }
 
+        #if DEBUG
         print("[ContinueWatching][Store] save: meta=\(meta.id), S\(season.map(String.init) ?? "nil")E\(episode.map(String.init) ?? "nil"), pos=\(position)/\(duration)")
+        #endif
 
         // Record the raw row before any display rule runs. A finished episode is
         // not "nothing to store" — it is precisely the seed that produces the
@@ -2644,7 +2940,9 @@ enum ContinueWatchingStore {
         )
 
         guard shouldKeep(position: position, duration: duration) else {
+            #if DEBUG
             print("[ContinueWatching][Store] save: shouldKeep=false (pos=\(position)/dur=\(duration) >= \(WatchProgressLedger.completionFraction)) -> removing from store")
+            #endif
             if let season, let episode {
                 removeEpisodeResumePoint(meta: meta, season: season, episode: episode)
             }
@@ -2677,7 +2975,9 @@ enum ContinueWatchingStore {
             released: existing?.released
         )
         let updated = ([item] + items().filter { $0.meta.id != meta.id }).prefix(maxItems)
+        #if DEBUG
         print("[ContinueWatching][Store] save: persisting \(updated.count) items in store")
+        #endif
         persist(Array(updated))
     }
 
@@ -2695,7 +2995,9 @@ enum ContinueWatchingStore {
         episode: Int? = nil
     ) {
         guard duration.isFinite, duration > 0 else { return }
+        #if DEBUG
         print("[ContinueWatching][Store] markPlaybackCompleted: meta=\(meta.id), S\(season.map(String.init) ?? "nil")E\(episode.map(String.init) ?? "nil"), dur=\(duration)")
+        #endif
         ContinueWatchingDismissStore.clear(contentId: meta.id)
         WatchProgressLedger.upsert(
             WatchProgressRecord(
@@ -2736,7 +3038,9 @@ enum ContinueWatchingStore {
         released: String? = nil,
         seedSeason: Int? = nil
     ) {
+        #if DEBUG
         print("[ContinueWatching][Store] saveUpNext: meta=\(meta.id), S\(season)E\(episode), dur=\(duration)")
+        #endif
         let item = ContinueWatchingItem(
             meta: meta,
             streamUrl: "",
@@ -4334,6 +4638,7 @@ enum CollectionFolderViewMode: String, CaseIterable, Hashable {
 struct NuvioCollection: Decodable, Identifiable, Equatable {
     let id: String
     let title: String
+    let templateID: String?
     var pinToTop: Bool
     /// Tabs vs Rows when browsing a folder inside this collection.
     var viewMode: CollectionFolderViewMode
@@ -4341,7 +4646,7 @@ struct NuvioCollection: Decodable, Identifiable, Equatable {
     var folders: [NuvioCollectionFolder]
 
     enum CodingKeys: String, CodingKey {
-        case id, title, pinToTop, folders, viewMode, showAllTab
+        case id, title, templateID, pinToTop, folders, viewMode, showAllTab
         case pin_to_top, view_mode, show_all_tab
     }
 
@@ -4349,6 +4654,7 @@ struct NuvioCollection: Decodable, Identifiable, Equatable {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         id = try c.decode(String.self, forKey: .id)
         title = try c.decode(String.self, forKey: .title)
+        templateID = try c.decodeIfPresent(String.self, forKey: .templateID)
         pinToTop = try c.decodeIfPresent(Bool.self, forKey: .pinToTop)
             ?? c.decodeIfPresent(Bool.self, forKey: .pin_to_top)
             ?? false
@@ -6740,6 +7046,7 @@ enum WatchedStore {
     private static var cachedSnapshot: WatchedSnapshot?
     private static var cachedSource: TraktWatchProgressSource?
     private static var cachedTraktHistoryVisibility = false
+    private static var cachedAdditionalSources: Set<TraktWatchProgressSource> = []
     private static var cacheGeneration = 0
 
     private enum PersistenceError: LocalizedError {
@@ -6785,6 +7092,7 @@ enum WatchedStore {
         cachedSnapshot = nil
         cachedSource = nil
         cachedTraktHistoryVisibility = false
+        cachedAdditionalSources = []
     }
 
     /// Pre-warms the in-memory cache in the background off the main actor.
@@ -6997,11 +7305,21 @@ enum WatchedStore {
         let currentSource = TraktSettingsStore.watchProgressSource(in: ProfileSettings.current)
         let shouldShowConnectedTraktHistory = currentSource != .trakt
             && RemoteTrackingState.shouldMirrorWatchedHistoryToTrakt(in: ProfileSettings.current)
+        var additionalSources: Set<TraktWatchProgressSource> = []
+        if shouldShowConnectedTraktHistory {
+            additionalSources.insert(.trakt)
+        }
+        for source in TraktWatchProgressSource.allCases where source != currentSource && source != .nuvioSync {
+            if RemoteTrackingState.isScrobbleEnabled(for: source, in: ProfileSettings.current) {
+                additionalSources.insert(source)
+            }
+        }
 
         if cachedKey == key,
            let snapshot = cachedSnapshot,
            cachedSource == currentSource,
-           cachedTraktHistoryVisibility == shouldShowConnectedTraktHistory {
+           cachedTraktHistoryVisibility == shouldShowConnectedTraktHistory,
+           cachedAdditionalSources == additionalSources {
             return snapshot
         }
 
@@ -7009,11 +7327,12 @@ enum WatchedStore {
         let snapshot = WatchedSnapshot(
             items: allItems,
             source: currentSource,
-            additionalVisibleSources: shouldShowConnectedTraktHistory ? [.trakt] : []
+            additionalVisibleSources: additionalSources
         )
         cachedSnapshot = snapshot
         cachedSource = currentSource
         cachedTraktHistoryVisibility = shouldShowConnectedTraktHistory
+        cachedAdditionalSources = additionalSources
         return snapshot
     }
 
@@ -7312,7 +7631,8 @@ enum WatchedStore {
                     )
                 }
             }
-            if TraktSettingsStore.watchProgressSource(in: store) == .wetrakr {
+            if TraktSettingsStore.watchProgressSource(in: store) == .wetrakr
+                || RemoteTrackingState.isScrobbleEnabled(for: .wetrakr, in: store) {
                 for episode in episodes {
                     _ = enqueueSelectedWeTrakrMutation(
                         meta: meta,
@@ -7422,8 +7742,7 @@ enum WatchedStore {
             }
             schedulePendingProviderFlush(.trakt, store: traktStore, profileId: profileId)
         }
-        if source == .simkl,
-           RemoteTrackingState.shouldSyncWatchedHistory(to: .simkl, in: traktStore) {
+        if RemoteTrackingState.shouldSyncWatchedHistory(to: .simkl, in: traktStore) {
             Task {
                 _ = await SimklHistoryService.setWatched(
                     meta,
@@ -7434,8 +7753,7 @@ enum WatchedStore {
                 )
             }
         }
-        if source == .mdblist,
-           RemoteTrackingState.shouldSyncWatchedHistory(to: .mdblist, in: traktStore) {
+        if RemoteTrackingState.shouldSyncWatchedHistory(to: .mdblist, in: traktStore) {
             Task { @MainActor in
                 _ = await MdbListProgressService.setWatched(
                     meta,
@@ -7447,7 +7765,8 @@ enum WatchedStore {
                 )
             }
         }
-        if TraktSettingsStore.watchProgressSource(in: traktStore) == .wetrakr {
+        if TraktSettingsStore.watchProgressSource(in: traktStore) == .wetrakr
+            || RemoteTrackingState.isScrobbleEnabled(for: .wetrakr, in: traktStore) {
             for episode in episodeNumbers.sorted() {
                 _ = enqueueSelectedWeTrakrMutation(
                     meta: meta,
@@ -7707,26 +8026,41 @@ enum WatchedStore {
             return true
         }
 
-        var countsBySource = existing?.watchCountsBySource ?? [:]
-        let priorCount: Int
-        if let storedCount = countsBySource.first(where: {
-            $0.key.caseInsensitiveCompare(sourceKey) == .orderedSame
-        })?.value {
-            priorCount = max(1, storedCount)
-        } else if existing?.pendingPlaybackCompletions.isEmpty == false {
-            priorCount = 0
-        } else if (existing?.sources.isEmpty == true && existing?.watchCountsBySource.isEmpty == true)
-            || existing?.sources.contains(where: {
-                $0.caseInsensitiveCompare(sourceKey) == .orderedSame
-            }) == true {
-            priorCount = 1
-        } else {
-            priorCount = 0
+        var targetSourceKeys: Set<String> = [sourceKey]
+        for activeSource in RemoteTrackingState.activeScrobbleSources(in: settings) {
+            targetSourceKeys.insert(activeSource.rawValue)
         }
-        countsBySource[sourceKey] = priorCount + 1
+        if RemoteTrackingState.isNuvioSyncScrobbleEnabled(in: settings) {
+            targetSourceKeys.insert(TraktWatchProgressSource.nuvioSync.rawValue)
+        }
+        for target in completionTargets {
+            targetSourceKeys.insert(target.provider.rawValue)
+        }
+
+        var countsBySource = existing?.watchCountsBySource ?? [:]
+        for key in targetSourceKeys {
+            let priorCount: Int
+            if let storedCount = countsBySource.first(where: {
+                $0.key.caseInsensitiveCompare(key) == .orderedSame
+            })?.value {
+                priorCount = max(1, storedCount)
+            } else if existing?.pendingPlaybackCompletions.isEmpty == false {
+                priorCount = 0
+            } else if (existing?.sources.isEmpty == true && existing?.watchCountsBySource.isEmpty == true)
+                || existing?.sources.contains(where: {
+                    $0.caseInsensitiveCompare(key) == .orderedSame
+                }) == true {
+                priorCount = 1
+            } else {
+                priorCount = 0
+            }
+            countsBySource[key] = priorCount + 1
+        }
 
         var lastIDsBySource = existing?.lastCountedPlaybackIDsBySource ?? [:]
-        lastIDsBySource[sourceKey] = completionID
+        for key in targetSourceKeys {
+            lastIDsBySource[key] = completionID
+        }
         let watchedAt = Date()
         var pendingCompletions = existing?.pendingPlaybackCompletions ?? []
         for target in completionTargets {
@@ -7747,7 +8081,7 @@ enum WatchedStore {
             watchedAt: watchedAt,
             season: season,
             episode: episode,
-            sources: (existing?.sources ?? []).union([sourceKey]),
+            sources: (existing?.sources ?? []).union(targetSourceKeys),
             watchCountsBySource: countsBySource,
             lastCountedPlaybackIDsBySource: lastIDsBySource,
             pendingPlaybackCompletions: pendingCompletions
@@ -7776,30 +8110,39 @@ enum WatchedStore {
             return value
         }
 
+        func appendTarget(provider: TraktWatchProgressSource, accountID: String?) {
+            guard !targets.contains(where: { $0.provider == provider }) else { return }
+            targets.append((provider, accountID))
+        }
+
         if let capturedAccounts {
             switch selectedSource {
             case .trakt:
-                targets.append((.trakt, capturedAccount(.trakt)))
+                appendTarget(provider: .trakt, accountID: capturedAccount(.trakt))
             case .wetrakr:
-                targets.append((.wetrakr, capturedAccount(.wetrakr)))
+                appendTarget(provider: .wetrakr, accountID: capturedAccount(.wetrakr))
             default:
                 break
             }
-            if selectedSource != .trakt,
-               capturedAccounts.keys.contains(where: {
-                   $0.caseInsensitiveCompare(TraktWatchProgressSource.trakt.rawValue) == .orderedSame
-               }) {
-                targets.append((.trakt, capturedAccount(.trakt)))
+            if capturedAccounts.keys.contains(where: {
+                $0.caseInsensitiveCompare(TraktWatchProgressSource.trakt.rawValue) == .orderedSame
+            }) {
+                appendTarget(provider: .trakt, accountID: capturedAccount(.trakt))
+            }
+            if capturedAccounts.keys.contains(where: {
+                $0.caseInsensitiveCompare(TraktWatchProgressSource.wetrakr.rawValue) == .orderedSame
+            }) {
+                appendTarget(provider: .wetrakr, accountID: capturedAccount(.wetrakr))
             }
         } else {
-            if selectedSource == .trakt {
-                targets.append((.trakt, TraktHistoryService.completionAccountID(in: settings, profileId: profileId)))
-            } else if selectedSource == .wetrakr {
-                targets.append((.wetrakr, currentWeTrakrCompletionAccountID(in: settings, profileId: profileId)))
+            if selectedSource == .trakt
+                || RemoteTrackingState.isScrobbleEnabled(for: .trakt, in: settings)
+                || RemoteTrackingState.shouldMirrorWatchedHistoryToTrakt(in: settings) {
+                appendTarget(provider: .trakt, accountID: TraktHistoryService.completionAccountID(in: settings, profileId: profileId))
             }
-            if selectedSource != .trakt,
-               RemoteTrackingState.shouldMirrorWatchedHistoryToTrakt(in: settings) {
-                targets.append((.trakt, TraktHistoryService.completionAccountID(in: settings, profileId: profileId)))
+            if selectedSource == .wetrakr
+                || RemoteTrackingState.isScrobbleEnabled(for: .wetrakr, in: settings) {
+                appendTarget(provider: .wetrakr, accountID: currentWeTrakrCompletionAccountID(in: settings, profileId: profileId))
             }
         }
         return targets
@@ -7843,10 +8186,11 @@ enum WatchedStore {
         ContinueWatchingStore.removeWatched([item])
         let markedAt = item.watchedAt
         Task { @MainActor in
-            TraktProgressService.forgetLocalPlayback(
+            TraktProgressService.forgetLocalPlaybackForCompletion(
                 meta: meta,
                 season: item.season,
                 episode: item.episode,
+                profileId: profileId,
                 recordedNoLaterThan: markedAt,
                 notify: true
             )
@@ -7858,6 +8202,17 @@ enum WatchedStore {
            }) {
             Task {
                 _ = await TraktHistoryService.flushPendingPlaybackCompletions(
+                    store: traktStore,
+                    profileId: profileId
+                )
+            }
+        }
+        if source != .trakt && source != .wetrakr,
+           item.pendingPlaybackCompletions.contains(where: {
+               $0.provider == TraktWatchProgressSource.wetrakr.rawValue && $0.accountID != nil
+           }) {
+            Task { @MainActor in
+                _ = await WeTrakrProgressService.flushPendingPlaybackCompletions(
                     store: traktStore,
                     profileId: profileId
                 )
@@ -7924,11 +8279,13 @@ enum WatchedStore {
         ContinueWatchingStore.markLedgerWatched(meta: meta, season: season, episode: episode)
         ContinueWatchingStore.removeWatched([item])
         let markedAt = item.watchedAt
+        let completionProfileId = activeProfileId
         Task { @MainActor in
-            TraktProgressService.forgetLocalPlayback(
+            TraktProgressService.forgetLocalPlaybackForCompletion(
                 meta: meta,
                 season: season,
                 episode: episode,
+                profileId: completionProfileId,
                 recordedNoLaterThan: markedAt,
                 notify: true
             )
@@ -7969,7 +8326,8 @@ enum WatchedStore {
                 )
             }
         }
-        if TraktSettingsStore.watchProgressSource(in: traktStore) == .wetrakr {
+        if TraktSettingsStore.watchProgressSource(in: traktStore) == .wetrakr
+            || RemoteTrackingState.isScrobbleEnabled(for: .wetrakr, in: traktStore) {
             _ = enqueueSelectedWeTrakrMutation(
                 meta: meta,
                 season: season,
@@ -8007,21 +8365,24 @@ enum WatchedStore {
     ) -> Set<PlaybackProviderAccountBinding> {
         let selectedSource = TraktSettingsStore.watchProgressSource(in: settings)
         var bindings: Set<PlaybackProviderAccountBinding> = []
-        if selectedSource == .trakt || selectedSource == .wetrakr {
-            let accountID = selectedSource == .trakt
-                ? TraktHistoryService.completionAccountID(in: settings, profileId: profileId)
-                : currentWeTrakrCompletionAccountID(in: settings, profileId: profileId)
-            if let accountID {
-                bindings.insert(PlaybackProviderAccountBinding(provider: selectedSource.rawValue, accountID: accountID))
+        if selectedSource == .trakt
+            || RemoteTrackingState.isScrobbleEnabled(for: .trakt, in: settings)
+            || RemoteTrackingState.shouldMirrorWatchedHistoryToTrakt(in: settings) {
+            if let accountID = TraktHistoryService.completionAccountID(in: settings, profileId: profileId) {
+                bindings.insert(PlaybackProviderAccountBinding(
+                    provider: TraktWatchProgressSource.trakt.rawValue,
+                    accountID: accountID
+                ))
             }
         }
-        if selectedSource != .trakt,
-           RemoteTrackingState.shouldMirrorWatchedHistoryToTrakt(in: settings),
-           let accountID = TraktHistoryService.completionAccountID(in: settings, profileId: profileId) {
-            bindings.insert(PlaybackProviderAccountBinding(
-                provider: TraktWatchProgressSource.trakt.rawValue,
-                accountID: accountID
-            ))
+        if selectedSource == .wetrakr
+            || RemoteTrackingState.isScrobbleEnabled(for: .wetrakr, in: settings) {
+            if let accountID = currentWeTrakrCompletionAccountID(in: settings, profileId: profileId) {
+                bindings.insert(PlaybackProviderAccountBinding(
+                    provider: TraktWatchProgressSource.wetrakr.rawValue,
+                    accountID: accountID
+                ))
+            }
         }
         return bindings
     }
@@ -8205,7 +8566,8 @@ enum WatchedStore {
                 )
             }
         }
-        if TraktSettingsStore.watchProgressSource(in: traktStore) == .wetrakr,
+        if (TraktSettingsStore.watchProgressSource(in: traktStore) == .wetrakr
+            || RemoteTrackingState.isScrobbleEnabled(for: .wetrakr, in: traktStore)),
            enqueueSelectedWeTrakrMutation(
                meta: meta,
                season: season,
@@ -8227,7 +8589,8 @@ enum WatchedStore {
         store: UserDefaults,
         profileId: String?
     ) -> Bool {
-        guard TraktSettingsStore.watchProgressSource(in: store) == .wetrakr,
+        guard TraktSettingsStore.watchProgressSource(in: store) == .wetrakr
+            || RemoteTrackingState.isScrobbleEnabled(for: .wetrakr, in: store),
               !(meta.isSeries && season == nil && episode == nil && !isWatched) else { return false }
         let accountID = currentWeTrakrCompletionAccountID(in: store, profileId: profileId)
         return enqueuePendingProviderMutation(

@@ -17,7 +17,12 @@ struct JellyfinLibraryResolution {
 /// `Series` item supplies a title's display metadata, and each `Episode`
 /// naming that series as its `SeriesId` becomes one of that title's files.
 enum JellyfinLibraryResolver {
-    static func resolve(_ items: [JellyfinMediaItem], serverID: String) -> JellyfinLibraryResolution {
+    static func resolve(
+        _ items: [JellyfinMediaItem],
+        serverID: String,
+        libraryID: String? = nil,
+        libraryName: String? = nil
+    ) -> JellyfinLibraryResolution {
         var titlesByContentId: [String: JellyfinIndexedTitle] = [:]
         var seriesItemIdByJellyfinId: [String: String] = [:]
         var unmatched: [String] = []
@@ -28,6 +33,8 @@ enum JellyfinLibraryResolver {
             titlesByContentId[contentId] = JellyfinIndexedTitle(
                 contentId: contentId,
                 serverID: serverID,
+                libraryID: libraryID,
+                libraryName: libraryName,
                 itemId: item.id,
                 type: "series",
                 name: item.name,
@@ -53,6 +60,8 @@ enum JellyfinLibraryResolver {
             titlesByContentId[contentId] = JellyfinIndexedTitle(
                 contentId: contentId,
                 serverID: serverID,
+                libraryID: libraryID,
+                libraryName: libraryName,
                 itemId: item.id,
                 type: "movie",
                 name: item.name,

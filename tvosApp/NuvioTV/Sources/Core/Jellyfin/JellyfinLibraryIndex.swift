@@ -37,6 +37,10 @@ struct JellyfinIndexedItem: Codable, Equatable {
 struct JellyfinIndexedTitle: Codable, Equatable {
     let contentId: String
     let serverID: String
+    /// Optional for compatibility with titles persisted before Home rows were
+    /// split by library.
+    let libraryID: String?
+    let libraryName: String?
     /// The Jellyfin item id itself (Series id, or the Movie's own id) —
     /// needed to build image URLs, kept explicit rather than re-parsed out
     /// of `contentId`.

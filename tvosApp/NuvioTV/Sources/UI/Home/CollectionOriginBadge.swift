@@ -5,16 +5,15 @@ import UIKit
 struct CollectionOriginBadge: View {
     let origin: CollectionOriginPresentation
     @State private var image: UIImage?
-    @State private var loadedURLs: [String] = []
+    @State private var loadedOrigin: CollectionOriginPresentation?
 
     var body: some View {
         ZStack {
             Circle().fill(Color.black.opacity(0.86))
-            if loadedURLs == origin.imageURLs, let image {
+            if loadedOrigin == origin, let image {
                 Image(uiImage: image)
                     .resizable()
                     .scaledToFit()
-                    .padding(5)
             } else if let emoji = origin.emoji {
                 Text(emoji).font(.system(size: 23))
             } else {
@@ -25,20 +24,21 @@ struct CollectionOriginBadge: View {
         }
         .frame(width: 40, height: 40)
         .clipShape(Circle())
-        .overlay(Circle().strokeBorder(.white.opacity(0.4), lineWidth: 1))
         .shadow(color: .black.opacity(0.35), radius: 3, y: 1)
         .allowsHitTesting(false)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(Text(origin.title))
-        .task(id: origin.imageURLs) {
-            let urls = origin.imageURLs
+        .task(id: origin) {
+            let requested = origin
+            let urls = requested.serviceIcon?.imageURLs ?? requested.imageURLs
             image = nil
-            loadedURLs = urls
+            loadedOrigin = nil
             for value in urls {
                 guard !Task.isCancelled, let url = URL(string: value) else { return }
                 if let loaded = await PosterArtworkCache.shared.image(for: url, maxPixelSize: 160) {
-                    guard !Task.isCancelled, urls == origin.imageURLs else { return }
-                    image = loaded
+                    guard !Task.isCancelled, requested == origin else { return }
+                    image = CollectionIconRenderer.render(loaded, style: requested.serviceIcon, sourceURL: value)
+                    loadedOrigin = requested
                     return
                 }
             }

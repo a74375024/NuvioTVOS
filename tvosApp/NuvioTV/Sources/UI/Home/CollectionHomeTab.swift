@@ -171,16 +171,19 @@ final class CollectionSidebarArtwork: ObservableObject {
         let urls: [String]
         let emoji: String?
         let genre: Genre?
+        let serviceIcon: CollectionServiceIcon?
 
         init(folder: TVCollectionFolderItem) {
             var seen = Set<String>()
-            urls = [folder.preferredTitleLogoURLString, folder.coverImageUrl].compactMap { raw in
+            serviceIcon = CollectionServiceIcon.configured(folder: folder)
+            let configuredURLs = [folder.preferredTitleLogoURLString, folder.coverImageUrl].compactMap { raw -> String? in
                 guard let value = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
                       let url = URL(string: value),
                       ["http", "https"].contains(url.scheme?.lowercased() ?? ""),
                       url.host != nil, seen.insert(value).inserted else { return nil }
                 return value
             }
+            urls = serviceIcon?.imageURLs ?? configuredURLs
             let value = folder.coverEmoji?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             emoji = value.isEmpty ? nil : String(value.prefix(8))
             // Match source IDs and the template's original emoji, not its
@@ -278,40 +281,32 @@ final class CollectionSidebarArtwork: ObservableObject {
             if loadedURLs[id] != nil { continue }
             for value in input.urls {
                 guard let url = URL(string: value) else { continue }
-                do {
-                    let (data, response) = try await URLSession.shared.data(from: url)
-                    guard !Task.isCancelled, loadedInputs[id] == input else { return }
-                    guard let http = response as? HTTPURLResponse,
-                          (200..<300).contains(http.statusCode), data.count <= 4_000_000,
-                          let original = UIImage(data: data) else { continue }
-                    images[id] = Self.render(input: input, artwork: original)
-                    loadedURLs[id] = value
-                    break
-                } catch {
-                    guard !Task.isCancelled else { return }
-                    // Try the cover after a failed logo; retain local artwork
-                    // when both fail. The tab always remains reachable.
-                }
+                let original = await PosterArtworkCache.shared.image(for: url, maxPixelSize: 160)
+                guard !Task.isCancelled, loadedInputs[id] == input else { return }
+                guard let original else { continue }
+                images[id] = Self.render(input: input, artwork: original, sourceURL: value)
+                loadedURLs[id] = value
+                break
             }
         }
     }
 
-    private static func render(input: Input, artwork: UIImage? = nil) -> UIImage {
+    private static func render(input: Input, artwork: UIImage? = nil, sourceURL: String? = nil) -> UIImage {
+        if let artwork {
+            return CollectionIconRenderer.render(artwork, style: input.serviceIcon, sourceURL: sourceURL)
+        }
         let bounds = CGRect(x: 0, y: 0, width: 40, height: 40)
-        return UIGraphicsImageRenderer(size: bounds.size).image { context in
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 4
+        format.opaque = false
+        return UIGraphicsImageRenderer(size: bounds.size, format: format).image { context in
             let circle = UIBezierPath(ovalIn: bounds)
-            // URL artwork gets a neutral backing; genre colors only apply to
-            // the bundled glyphs and must not recolor a user's image.
-            let background = artwork == nil
-                ? (input.genre?.color ?? UIColor(white: 0.18, alpha: 1))
-                : UIColor(white: 0.12, alpha: 1)
+            let background = input.genre?.color ?? UIColor(white: 0.18, alpha: 1)
             background.setFill()
             circle.fill()
             context.cgContext.saveGState()
             circle.addClip()
-            if let artwork {
-                drawFitted(artwork, in: bounds.insetBy(dx: 5, dy: 5))
-            } else if input.genre == nil, let emoji = input.emoji {
+            if input.genre == nil, let emoji = input.emoji {
                 let text = emoji as NSString
                 let attributes: [NSAttributedString.Key: Any] = [.font: UIFont.systemFont(ofSize: 23)]
                 let size = text.size(withAttributes: attributes)

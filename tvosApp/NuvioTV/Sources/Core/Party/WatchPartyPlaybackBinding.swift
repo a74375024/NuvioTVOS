@@ -18,8 +18,19 @@ protocol WatchPartyPlaybackRoom: AnyObject {
     func nowMs() -> Int64
     func observeChanges(_ callback: @escaping @MainActor () -> Void) -> UUID
     func removeChangeObserver(_ id: UUID)
+    func observeNotices(_ callback: @escaping @MainActor (WatchPartyNotice) -> Void) -> UUID
+    func removeNoticeObserver(_ id: UUID)
+    func observeChat(_ callback: @escaping @MainActor (WatchPartyChatMessage) -> Void) -> UUID
+    func removeChatObserver(_ id: UUID)
     func publish(paused: Bool, positionMs: Int64, rate: Float, waiting: Bool) async throws
     func setPresence(status: WatchPartyMemberStatus, mediaKey: String?, behindMs: Int64?) async throws
+}
+
+extension WatchPartyPlaybackRoom {
+    func observeNotices(_ callback: @escaping @MainActor (WatchPartyNotice) -> Void) -> UUID { UUID() }
+    func removeNoticeObserver(_ id: UUID) {}
+    func observeChat(_ callback: @escaping @MainActor (WatchPartyChatMessage) -> Void) -> UUID { UUID() }
+    func removeChatObserver(_ id: UUID) {}
 }
 
 extension WatchPartySession: WatchPartyPlaybackRoom {
@@ -43,6 +54,8 @@ enum WatchPartyPlaybackBindingError: Error, Equatable {
 final class WatchPartyPlaybackBinding {
     var onError: (@MainActor (Error) -> Void)?
     var onNeedsMedia: (@MainActor (String) -> Void)?
+    var onNotice: (@MainActor (WatchPartyNotice) -> Void)?
+    var onChatMessage: (@MainActor (WatchPartyChatMessage) -> Void)?
     private(set) var isBehind = false
     private(set) var behindMs: Int64?
 
@@ -55,6 +68,8 @@ final class WatchPartyPlaybackBinding {
     private let mediaKey: String
     private var state: WatchPartyBindingRoomState
     private var observerID: UUID?
+    private var noticeObserverID: UUID?
+    private var chatObserverID: UUID?
     private var stopped = false
     private var suspended = false
     private var revision = UUID()
@@ -105,6 +120,8 @@ final class WatchPartyPlaybackBinding {
         self.state = state
         roomID = state.roomID; memberID = state.memberID; mediaKey = state.mediaKey
         observerID = room.observeChanges { [weak self] in self?.roomChanged() }
+        noticeObserverID = room.observeNotices { [weak self] in self?.onNotice?($0) }
+        chatObserverID = room.observeChat { [weak self] in self?.onChatMessage?($0) }
         bridge.onSample = { [weak self] in self?.observed($0) }
         if let sample = bridge.sample { observed(sample) }
     }
@@ -123,6 +140,10 @@ final class WatchPartyPlaybackBinding {
         revision = UUID()
         if let observerID { room.removeChangeObserver(observerID) }
         observerID = nil
+        if let noticeObserverID { room.removeNoticeObserver(noticeObserverID) }
+        noticeObserverID = nil
+        if let chatObserverID { room.removeChatObserver(chatObserverID) }
+        chatObserverID = nil
         worker?.cancel(); worker = nil
         presenceWorker?.cancel(); presenceWorker = nil
         bridge.stop()
@@ -442,18 +463,25 @@ final class WatchPartyPlaybackBinding {
     }
 
     /// Called only for an explicit control intent. Observer-driven reconciliation never calls publish.
-    func perform(_ intent: WatchPartyLocalIntent, onApplied: (@MainActor () -> Void)? = nil) async throws {
+    func perform(_ intent: WatchPartyLocalIntent, onApplied: (@MainActor () -> Void)? = nil,
+                 refreshSample: (@MainActor () -> WatchPartyPlayerSample?)? = nil) async throws {
         try Task.checkCancellation()
         if case .pause = intent {
             try await performPause(onApplied: onApplied)
             return
         }
+        switch intent {
+        case .seek, .seekAndPlay:
+            if let refreshSample { try refreshSampleForLocalSeek(refreshSample) }
+        default: break
+        }
         guard active, state.connected, let sample = usableSample() else { throw WatchPartyPlaybackBindingError.notReady }
         guard !localBusy, worker == nil else { throw WatchPartyPlaybackBindingError.busy }
         if case .catchUp = intent {
             guard onApplied == nil else { throw WatchPartyPlaybackBindingError.forbidden }
-            isBehind = false; behindMs = nil; lastApplied = nil
-            reconcile()
+            isBehind = false; behindMs = nil
+            // An explicit catch-up may retry a failed player correction; samples alone may not.
+            retrySynchronization()
             return
         }
         let mark = revision
@@ -509,6 +537,26 @@ final class WatchPartyPlaybackBinding {
             if revision == mark { isBehind = state.canControl ? false : previousBehind }
             throw error
         }
+    }
+
+    /// The last poll may describe an active scrub even after UI commit cleared it.
+    /// Refresh inside local admission so onSample cannot start automatic correction
+    /// ahead of this explicit seek. Never adopt a different source or parked session.
+    private func refreshSampleForLocalSeek(
+        _ read: @MainActor () -> WatchPartyPlayerSample?
+    ) throws {
+        guard active, !suspended, state.connected, room.bindingState == state,
+              let stamp = bridge.sample?.stamp else { throw WatchPartyPlaybackBindingError.notReady }
+        guard !localBusy, worker == nil else { throw WatchPartyPlaybackBindingError.busy }
+        let mark = revision
+        localBusy = true
+        defer { localBusy = false }
+        guard let fresh = read(), fresh.stamp == stamp else {
+            throw WatchPartyPlaybackBindingError.staleOperation
+        }
+        guard admitted(mark, stamp: stamp) else { throw WatchPartyPlaybackBindingError.staleOperation }
+        bridge.observe(fresh)
+        guard admitted(mark, stamp: stamp) else { throw WatchPartyPlaybackBindingError.staleOperation }
     }
 
     private func updatePresence(_ sample: WatchPartyPlayerSample) {

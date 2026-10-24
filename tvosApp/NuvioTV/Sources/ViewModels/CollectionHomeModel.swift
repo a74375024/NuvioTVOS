@@ -18,6 +18,10 @@ struct CollectionHomeDestination: Identifiable, Equatable {
     let id: CollectionHomeID
     let collectionTitle: String
     let folder: TVCollectionFolderItem
+    var templateID: String? = nil
+
+    /// Display only: never rewrite synced folder titles or browsing identity.
+    var sidebarTitle: String { CollectionGenreLocalization.title(for: self) }
 
     /// Classify the folder's configured sources, never the genres attached to
     /// its movie metadata or its editable/localized display name.
@@ -76,7 +80,8 @@ struct CollectionHomeDestination: Identifiable, Equatable {
                         collectionId: collection.id, folder: folder,
                         sources: folder.resolvedSources,
                         viewMode: .followLayout, showAllTab: false
-                    )
+                    ),
+                    templateID: collection.templateID
                 )
             }
         }

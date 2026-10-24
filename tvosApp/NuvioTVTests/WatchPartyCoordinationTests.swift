@@ -3,6 +3,138 @@ import XCTest
 
 @MainActor
 final class WatchPartyCoordinationTests: XCTestCase {
+    func testCatchUpRetriesFailedCorrectionWithoutEchoAndRequiresSeekReceipt() async throws {
+        let room = PlaybackRoom(hostOnly: true, memberID: "me", hostMemberID: "other",
+                                playbackPositionMs: 20_000)
+        let failed = expectation(description: "Initial correction failed")
+        let retryIssued = expectation(description: "Explicit catch-up issued a new seek")
+        var attempts = 0
+        let player = makePlaybackBinding(room: room, positionMs: 0, issueSeek: { _, _ in
+            attempts += 1
+            if attempts == 1 { throw WatchPartyPlayerBridgeError.timedOut }
+            retryIssued.fulfill()
+        })
+        defer { player.binding.stop() }
+        player.binding.onError = { error in
+            XCTAssertEqual(error as? WatchPartyPlayerBridgeError, .timedOut)
+            failed.fulfill()
+        }
+        await fulfillment(of: [failed], timeout: 1)
+        for _ in 0..<100 where player.binding.isSynchronizing { await Task.yield() }
+        XCTAssertFalse(player.binding.isSynchronizing)
+
+        let stamp = try XCTUnwrap(player.bridge.sample?.stamp)
+        player.bridge.observe(WatchPartyPlayerSample(stamp: stamp, positionMs: 0, durationMs: 100_000,
+                                                      rate: 1, paused: true, loading: false, coherent: true,
+                                                      seeking: false))
+        XCTAssertFalse(player.binding.isSynchronizing, "A healthy sample must not automatically retry a failed correction")
+        XCTAssertEqual(player.seekTargets.values, [20_000])
+
+        try await player.binding.perform(.catchUp)
+        await fulfillment(of: [retryIssued], timeout: 1)
+        for _ in 0..<100 where !player.bridge.awaitsSeekSample { await Task.yield() }
+        XCTAssertTrue(player.bridge.awaitsSeekSample, "Catch-up still needs a sample after the seek returns")
+        XCTAssertTrue(player.binding.isSynchronizing)
+        XCTAssertEqual(player.seekTargets.values, [20_000, 20_000])
+        XCTAssertTrue(room.published.isEmpty, "Catch-up must not publish a guest command to a host-only room")
+        do {
+            try await player.binding.perform(.catchUp)
+            XCTFail("A second catch-up must not overlap the active correction")
+        } catch {
+            XCTAssertEqual(error as? WatchPartyPlaybackBindingError, .busy)
+        }
+        XCTAssertEqual(player.seekTargets.values.count, 2)
+
+        player.bridge.observe(WatchPartyPlayerSample(stamp: stamp, positionMs: 20_000, durationMs: 100_000,
+                                                      rate: 1, paused: true, loading: false, coherent: true,
+                                                      seeking: false))
+        for _ in 0..<100 where player.binding.isSynchronizing { await Task.yield() }
+        XCTAssertFalse(player.binding.isSynchronizing)
+        XCTAssertEqual(player.transports.values.last?.paused, false)
+        XCTAssertTrue(room.published.isEmpty, "Recovery applies room state without echo")
+    }
+
+    func testFailedCatchUpRelatchesUntilAnotherExplicitRecovery() async throws {
+        let room = PlaybackRoom(hostOnly: true, memberID: "me", hostMemberID: "other",
+                                playbackPositionMs: 20_000)
+        let firstFailure = expectation(description: "Initial correction failed")
+        let retryFailure = expectation(description: "Explicit catch-up failed")
+        let player = makePlaybackBinding(room: room, positionMs: 0,
+                                         issueSeek: { _, _ in throw WatchPartyPlayerBridgeError.timedOut })
+        defer { player.binding.stop() }
+        var failures = 0
+        player.binding.onError = { error in
+            XCTAssertEqual(error as? WatchPartyPlayerBridgeError, .timedOut)
+            failures += 1
+            if failures == 1 { firstFailure.fulfill() }
+            else if failures == 2 { retryFailure.fulfill() }
+            else { XCTFail("A failure must not start an automatic retry loop") }
+        }
+        await fulfillment(of: [firstFailure], timeout: 1)
+        for _ in 0..<100 where player.binding.isSynchronizing { await Task.yield() }
+        XCTAssertFalse(player.binding.isSynchronizing)
+        let stamp = try XCTUnwrap(player.bridge.sample?.stamp)
+        let healthy = WatchPartyPlayerSample(stamp: stamp, positionMs: 0, durationMs: 100_000,
+                                             rate: 1, paused: true, loading: false, coherent: true,
+                                             seeking: false)
+        player.bridge.observe(healthy)
+        XCTAssertFalse(player.binding.isSynchronizing)
+        try await player.binding.perform(.catchUp)
+        await fulfillment(of: [retryFailure], timeout: 1)
+        for _ in 0..<100 where player.binding.isSynchronizing { await Task.yield() }
+        XCTAssertFalse(player.binding.isSynchronizing)
+        for _ in 0..<3 { player.bridge.observe(healthy) }
+        XCTAssertFalse(player.binding.isSynchronizing, "Another failure must block sample-driven retries again")
+        XCTAssertEqual(player.seekTargets.values, [20_000, 20_000])
+        XCTAssertEqual(failures, 2)
+        XCTAssertTrue(room.published.isEmpty)
+    }
+
+    func testCatchUpRecoveryRetainsReadinessSuspensionAndContextGuards() async throws {
+        let room = PlaybackRoom(hostOnly: true, memberID: "me", hostMemberID: "other",
+                                playbackPositionMs: 20_000)
+        let failed = expectation(description: "Initial correction failed")
+        var contextCurrent = true
+        let player = makePlaybackBinding(room: room, positionMs: 0,
+                                         isCurrent: { contextCurrent },
+                                         issueSeek: { _, _ in throw WatchPartyPlayerBridgeError.timedOut })
+        defer { player.binding.stop() }
+        player.binding.onError = { _ in failed.fulfill() }
+        await fulfillment(of: [failed], timeout: 1)
+        for _ in 0..<100 where player.binding.isSynchronizing { await Task.yield() }
+        XCTAssertFalse(player.binding.isSynchronizing)
+        let stamp = try XCTUnwrap(player.bridge.sample?.stamp)
+        player.bridge.observe(WatchPartyPlayerSample(stamp: stamp, positionMs: 0, durationMs: 0,
+                                                      rate: 1, paused: true, loading: false, coherent: true,
+                                                      seeking: false))
+        do {
+            try await player.binding.perform(.catchUp)
+            XCTFail("An explicit recovery must not bypass unknown duration")
+        } catch {
+            XCTAssertEqual(error as? WatchPartyPlaybackBindingError, .notReady)
+        }
+        player.bridge.observe(WatchPartyPlayerSample(stamp: stamp, positionMs: 0, durationMs: 100_000,
+                                                      rate: 1, paused: true, loading: false, coherent: true,
+                                                      seeking: false))
+        XCTAssertFalse(player.binding.isSynchronizing, "Rejected recovery must leave the automatic retry latch intact")
+        player.binding.setSuspended(true)
+        do {
+            try await player.binding.perform(.catchUp)
+            XCTFail("A suspended player must not recover")
+        } catch {
+            XCTAssertEqual(error as? WatchPartyPlaybackBindingError, .notReady)
+        }
+        contextCurrent = false
+        do {
+            try await player.binding.perform(.catchUp)
+            XCTFail("A stale membership must not recover")
+        } catch {
+            XCTAssertEqual(error as? WatchPartyPlaybackBindingError, .notReady)
+        }
+        XCTAssertEqual(player.seekTargets.values, [20_000])
+        XCTAssertTrue(room.published.isEmpty)
+    }
+
     func testSessionTickPausesForBufferingAndResumesWhenReady() async throws {
         let ticks = Gate(), remote = Remote(), channel = Channel()
         var uptime: TimeInterval = 0
@@ -93,6 +225,115 @@ final class WatchPartyCoordinationTests: XCTestCase {
             XCTAssertEqual(error, .unavailable)
         }
         XCTAssertEqual(channel.stateRequestMemberIDs, ["me"])
+    }
+
+    func testHostResendsActiveStreamOnGuestStateRequest() async throws {
+        let remote = Remote(), channel = Channel()
+        let session = makeSession(remote, channel: channel, uptime: { 0 },
+                                  sleep: { _ in try await Task.sleep(nanoseconds: 3_600_000_000_000) })
+        defer { session.stop() }
+        try await session.start(snapshot: remote.snapshot)
+        let source = WatchPartyStream(mediaKey: "movie|tt1||", url: "https://example.test/host_stream.mp4")
+        let consent = try session.approveStreamSharing(source, origin: .directHTTP)
+        try await session.shareStream(source, consent: consent)
+
+        XCTAssertTrue(session.isSharingStream)
+        XCTAssertEqual(session.activeHostStream, source)
+        XCTAssertEqual(channel.streamMessages.count, 1)
+        XCTAssertEqual(channel.streamMessages[0].memberID, "me")
+        XCTAssertEqual(channel.streamMessages[0].stream?.url, source.url)
+
+        let resendExpectation = expectation(description: "Host resends stream on state_request")
+        channel.onStreamMessage = { msg in
+            if msg.stream?.url == source.url { resendExpectation.fulfill() }
+        }
+
+        // Simulate guest sending state_request
+        let payload = try JSONEncoder().encode(["member_id": "other"])
+        channel.receive?(.message(name: "state_request", payload: payload))
+
+        await fulfillment(of: [resendExpectation], timeout: 1)
+        XCTAssertEqual(channel.streamMessages.count, 2)
+        XCTAssertEqual(channel.streamMessages[1].memberID, "me")
+        XCTAssertEqual(channel.streamMessages[1].stream, source)
+    }
+
+    func testHostDoesNotResendStreamAfterStopSharing() async throws {
+        let remote = Remote(), channel = Channel()
+        let session = makeSession(remote, channel: channel, uptime: { 0 },
+                                  sleep: { _ in try await Task.sleep(nanoseconds: 3_600_000_000_000) })
+        defer { session.stop() }
+        try await session.start(snapshot: remote.snapshot)
+        let source = WatchPartyStream(mediaKey: "movie|tt1||", url: "https://example.test/host_stream.mp4")
+        let consent = try session.approveStreamSharing(source, origin: .directHTTP)
+        try await session.shareStream(source, consent: consent)
+        XCTAssertEqual(channel.streamMessages.count, 1)
+
+        try await session.stopSharingStream()
+        XCTAssertFalse(session.isSharingStream)
+        XCTAssertNil(session.activeHostStream)
+        XCTAssertEqual(channel.streamMessages.count, 2)
+        XCTAssertNil(channel.streamMessages[1].stream)
+
+        let payload = try JSONEncoder().encode(["member_id": "other"])
+        channel.receive?(.message(name: "state_request", payload: payload))
+
+        for _ in 0..<10 { await Task.yield() }
+        XCTAssertEqual(channel.streamMessages.count, 2, "No stream message should be sent after stopSharingStream")
+    }
+
+    func testIncomingChatMessageNotifiesObservers() async throws {
+        XCTAssertTrue(WatchPartyChannelContract.events.contains("chat"), "Realtime channel contract must include chat")
+
+        let remote = Remote(), channel = Channel()
+        let session = makeSession(remote, channel: channel, uptime: { 0 },
+                                  sleep: { _ in try await Task.sleep(nanoseconds: 3_600_000_000_000) })
+        defer { session.stop() }
+        try await session.start(snapshot: remote.snapshot)
+
+        var receivedMessage: WatchPartyChatMessage?
+        let observerID = session.observeChat { msg in
+            receivedMessage = msg
+        }
+        defer { session.removeChatObserver(observerID) }
+
+        // 1. Message from another member with valid body should notify observer
+        let chatMsg = WatchPartyChatMessage(id: 101, memberID: "other", name: "Alice", avatarURL: nil, avatarColor: "#FF0000", body: "Hello room!")
+        let chatPayload = try JSONEncoder().encode(chatMsg)
+        channel.receive?(.message(name: "chat", payload: chatPayload))
+        XCTAssertEqual(receivedMessage?.body, "Hello room!")
+        XCTAssertEqual(receivedMessage?.name, "Alice")
+        XCTAssertEqual(receivedMessage?.memberID, "other")
+
+        // 2. Message from self should be ignored
+        receivedMessage = nil
+        let ownMsg = WatchPartyChatMessage(id: 102, memberID: "me", name: "Me", body: "My own message")
+        let ownPayload = try JSONEncoder().encode(ownMsg)
+        channel.receive?(.message(name: "chat", payload: ownPayload))
+        XCTAssertNil(receivedMessage)
+
+        // 3. Message marked mine = true should be ignored
+        receivedMessage = nil
+        let mineMsg = WatchPartyChatMessage(id: 103, memberID: "other", body: "Flagged mine", mine: true)
+        let minePayload = try JSONEncoder().encode(mineMsg)
+        channel.receive?(.message(name: "chat", payload: minePayload))
+        XCTAssertNil(receivedMessage)
+
+        // 4. Blank message should be ignored
+        let blankMsg = WatchPartyChatMessage(id: 104, memberID: "other", body: "   ")
+        let blankPayload = try JSONEncoder().encode(blankMsg)
+        channel.receive?(.message(name: "chat", payload: blankPayload))
+        XCTAssertNil(receivedMessage)
+
+        // 5. Message with string id and sent_at, missing name enriches from known member
+        receivedMessage = nil
+        let jsonString = #"{"id":"999","member_id":"other","body":"Resilient test","sent_at":"1700000000"}"#
+        channel.receive?(.message(name: "chat", payload: Data(jsonString.utf8)))
+        XCTAssertEqual(receivedMessage?.body, "Resilient test")
+        XCTAssertEqual(receivedMessage?.id, 999)
+        XCTAssertEqual(receivedMessage?.sentAt, 1_700_000_000)
+        // remote.snapshot has member "other" with displayName "Other"
+        XCTAssertEqual(receivedMessage?.name, "Other")
     }
 
     func testGuestAcceptsOnlyCurrentHostStreamAndRevocationInvalidatesSelection() async throws {
@@ -349,6 +590,153 @@ final class WatchPartyCoordinationTests: XCTestCase {
         XCTAssertEqual(pauseCount, 0)
     }
 
+    func testCommittedSeekRefreshesScrubSampleWithoutStartingRemoteCorrection() async throws {
+        let issued = expectation(description: "Explicit seek issued")
+        let room = PlaybackRoom(hostOnly: true, memberID: "me", hostMemberID: "me",
+                                playbackPositionMs: 0)
+        let player = makePlaybackBinding(room: room, positionMs: 1_000, loading: true,
+            issueSeek: { target, _ in
+                XCTAssertEqual(target, 2_000, "Fresh sample must not launch correction to room position first")
+                issued.fulfill()
+            })
+        defer { player.binding.stop() }
+        let old = try XCTUnwrap(player.bridge.sample)
+        let fresh = refreshedSeekSample(old, positionMs: 1_000, loading: false)
+        let task = Task { try await player.binding.perform(.seek(2_000), refreshSample: { fresh }) }
+        defer { task.cancel() }
+        await fulfillment(of: [issued], timeout: 1)
+        for _ in 0..<100 {
+            if player.bridge.awaitsSeekSample { break }
+            await Task.yield()
+        }
+        XCTAssertTrue(player.bridge.awaitsSeekSample)
+        XCTAssertTrue(room.published.isEmpty, "Issuing the seek is not a confirmed position")
+        player.bridge.observe(refreshedSeekSample(fresh, positionMs: 2_000, loading: false))
+        try await task.value
+        XCTAssertEqual(player.seekTargets.values, [2_000])
+        XCTAssertEqual(room.published.count, 1)
+        XCTAssertEqual(room.published.first?.positionMs, 2_000)
+    }
+
+    func testFreshSampleDoesNotMakeAnActiveGestureSeekReady() async throws {
+        let room = PlaybackRoom(hostOnly: true, memberID: "me", hostMemberID: "me", playbackPositionMs: 0)
+        let player = makePlaybackBinding(room: room, positionMs: 0, loading: true)
+        defer { player.binding.stop() }
+        let fresh = try XCTUnwrap(player.bridge.sample)
+        do {
+            try await player.binding.perform(.seek(2_000), refreshSample: { fresh })
+            XCTFail("An ongoing gesture must remain blocked")
+        } catch { XCTAssertEqual(error as? WatchPartyPlaybackBindingError, .notReady) }
+        XCTAssertTrue(player.seekTargets.values.isEmpty)
+        XCTAssertTrue(room.published.isEmpty)
+    }
+
+    func testFreshSampleStillRequiresKnownDuration() async throws {
+        let room = PlaybackRoom(hostOnly: true, memberID: "me", hostMemberID: "me", playbackPositionMs: 0)
+        let player = makePlaybackBinding(room: room, positionMs: 0, durationMs: 0, loading: true)
+        defer { player.binding.stop() }
+        let old = try XCTUnwrap(player.bridge.sample)
+        let fresh = refreshedSeekSample(old, positionMs: 0, loading: false)
+        do {
+            try await player.binding.perform(.seek(2_000), refreshSample: { fresh })
+            XCTFail("Unknown duration must not authorize a seek")
+        } catch { XCTAssertEqual(error as? WatchPartyPlaybackBindingError, .notReady) }
+        XCTAssertTrue(player.seekTargets.values.isEmpty)
+        XCTAssertTrue(room.published.isEmpty)
+    }
+
+    func testFreshSampleCannotAdoptAnotherLoad() async throws {
+        let room = PlaybackRoom(hostOnly: true, memberID: "me", hostMemberID: "me", playbackPositionMs: 0)
+        let player = makePlaybackBinding(room: room, positionMs: 0, loading: true)
+        defer { player.binding.stop() }
+        let old = try XCTUnwrap(player.bridge.sample)
+        let stamp = WatchPartyPlayerStamp(generation: old.stamp.generation + 1,
+                                         engineID: old.stamp.engineID, mediaKey: old.stamp.mediaKey)
+        let fresh = refreshedSeekSample(old, positionMs: 0, loading: false, stamp: stamp)
+        do {
+            try await player.binding.perform(.seek(2_000), refreshSample: { fresh })
+            XCTFail("A source replacement must not be adopted by the pending gesture")
+        } catch { XCTAssertEqual(error as? WatchPartyPlaybackBindingError, .staleOperation) }
+        XCTAssertEqual(player.bridge.sample, old)
+        XCTAssertTrue(player.seekTargets.values.isEmpty)
+        XCTAssertTrue(room.published.isEmpty)
+    }
+
+    func testContextLossDuringFreshSampleReadRejectsSeek() async throws {
+        var current = true
+        let room = PlaybackRoom(hostOnly: true, memberID: "me", hostMemberID: "me", playbackPositionMs: 0)
+        let player = makePlaybackBinding(room: room, positionMs: 0, loading: true, isCurrent: { current })
+        defer { player.binding.stop() }
+        let old = try XCTUnwrap(player.bridge.sample)
+        let fresh = refreshedSeekSample(old, positionMs: 0, loading: false)
+        do {
+            try await player.binding.perform(.seek(2_000), refreshSample: {
+                current = false
+                return fresh
+            })
+            XCTFail("Context revoked during refresh must reject the gesture")
+        } catch { XCTAssertEqual(error as? WatchPartyPlaybackBindingError, .staleOperation) }
+        XCTAssertTrue(player.seekTargets.values.isEmpty)
+        XCTAssertTrue(room.published.isEmpty)
+    }
+
+    func testPauseDoesNotReadSeekRefreshProvider() async throws {
+        let room = PlaybackRoom(hostOnly: true, memberID: "me", hostMemberID: "me", playbackPositionMs: 0)
+        let player = makePlaybackBinding(room: room, positionMs: 0, durationMs: 0,
+                                        seeking: true, loading: true, coherent: false)
+        defer { player.binding.stop() }
+        try await player.binding.perform(.pause, refreshSample: {
+            XCTFail("Pause must remain independent of seek readiness")
+            return nil
+        })
+        XCTAssertEqual(room.published.count, 1)
+        XCTAssertTrue(room.published[0].paused)
+    }
+
+    private func refreshedSeekSample(
+        _ old: WatchPartyPlayerSample, positionMs: Int64, loading: Bool,
+        stamp: WatchPartyPlayerStamp? = nil
+    ) -> WatchPartyPlayerSample {
+        WatchPartyPlayerSample(stamp: stamp ?? old.stamp, positionMs: positionMs,
+            durationMs: old.durationMs, rate: old.rate, paused: old.paused,
+            loading: loading, coherent: old.coherent, seeking: old.seeking,
+            rendered: old.rendered, failed: old.failed)
+    }
+
+    func testRemotePlaybackAndMemberChangesEmitNotices() async throws {
+        let remote = Remote(), channel = Channel()
+        let session = makeSession(remote, channel: channel, uptime: { 0 },
+                                  sleep: { _ in try await Task.sleep(nanoseconds: 3_600_000_000_000) })
+        defer { session.stop() }
+        var notices: [WatchPartyNotice] = []
+        let observerID = session.observeNotices { notices.append($0) }
+        defer { session.removeNoticeObserver(observerID) }
+
+        try await session.start(snapshot: remote.snapshot)
+        XCTAssertEqual(notices, [], "Initial snapshot should not emit notices")
+
+        // Remote member pauses
+        channel.receive?(.message(name: "state", payload: Data(#"{"seq":2,"member_id":"other","paused":true,"position_ms":1000,"at":20000,"media_key":"movie|tt1||","waiting":false}"#.utf8)))
+        XCTAssertEqual(notices.last?.message, "Other paused")
+        XCTAssertEqual(notices.last?.avatarURL, "https://example.com/avatar.jpg")
+        XCTAssertEqual(notices.last?.avatarColor, "#FF5500")
+        XCTAssertEqual(notices.last?.initials, "O")
+
+        // Remote member resumes
+        channel.receive?(.message(name: "state", payload: Data(#"{"seq":3,"member_id":"other","paused":false,"position_ms":1000,"at":20000,"media_key":"movie|tt1||","waiting":false}"#.utf8)))
+        XCTAssertEqual(notices.last?.message, "Other resumed")
+        XCTAssertEqual(notices.last?.avatarURL, "https://example.com/avatar.jpg")
+        XCTAssertEqual(notices.last?.avatarColor, "#FF5500")
+        XCTAssertEqual(notices.last?.initials, "O")
+
+        // Remote member leaves
+        channel.receive?(.message(name: "member_left", payload: Data(#"{"member_id":"other","reason":"left"}"#.utf8)))
+        XCTAssertEqual(notices.last?.message, "Other left the watch party")
+        XCTAssertEqual(notices.last?.avatarURL, "https://example.com/avatar.jpg")
+        XCTAssertEqual(notices.last?.avatarColor, "#FF5500")
+        XCTAssertEqual(notices.last?.initials, "O")
+    }
+
     private func makePlaybackBinding(room: PlaybackRoom, positionMs: Int64,
                                      durationMs: Int64 = 100_000, seeking: Bool = false,
                                      sampleRate: Float = 1,
@@ -477,6 +865,8 @@ final class WatchPartyCoordinationTests: XCTestCase {
         var states: [WatchPartyPlayback] = []
         var stateRequestMemberIDs: [String] = []
         var failStateRequest = false
+        var streamMessages: [WatchPartyStreamMessage] = []
+        var onStreamMessage: ((WatchPartyStreamMessage) -> Void)?
         func open(partyID: String, memberID: String, receive: @escaping @MainActor (WatchPartyChannelEvent) -> Void) async throws {
             isConnected = true; self.receive = receive
         }
@@ -490,6 +880,11 @@ final class WatchPartyCoordinationTests: XCTestCase {
                 let state = try JSONDecoder().decode(WatchPartyPlayback.self, from: payload)
                 states.append(state); onState?(state)
             }
+            if event == "stream" {
+                let msg = try JSONDecoder().decode(WatchPartyStreamMessage.self, from: payload)
+                streamMessages.append(msg)
+                onStreamMessage?(msg)
+            }
         }
         func track(_ presence: WatchPartyPresence) async throws {}
         func refreshAuth() async throws {}
@@ -502,11 +897,15 @@ final class WatchPartyCoordinationTests: XCTestCase {
         var failClockCall: Int?
         var onClock: ((Int) -> Void)?
         var hostMemberID = "me"
+        var members = [
+            WatchPartyMember(id: "me", displayName: "Me"),
+            WatchPartyMember(id: "other", displayName: "Other", avatarURL: "https://example.com/avatar.jpg", avatarColor: "#FF5500")
+        ]
         var snapshot: WatchPartySnapshot {
             let media = WatchPartyMedia(type: "movie", metaID: "tt1", metaType: "movie")
             let state = WatchPartyPlayback(seq: 1, memberID: "me", paused: false, positionMs: 1_000, at: 20_000, mediaKey: media.key)
             return WatchPartySnapshot(party: WatchPartyInfo(id: "room", code: "ABC234", hostMemberID: hostMemberID, media: media, playback: state),
-                                      members: [WatchPartyMember(id: "me", displayName: "Me"), WatchPartyMember(id: "other", displayName: "Other")], memberID: "me")
+                                      members: members, memberID: "me")
         }
         func heartbeat(partyID: String, deviceID: String) async throws -> WatchPartySnapshot { snapshot }
         func clock() async throws -> Int64 {

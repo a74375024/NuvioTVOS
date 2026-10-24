@@ -6,11 +6,12 @@ struct CollectionOriginReference: Codable, Equatable, Hashable {
     let folderID: String
 }
 
-struct CollectionOriginPresentation: Equatable {
+struct CollectionOriginPresentation: Equatable, Hashable {
     let reference: CollectionOriginReference
     let title: String
     let imageURLs: [String]
     let emoji: String?
+    var serviceIcon: CollectionServiceIcon? = nil
 
     static func service(folder: TVCollectionFolderItem) -> Self? {
         let style = folder.presentationStyle?.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
@@ -36,7 +37,8 @@ struct CollectionOriginPresentation: Equatable {
         return Self(
             reference: CollectionOriginReference(collectionID: folder.collectionId, folderID: folder.folderId),
             title: folder.title, imageURLs: urls,
-            emoji: folder.coverEmoji.flatMap { $0.isEmpty ? nil : String($0.prefix(8)) }
+            emoji: folder.coverEmoji.flatMap { $0.isEmpty ? nil : String($0.prefix(8)) },
+            serviceIcon: CollectionServiceIcon.configured(folder: folder)
         )
     }
 

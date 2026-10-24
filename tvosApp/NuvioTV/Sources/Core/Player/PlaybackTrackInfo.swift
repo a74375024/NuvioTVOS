@@ -12,6 +12,8 @@ struct PlaybackTrackInfo: Equatable {
     /// mpv `external-filename` — the URL a `sub-add`ed track was loaded from,
     /// empty for tracks embedded in the container.
     let externalFilename: String
+    /// Container/backend forced disposition for subtitle tracks.
+    var isForced: Bool = false
     /// A system-rendered track sits outside Nuvio's subtitle overlay, so custom
     /// timing and appearance require a compatibility-renderer handoff.
     var isNativelyRenderedSubtitle: Bool = false

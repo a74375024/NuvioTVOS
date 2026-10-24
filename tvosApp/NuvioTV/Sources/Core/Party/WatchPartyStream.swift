@@ -103,7 +103,7 @@ enum WatchPartySharedSourceNotice {
         let raw = hostName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let name = raw.isEmpty ? "The host" : String(raw.prefix(48))
         if let stream, stream.mediaKey == mediaKey {
-            return "\(name) shared a source (Beta). Direct playback from the host's link is not available on Apple TV yet."
+            return "\(name) shared a source (Beta). Select Use host's source to try it, or choose your own source. Provider restrictions may apply."
         }
         return "No shared source available right now. If \(name) already shared a link, ask them to share it again. Or choose your own source."
     }

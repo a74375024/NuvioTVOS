@@ -483,4 +483,93 @@ final class SceneNavigationTests: XCTestCase {
             rssMb: 0
         )
     }
+
+    func testSceneUpNextEpisodePlayabilityAndReleasePolicy() {
+        let coordinator = SceneCoordinator(
+            frameProvider: UnsupportedSceneFrameProvider()
+        )
+        let sceneVM = SceneViewModel(coordinator: coordinator)
+
+        let airedEpisode = NuvioVideo(
+            id: "ep1",
+            title: "Aired Episode",
+            season: 1,
+            episode: 2,
+            released: "2020-01-01T00:00:00Z"
+        )
+        let unreleasedEpisode = NuvioVideo(
+            id: "ep2",
+            title: "Future Episode",
+            season: 1,
+            episode: 3,
+            released: "2099-01-01T00:00:00Z"
+        )
+
+        XCTAssertTrue(EpisodeReleasePolicy.hasAired(airedEpisode.released))
+        XCTAssertFalse(EpisodeReleasePolicy.hasAired(unreleasedEpisode.released))
+
+        sceneVM.setMetadata(
+            title: "Test Show",
+            year: 2026,
+            overview: "Overview",
+            runtime: "45m",
+            nextEpisode: airedEpisode
+        )
+        XCTAssertEqual(sceneVM.nextEpisode?.id, "ep1")
+        XCTAssertTrue(sceneVM.availableTabs.contains(.upNext))
+
+        sceneVM.setMetadata(
+            title: "Test Show",
+            year: 2026,
+            overview: "Overview",
+            runtime: "45m",
+            nextEpisode: unreleasedEpisode
+        )
+        XCTAssertEqual(sceneVM.nextEpisode?.id, "ep2")
+        XCTAssertTrue(sceneVM.availableTabs.contains(.upNext))
+
+        let panelView = ScenePanelView(
+            viewModel: sceneVM,
+            isAdvancing: true,
+            onDismiss: {},
+            onPlayNextEpisode: {}
+        )
+        XCTAssertTrue(panelView.isAdvancing)
+    }
+
+    func testPlayerAdvanceGuardsAgainstUnreleasedEpisode() {
+        let viewModel = PlayerViewModel()
+        defer { viewModel.shutdown() }
+
+        let currentEpisode = NuvioVideo(
+            id: "ep-current",
+            title: "Current Episode",
+            season: 1,
+            episode: 1,
+            released: "2020-01-01T00:00:00Z"
+        )
+        let unreleasedEpisode = NuvioVideo(
+            id: "ep-future",
+            title: "Future Episode",
+            season: 1,
+            episode: 2,
+            released: "2099-01-01T00:00:00Z"
+        )
+
+        viewModel.configureNextEpisode(
+            episodes: [currentEpisode, unreleasedEpisode],
+            current: currentEpisode,
+            autoPlayEnabled: true,
+            autoPlayCountdownSeconds: 10,
+            resolver: { _, _ in nil }
+        )
+
+        XCTAssertEqual(viewModel.nextEpisode?.id, unreleasedEpisode.id)
+        XCTAssertFalse(EpisodeReleasePolicy.hasAired(unreleasedEpisode.released))
+
+        viewModel.playNextEpisode()
+
+        XCTAssertFalse(viewModel.isAdvancingEpisode, "playNextEpisode must not proceed when episode has not aired")
+    }
 }
+

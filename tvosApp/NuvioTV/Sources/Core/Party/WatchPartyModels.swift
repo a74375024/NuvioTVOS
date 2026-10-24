@@ -114,6 +114,64 @@ struct WatchPartyMember: Codable, Equatable, Sendable {
     }
 }
 
+struct WatchPartyNotice: Equatable, Sendable {
+    var message: String
+    var avatarURL: String? = nil
+    var avatarColor: String? = nil
+    var initials: String? = nil
+}
+
+struct WatchPartyChatMessage: Codable, Equatable, Sendable {
+    var id: Int64? = nil
+    var memberID: String
+    var name: String? = nil
+    var avatarURL: String? = nil
+    var avatarColor: String? = nil
+    var body: String
+    var clientID: String? = nil
+    var sentAt: Int64? = nil
+    var mine: Bool? = nil
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case memberID = "member_id"
+        case name
+        case avatarURL = "avatar_url"
+        case avatarColor = "avatar_color"
+        case body
+        case clientID = "client_id"
+        case sentAt = "sent_at"
+        case mine
+    }
+}
+
+extension WatchPartyChatMessage {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if let intVal = try? c.decode(Int64.self, forKey: .id) {
+            id = intVal
+        } else if let strVal = try? c.decode(String.self, forKey: .id), let intVal = Int64(strVal) {
+            id = intVal
+        } else {
+            id = nil
+        }
+        memberID = (try? c.decode(String.self, forKey: .memberID)) ?? ""
+        name = try? c.decodeIfPresent(String.self, forKey: .name)
+        avatarURL = try? c.decodeIfPresent(String.self, forKey: .avatarURL)
+        avatarColor = try? c.decodeIfPresent(String.self, forKey: .avatarColor)
+        body = (try? c.decode(String.self, forKey: .body)) ?? ""
+        clientID = try? c.decodeIfPresent(String.self, forKey: .clientID)
+        if let intVal = try? c.decode(Int64.self, forKey: .sentAt) {
+            sentAt = intVal
+        } else if let strVal = try? c.decode(String.self, forKey: .sentAt), let intVal = Int64(strVal) {
+            sentAt = intVal
+        } else {
+            sentAt = nil
+        }
+        mine = try? c.decodeIfPresent(Bool.self, forKey: .mine)
+    }
+}
+
 enum WatchPartyMemberStatus: String, Codable, Sendable {
     case browsing, loading, buffering, ready, behind
 }

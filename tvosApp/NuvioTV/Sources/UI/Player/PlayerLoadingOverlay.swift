@@ -9,6 +9,16 @@ import SwiftUI
 
 // MARK: - Playback Startup Benchmark & Timing
 
+#if DEBUG
+@inline(__always)
+private func startupBenchmarkLog(_ message: @autoclosure () -> String) {
+    print(message())
+}
+#else
+@inline(__always)
+private func startupBenchmarkLog(_ message: @autoclosure () -> String) {}
+#endif
+
 @MainActor
 final class PlaybackStartupBenchmark {
     static let shared = PlaybackStartupBenchmark()
@@ -52,7 +62,7 @@ final class PlaybackStartupBenchmark {
         self.t_displayPrepared = nil
         self.t_sessionConstructed = nil
         let target = title.isEmpty ? "playback" : "\"\(title)\""
-        print("[StartupBenchmark] ⏱ [0/3] Started startup timer for \(target)")
+        startupBenchmarkLog("[StartupBenchmark] ⏱ [0/3] Started startup timer for \(target)")
         return token
     }
 
@@ -64,7 +74,7 @@ final class PlaybackStartupBenchmark {
         self.addonName = stream.addonName ?? "Unknown"
         let pickDuration = now.timeIntervalSince(t0)
         let cleanName = streamName.replacingOccurrences(of: "\n", with: " ")
-        print("[StartupBenchmark] 🔍 [1/3] Source picked in \(String(format: "%.3fs", pickDuration)) (\(addonName) · \(cleanName))")
+        startupBenchmarkLog("[StartupBenchmark] 🔍 [1/3] Source picked in \(String(format: "%.3fs", pickDuration)) (\(addonName) · \(cleanName))")
     }
 
     func markDebridResolved(token: UUID?) {
@@ -73,7 +83,7 @@ final class PlaybackStartupBenchmark {
         self.t2_debridResolved = now
         let debridDuration = now.timeIntervalSince(t1)
         let totalSoFar = now.timeIntervalSince(t0_initiated ?? t1)
-        print("[StartupBenchmark] ⚡️ [2/3] Debrid link resolved in \(String(format: "%.3fs", debridDuration)) (elapsed: \(String(format: "%.3fs", totalSoFar)))")
+        startupBenchmarkLog("[StartupBenchmark] ⚡️ [2/3] Debrid link resolved in \(String(format: "%.3fs", debridDuration)) (elapsed: \(String(format: "%.3fs", totalSoFar)))")
     }
 
     func markEngineCheckpoint(_ name: String, token: UUID?) {
@@ -103,6 +113,7 @@ final class PlaybackStartupBenchmark {
         self.activeToken = nil
 
         let totalDuration = now.timeIntervalSince(t0)
+#if DEBUG
         let pickDuration = t1_sourcePicked.map { $0.timeIntervalSince(t0) }
         let debridDuration: Double = {
             if let t2 = t2_debridResolved, let t1 = t1_sourcePicked {
@@ -192,12 +203,13 @@ final class PlaybackStartupBenchmark {
         lines.append("============================================================\n")
 
         print(lines.joined(separator: "\n"))
+#endif
         return totalDuration
     }
 
     func cancel(token: UUID?) {
         guard owns(token) else { return }
-        print("[StartupBenchmark] ❌ Startup timer cancelled")
+        startupBenchmarkLog("[StartupBenchmark] ❌ Startup timer cancelled")
         activeToken = nil
         t0_initiated = nil
         t1_sourcePicked = nil
@@ -269,6 +281,9 @@ struct PlayerLoadingOverlay: View {
     var startTime: Date? = nil
     var showTimer: Bool = true
     var onDismiss: (() -> Void)? = nil
+    var focusEnabled: Bool = true
+    var onSelect: (() -> Void)? = nil
+    var onMove: ((MoveCommandDirection) -> Void)? = nil
 
     @AppStorage(SettingsKey.showLoadingStatus) private var showLoadingStatus = true
     @FocusState private var isFocusActive: Bool
@@ -286,8 +301,19 @@ struct PlayerLoadingOverlay: View {
             #if os(tvOS)
             Color.clear
                 .frame(width: 1, height: 1)
-                .focusable(true)
+                .contentShape(Rectangle())
+                .focusable(focusEnabled)
                 .focused($isFocusActive)
+                .onTapGesture {
+                    if focusEnabled {
+                        onSelect?()
+                    }
+                }
+                .onMoveCommand { direction in
+                    if focusEnabled {
+                        onMove?(direction)
+                    }
+                }
             #endif
 
             // 1. Solid Black Base
@@ -449,17 +475,28 @@ struct PlayerLoadingOverlay: View {
         .ignoresSafeArea()
         #if os(tvOS)
         .onExitCommand {
-            onDismiss?()
+            if focusEnabled {
+                onDismiss?()
+            }
         }
         #endif
         .onAppear {
             isPulsing = true
             #if os(tvOS)
             DispatchQueue.main.async {
-                isFocusActive = true
+                isFocusActive = focusEnabled
             }
             #endif
         }
+        #if os(tvOS)
+        .onChange(of: focusEnabled) { _, enabled in
+            if enabled {
+                DispatchQueue.main.async { isFocusActive = focusEnabled }
+            } else {
+                isFocusActive = false
+            }
+        }
+        #endif
     }
 
     @ViewBuilder

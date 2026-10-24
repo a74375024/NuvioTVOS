@@ -48,22 +48,22 @@ Download the latest Apple TV `.ipa` from [Releases](https://github.com/bobsupra/
 ## Latest tvOS Beta
 
 <!-- BEGIN LATEST_BETA -->
-**Beta 3.4.5** is the latest tvOS release.
+**Beta 3.4.7** is the latest tvOS release.
 
-[Quick download (.ipa)](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.4.5/NuvioTV-3.4.5-unsigned-release.ipa) · [Read the release notes](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.4.5) · [Report a bug or suggest an idea](https://github.com/bobsupra/NuvioTVOS/issues/new/choose)
+[Quick download (.ipa)](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.4.7/NuvioTV-3.4.7-unsigned-release.ipa) · [Read the release notes](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.4.7) · [Report a bug or suggest an idea](https://github.com/bobsupra/NuvioTVOS/issues/new/choose)
 <!-- END LATEST_BETA -->
 
-> 🎉 **Thank you for 200+ GitHub Stars!** A huge thank you to everyone in the community for supporting NuvioTVOS and helping us reach 200+ stars!
+> 🎉 **Thank you for 300+ GitHub Stars!** A huge thank you to everyone in the community for supporting NuvioTVOS and helping us reach 300+ stars!
 
 The IPA requires a compatible tvOS development or sideloading signing workflow before installation.
 
-### New in Beta 3.4.5
+### New in Beta 3.4.7
 
-- **Playback Engine, Subtitles & Telemetry Improvements:** Pre-computed stream candidate sort keys (`StreamPickerSortKey`) to eliminate sort churn, respected forced subtitles during automatic track matching, normalized subtitle preview layout and tracking clamps, preserved stream and row identity across resolved URLs, and hardened MPV display criteria.
-- **Trailers, Artwork & Visual Polish:** Bounded trailer preview delays and activation readiness, preserved artwork caches across playback transitions, and maintained Top Shelf order and AMOLED surface styling.
-- **Cloud, Library & Multi-Profile Hardening:** Serialized remote watchlist toggles from Details, deduplicated Continue Watching and Simkl Up Next seeds, and strictly scoped add-on and collection operations per profile.
-- **Watch Party Feature Gated:** Temporarily disabled the experimental Watch Party feature pending room coordination and lobby finalization.
-- **Tests & Stability:** 1,205 automated unit and regression tests passing with 0 failures across playback backends, stream caching, subtitle rendering, sync services, and layout settings.
+- **In-App Update Notices & Remote Announcements:** Direct in-app detection of new official releases (`ReleaseUpdateService`) with focus-safe update prompts, QR code download links, and customizable update notification toggles in Settings. Added `AnnouncementService` with support for remote broadcast alerts and release highlights (`announcements.json`).
+- **AetherEngine 7.47.0 & Live HLS Stream Recovery:** Upgraded core playback engine to version 7.47.0 with native live HLS starvation recovery (`NativeLiveHLSStarvationPolicy`), origin HOLD-BACK restoration to eliminate buffer loops, tuned live edge cushion, and keyframe-aligned live joins.
+- **Performance Optimization & Zero-Allocation Diagnostics:** Zero-allocation `@autoclosure` string tracing in `HomeView`, eliminated startup benchmark logging and table formatting in Release builds, and silenced hot-path loop diagnostics (scrub watchdogs, tap brokers, face detection, continue-watching store heartbeats).
+- **Watch Party Polish & Multi-Service Scrobble:** Streamlined sign-in flow directly from the Party tab for expired sessions, hardened cross-platform chat toast layouts, and unified simultaneous scrobbling across Trakt, Simkl, and WeTrakr.
+- **Localization Polish:** Refined translations and terminology across European Portuguese, Traditional Chinese, Simplified Chinese, French, Spanish, German, and Arabic.
 
 ### Built-in Player
 

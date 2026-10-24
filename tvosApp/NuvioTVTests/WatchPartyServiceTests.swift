@@ -48,6 +48,23 @@ final class WatchPartyServiceTests: XCTestCase {
         XCTAssertEqual(remote.calls.filter { $0 == "create" }.count, 1)
     }
 
+    func testCreateWithCustomAvatarURLPassesThroughToRemote() async throws {
+        let customURL = "https://images.example.com/custom-avatar.jpg"
+        let base = environment()
+        let env = WatchPartyEnvironment(
+            configuration: base.configuration,
+            userID: base.userID,
+            profileID: base.profileID,
+            identity: WatchPartyIdentity(deviceID: "stable-device", displayName: "Viewer", avatarURL: customURL, avatarColor: "#AABBCC")
+        )
+        let remote = Remote()
+        let service = service(remote, environment: { env })
+        defer { service.invalidateContext() }
+        try await service.create(media: remote.media)
+        XCTAssertEqual(remote.identities.first?.avatarURL, customURL)
+        XCTAssertEqual(remote.identities.first?.avatarColor, "#AABBCC")
+    }
+
     func testRealtimeFailureKeepsMembershipWithoutRepeatingCreate() async throws {
         let env = environment(), remote = Remote(), channel = Channel()
         channel.openFails = true

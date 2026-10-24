@@ -73,7 +73,8 @@ final class WatchPartyRealtimeChannel: WatchPartyChannel {
             observers.append(Task { [weak self] in
                 for await object in stream {
                     guard let self, self.generation == attempt, self.isCurrent(context), !Task.isCancelled else { return }
-                    guard let payload = try? JSONEncoder().encode(object) else { continue }
+                    let rawPayload = object["payload"] ?? .object(object)
+                    guard let payload = try? JSONEncoder().encode(rawPayload) else { continue }
                     receive(.message(name: event, payload: payload))
                 }
             })

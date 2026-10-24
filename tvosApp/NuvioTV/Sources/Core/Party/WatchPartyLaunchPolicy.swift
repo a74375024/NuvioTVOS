@@ -38,7 +38,11 @@ enum WatchPartyLaunchPolicy {
             season: episode?.season,
             episode: episode?.episode,
             title: meta.name,
-            episodeTitle: episode?.title
+            episodeTitle: episode?.title,
+            description: meta.description,
+            poster: meta.posterUrl,
+            background: meta.backgroundUrl,
+            logo: meta.logoUrl
         )
         try validate(media)
         return media
@@ -91,6 +95,32 @@ enum WatchPartyRoomFocusPolicy {
         if membershipEnded { return "leave" }
         if !connectionReady { return "reconnect" }
         if needsMediaReview { return "review-room" }
-        return playerAttached ? "catch-up" : "choose-source"
+        return playerAttached ? "return-to-player" : "choose-source"
+    }
+}
+
+
+/// Local Details presentation belongs to an exact accepted membership. It never starts playback.
+enum WatchPartyDetailsPresentationPolicy {
+    static func sameMembership(_ origin: WatchPartyPlaybackContext,
+                               _ current: WatchPartyPlaybackContext) -> Bool {
+        origin.request == current.request && origin.membershipID == current.membershipID
+            && origin.roomID == current.roomID && origin.memberID == current.memberID
+    }
+
+    /// A server may omit artwork. Only fill presentation fields for the exact same title/episode.
+    static func artwork(for media: WatchPartyMedia, fallback: WatchPartyMedia?) -> WatchPartyMedia {
+        let fallback = fallback?.key == media.key ? fallback : nil
+        var result = media
+        result.poster = nonblank(media.poster) ?? nonblank(fallback?.poster)
+        result.background = nonblank(media.background) ?? nonblank(fallback?.background)
+        result.logo = nonblank(media.logo) ?? nonblank(fallback?.logo)
+        return result
+    }
+
+    private static func nonblank(_ value: String?) -> String? {
+        guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !value.isEmpty else { return nil }
+        return value
     }
 }

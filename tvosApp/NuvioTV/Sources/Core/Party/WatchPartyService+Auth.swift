@@ -23,10 +23,14 @@ extension WatchPartyService {
                   profile.id == ProfileSettings.activeProfileID else { return nil }
             let configuration = AuthConfig.currentConfiguration
             let name = profile.name.trimmingCharacters(in: .whitespacesAndNewlines)
-            let avatarPrefix = configuration.normalizedBackendURL + "/storage/v1/object/public/avatars/"
-            let avatar = profile.avatarURL.flatMap { url -> String? in
-                guard url.hasPrefix("https://"), url.hasPrefix(avatarPrefix), url.count <= 512 else { return nil }
-                return url
+            let avatar = profile.avatarURL.flatMap { raw -> String? in
+                let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard trimmed.count <= 2048,
+                      let url = URL(string: trimmed),
+                      let scheme = url.scheme?.lowercased(),
+                      scheme == "https" || scheme == "http",
+                      url.host != nil else { return nil }
+                return trimmed
             }
             let color = profile.avatarColor.flatMap { value in
                 value.range(of: "^#[0-9A-Fa-f]{6}$", options: .regularExpression) != nil ? value : nil

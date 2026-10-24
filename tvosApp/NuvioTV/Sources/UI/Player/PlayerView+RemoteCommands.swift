@@ -11,6 +11,10 @@ extension PlayerView {
                     return
                 }
                 guard viewModel.currentErrorDiagnostic == nil else { return }
+                guard didReportPlaybackStarted else {
+                    revealControlsAndFocusSettings()
+                    return
+                }
                 viewModel.togglePlayPause()
             }
             .onExitCommand {

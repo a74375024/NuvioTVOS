@@ -27,6 +27,102 @@ struct WatchPartyEnvironment: Equatable {
     }
 }
 
+struct WatchPartyRecentRoom: Codable, Equatable, Identifiable, Sendable {
+    let roomID: String
+    let code: String
+    let title: String
+    let type: String
+    let season: Int?
+    let episode: Int?
+    let episodeTitle: String?
+    let poster: String?
+    let hostName: String
+    let memberCount: Int
+    let maxMembers: Int
+    let lastUsed: Date
+
+    var id: String { roomID }
+}
+
+private enum WatchPartyRecentRoomsStore {
+    private static let limit = 8
+    private static let keyPrefix = "nuvio.watchParty.recentRooms.v1"
+
+    static func load(profileID: String, backendIdentity: String, userID: String) -> [WatchPartyRecentRoom] {
+        load(
+            from: ProfileSettings.store(for: profileID),
+            backendIdentity: backendIdentity,
+            userID: userID
+        )
+    }
+
+    static func recordAccepted(
+        _ snapshot: WatchPartySnapshot,
+        profileID: String,
+        backendIdentity: String,
+        userID: String
+    ) {
+        guard let party = snapshot.party else { return }
+        let rawHostName = snapshot.members.first(where: { $0.id == party.hostMemberID })?.displayName
+        let hostName = rawHostName?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let room = WatchPartyRecentRoom(
+            roomID: party.id,
+            code: WatchPartyCode.normalize(party.code),
+            title: party.media.title,
+            type: party.media.type,
+            season: party.media.season,
+            episode: party.media.episode,
+            episodeTitle: party.media.episodeTitle,
+            poster: party.media.poster,
+            hostName: hostName.flatMap { $0.isEmpty ? nil : $0 } ?? "Host",
+            memberCount: snapshot.members.count,
+            maxMembers: party.maxMembers,
+            lastUsed: Date()
+        )
+        record(
+            room,
+            in: ProfileSettings.store(for: profileID),
+            backendIdentity: backendIdentity,
+            userID: userID
+        )
+    }
+
+    private static func load(
+        from defaults: UserDefaults,
+        backendIdentity: String,
+        userID: String
+    ) -> [WatchPartyRecentRoom] {
+        guard let data = defaults.data(forKey: storageKey(backendIdentity: backendIdentity, userID: userID)),
+              let rooms = try? JSONDecoder().decode([WatchPartyRecentRoom].self, from: data) else {
+            return []
+        }
+        return Array(rooms.sorted { $0.lastUsed > $1.lastUsed }.prefix(limit))
+    }
+
+    private static func record(
+        _ room: WatchPartyRecentRoom,
+        in defaults: UserDefaults,
+        backendIdentity: String,
+        userID: String
+    ) {
+        guard !room.roomID.isEmpty, WatchPartyCode.isValid(room.code) else { return }
+        var rooms = load(from: defaults, backendIdentity: backendIdentity, userID: userID)
+        rooms.removeAll { $0.roomID == room.roomID || $0.code == room.code }
+        rooms.insert(room, at: 0)
+        guard let data = try? JSONEncoder().encode(Array(rooms.prefix(limit))) else { return }
+        defaults.set(data, forKey: storageKey(backendIdentity: backendIdentity, userID: userID))
+    }
+
+    private static func storageKey(backendIdentity: String, userID: String) -> String {
+        let scope = Data("\(backendIdentity.utf8.count):\(backendIdentity)\(userID.utf8.count):\(userID)".utf8)
+            .base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+        return "\(keyPrefix).\(scope)"
+    }
+}
+
 enum WatchPartyServiceError: Error, Equatable {
     case busy, alreadyInRoom, unavailable, membershipOutcomeUncertain, newJoinRequired, requestFailed
     case rejected(WatchPartyFailure)
@@ -113,6 +209,15 @@ final class WatchPartyService: ObservableObject {
         } catch { throw report(error, context: setup.context, operation: setup.operation) }
     }
 
+    func recentRooms() -> [WatchPartyRecentRoom] {
+        guard let current = environment() else { return [] }
+        return WatchPartyRecentRoomsStore.load(
+            profileID: current.profileID,
+            backendIdentity: current.configuration.backendIdentity,
+            userID: current.userID
+        )
+    }
+
     func create(media: WatchPartyMedia, playback: WatchPartyPlayback? = nil) async throws {
         try await enter { remote, identity in try await remote.create(identity: identity, media: media, playback: playback) }
     }
@@ -170,6 +275,19 @@ final class WatchPartyService: ObservableObject {
         }
     }
 
+    func updateMedia(_ media: WatchPartyMedia) async throws {
+        let setup = try begin()
+        defer { finish(setup.operation) }
+        guard let current = session, current.party != nil else { throw WatchPartySessionError.notReady }
+        do {
+            try await current.updateMedia(media)
+            try check(setup.context, operation: setup.operation)
+            if let failure = current.failure { throw WatchPartyServiceError.rejected(failure) }
+        } catch {
+            throw report(error, context: setup.context, operation: setup.operation)
+        }
+    }
+
     func resume() async throws {
         let setup = try begin()
         defer { finish(setup.operation) }
@@ -205,6 +323,12 @@ final class WatchPartyService: ObservableObject {
                   let member = snapshot.memberID, !member.isEmpty,
                   snapshot.members.contains(where: { $0.id == member }) else { throw WatchPartyAPIError.invalidResponse }
             accepted = true
+            WatchPartyRecentRoomsStore.recordAccepted(
+                snapshot,
+                profileID: setup.environment.profileID,
+                backendIdentity: setup.environment.configuration.backendIdentity,
+                userID: setup.environment.userID
+            )
             let validator: WatchPartyAPI.ContextValidator = { [weak self] in self?.isCurrent($0) == true }
             let current = makeSession(setup.remote, setup.environment, setup.context, validator)
             session?.onChange = nil; session?.stop()

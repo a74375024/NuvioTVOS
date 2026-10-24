@@ -9,6 +9,51 @@ import AetherEngine
 import AetherEngineSMB
 import SwiftAssRenderer
 
+@MainActor
+private final class SceneFrameAnalysisResultBox {
+    var capture: AetherEngine.VideoFrameAnalysisCapture?
+}
+
+private final class SceneAnalysisYieldLatch: @unchecked Sendable {
+    private let signal: @Sendable () -> Bool
+    private let lock = NSLock()
+    private var observedYield = false
+
+    init(signal: @escaping @Sendable () -> Bool) {
+        self.signal = signal
+    }
+
+    func check() -> Bool {
+        let value = signal()
+        if value {
+            lock.lock()
+            observedYield = true
+            lock.unlock()
+        }
+        return value
+    }
+
+    var didYield: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return observedYield
+    }
+}
+
+struct AetherSceneFrameAnalysisIdentity: Equatable, @unchecked Sendable {
+    let hostGeneration: UInt64
+    let engineStartupGeneration: UInt64?
+    let nativePlayer: AnyObject?
+    let nativeItem: AnyObject?
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.hostGeneration == rhs.hostGeneration
+            && lhs.engineStartupGeneration == rhs.engineStartupGeneration
+            && lhs.nativePlayer === rhs.nativePlayer
+            && lhs.nativeItem === rhs.nativeItem
+    }
+}
+
 /// High-frequency state observed only by the subtitle overlay. Keeping it
 /// separate prevents Aether's 10 Hz presentation clock from rebuilding the
 /// whole player screen while still making cue changes immediately visible.
@@ -1570,8 +1615,49 @@ struct AetherExternalSubtitleRegistration {
 }
 
 enum AetherPlaybackLifecyclePolicy {
+    static let maximumActiveCancellationRetries = 1
+
     static func shouldReloadAfterBackground(state: PlaybackState) -> Bool {
-        state == .playing || state == .paused
+        switch state {
+        case .playing, .paused, .loading, .seeking:
+            return true
+        default:
+            return false
+        }
+    }
+
+    static func shouldResumeAfterBackground(
+        state: PlaybackState,
+        isPlayerPlaying: Bool,
+        isTransportPlaying: Bool,
+        previousIntent: Bool
+    ) -> Bool {
+        previousIntent
+            || state == .playing
+            || (state != .paused && (isPlayerPlaying || isTransportPlaying))
+    }
+
+    enum ReloadFailureDisposition: Equatable {
+        case ignore
+        case keepPending
+        case retryAfterTaskClears
+        case report
+    }
+
+    static func reloadFailureDisposition(
+        isCancellation: Bool,
+        tokenIsCurrent: Bool,
+        applicationIsActive: Bool,
+        activeCancellationRetryCount: Int
+    ) -> ReloadFailureDisposition {
+        guard tokenIsCurrent else { return .ignore }
+        guard applicationIsActive else { return .keepPending }
+        if isCancellation {
+            return activeCancellationRetryCount < maximumActiveCancellationRetries
+                ? .retryAfterTaskClears
+                : .report
+        }
+        return .report
     }
 }
 
@@ -2451,6 +2537,7 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
     private var needsForegroundReload = false
     private var playbackWasPlayingBeforeBackground = false
     private var foregroundReloadTask: Task<Void, Never>?
+    private var foregroundReloadActiveCancellationRetryCount = 0
     private var artworkLoadTask: Task<Void, Never>?
     private var nowPlayingInfo: [String: Any] = [:]
     private var lifecycleReloadToken: UInt64 = 0
@@ -2763,6 +2850,247 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
             activeThumbnailCancellation = nil
         }
         return result
+    }
+
+    /// Scene adapter preserves primary capture results and permits only the DV5 resident failure
+    /// allowlist to use the bounded, mandatory-RPU original-source path.
+    func captureSceneFrameForAnalysis(maxWidth: Int = 960) async -> AetherEngine.VideoFrameAnalysisCapture {
+        let generation = loadGeneration
+        let engineSnapshot = engine
+        let captureIdentity = sceneFrameAnalysisIdentity(for: engineSnapshot, hostGeneration: generation)
+        let sourceContext = thumbnailSourceContext
+        let previousTask = activeThumbnailTask
+        let softwareCleanupTask = softwareFrameExtractorCleanupTask
+        let softwareCleanupGeneration = softwareFrameExtractorCleanupGeneration
+        let engineCleanupTask = engineAuxiliaryCleanupTask
+        let engineCleanupRequestID = engineAuxiliaryCleanupRequestID
+        let requestID = beginScrubThumbnailRequest()
+        let providerGeneration = externalProviderGeneration
+        let cancellation = PlaybackThumbnailRequestCancellation()
+        activeThumbnailCancellation = cancellation
+        let captureBox = SceneFrameAnalysisResultBox()
+        let width = min(960, max(1, maxWidth))
+
+        let work: Task<CGImage?, Never> = Task { @MainActor
+            [weak self, previousTask, softwareCleanupTask, engineCleanupTask] in
+            _ = await previousTask?.value
+            _ = await softwareCleanupTask?.value
+            _ = await engineCleanupTask?.value
+            guard let self,
+                  self.isCurrentSceneFrameRequest(
+                    requestID, generation: generation, providerGeneration: providerGeneration,
+                    sourceContext: sourceContext, engine: engineSnapshot,
+                    captureIdentity: captureIdentity, cancellation: cancellation) else {
+                return nil
+            }
+            if self.softwareFrameExtractorCleanupGeneration == softwareCleanupGeneration {
+                self.softwareFrameExtractorCleanupTask = nil
+            }
+            if self.engineAuxiliaryCleanupRequestID == engineCleanupRequestID {
+                self.engineAuxiliaryCleanupTask = nil
+            }
+            let capture = await self.generateSceneFrameAnalysisCapture(
+                engine: engineSnapshot,
+                sourceContext: sourceContext,
+                maxWidth: width,
+                requestID: requestID,
+                generation: generation,
+                providerGeneration: providerGeneration,
+                captureIdentity: captureIdentity,
+                cancellation: cancellation
+            )
+            captureBox.capture = capture
+            return capture.image
+        }
+        activeThumbnailTask = work
+        activeThumbnailTaskRequestID = requestID
+        _ = await withTaskCancellationHandler {
+            await work.value
+        } onCancel: {
+            cancellation.cancel()
+            work.cancel()
+        }
+        if activeThumbnailTaskRequestID == requestID {
+            activeThumbnailTask = nil
+            activeThumbnailTaskRequestID = nil
+        }
+        if thumbnailRequestSequence == requestID,
+           activeThumbnailCancellation === cancellation {
+            activeThumbnailCancellation = nil
+        }
+        return captureBox.capture ?? AetherEngine.VideoFrameAnalysisCapture(
+            image: nil, sourceTime: engineSnapshot.clock.currentTime,
+            diagnostics: "route=scene-adapter reason=cancelled-or-superseded")
+    }
+
+    private func generateSceneFrameAnalysisCapture(
+        engine engineSnapshot: AetherEngine,
+        sourceContext: PlaybackThumbnailSourceContext?,
+        maxWidth: Int,
+        requestID: UInt64,
+        generation: UInt64,
+        providerGeneration: UInt64,
+        captureIdentity: AetherSceneFrameAnalysisIdentity,
+        cancellation: PlaybackThumbnailRequestCancellation
+    ) async -> AetherEngine.VideoFrameAnalysisCapture {
+        let primary = await engineSnapshot.captureVideoFrameForAnalysis(maxWidth: maxWidth)
+        guard isCurrentSceneFrameRequest(
+            requestID, generation: generation, providerGeneration: providerGeneration,
+            sourceContext: sourceContext, engine: engineSnapshot,
+            captureIdentity: captureIdentity, cancellation: cancellation) else {
+            return AetherEngine.VideoFrameAnalysisCapture(
+                image: nil, sourceTime: primary.sourceTime,
+                diagnostics: "route=scene-adapter reason=cancelled-or-superseded primary={\(primary.diagnostics)}")
+        }
+        let sourceProfile = engineSnapshot.sourceDVProfile
+        let sourceEligible = sourceContext != nil && usesBoundedProgressiveScrubPreview(sourceContext)
+        let yieldLatch = SceneAnalysisYieldLatch(signal: engineSnapshot.frameAnalysisYieldSignal())
+        // This is sampled only after the primary capture attempt. Scene time is elapsed Aether time.
+        let targetSeconds = engineSnapshot.clock.currentTime
+        let limits = ProbeLimits(
+            maxInputBytes: 64 * 1024 * 1024,
+            maxPackets: 4_096,
+            maxPacketBytes: 16 * 1024 * 1024,
+            timeBudget: 3)
+        return await Self.resolveSceneCaptureAfterPrimary(
+            primary,
+            sourceDVProfile: sourceProfile,
+            sourceEligible: sourceEligible,
+            targetSeconds: targetSeconds,
+            shouldYield: { yieldLatch.check() },
+            didYield: { yieldLatch.didYield },
+            isCurrent: {
+                self.isCurrentSceneFrameRequest(
+                    requestID, generation: generation, providerGeneration: providerGeneration,
+                    sourceContext: sourceContext, engine: engineSnapshot,
+                    captureIdentity: captureIdentity, cancellation: cancellation)
+            },
+            fallback: {
+                guard let sourceContext else { return nil }
+                return await PlaybackThumbnailSourceFallback.boundedSnapshot(
+                    sourceContext: sourceContext,
+                    atSeconds: targetSeconds,
+                    maxWidth: maxWidth,
+                    cancellation: cancellation,
+                    isCurrent: {
+                        self.isCurrentSceneFrameRequest(
+                            requestID, generation: generation, providerGeneration: providerGeneration,
+                            sourceContext: sourceContext, engine: engineSnapshot,
+                            captureIdentity: captureIdentity, cancellation: cancellation)
+                    },
+                    requiredDolbyVisionReshaping: true,
+                    limits: limits,
+                    yieldWhile: { yieldLatch.check() })
+            })
+    }
+
+    @MainActor
+    static func resolveSceneCaptureAfterPrimary(
+        _ primary: AetherEngine.VideoFrameAnalysisCapture,
+        sourceDVProfile: Int?,
+        sourceEligible: Bool,
+        targetSeconds: Double,
+        shouldYield: (@Sendable () -> Bool)? = nil,
+        didYield: (@Sendable () -> Bool)? = nil,
+        isCurrent: @MainActor () -> Bool,
+        fallback: @MainActor () async -> BoundedStillFrame?
+    ) async -> AetherEngine.VideoFrameAnalysisCapture {
+        guard isCurrent() else {
+            return AetherEngine.VideoFrameAnalysisCapture(
+                image: nil, sourceTime: targetSeconds,
+                diagnostics: "route=scene-adapter reason=cancelled-or-superseded primary={\(primary.diagnostics)}")
+        }
+        guard primary.image == nil,
+              sourceDVProfile == 5,
+              sourceEligible,
+              Self.isRecoverableDV5ResidentCaptureFailure(primary.diagnostics) else { return primary }
+        guard targetSeconds.isFinite, targetSeconds >= 0 else {
+            return AetherEngine.VideoFrameAnalysisCapture(
+                image: nil, sourceTime: primary.sourceTime,
+                diagnostics: "route=bounded-dovi-source reason=invalid-target primary={\(primary.diagnostics)}")
+        }
+        guard shouldYield?() != true, didYield?() != true else {
+            return AetherEngine.VideoFrameAnalysisCapture(
+                image: nil, sourceTime: targetSeconds,
+                diagnostics: "route=bounded-dovi-source reason=playback-priority-yield primary={\(primary.diagnostics)}")
+        }
+        let still = await fallback()
+        guard isCurrent() else {
+            return AetherEngine.VideoFrameAnalysisCapture(
+                image: nil, sourceTime: targetSeconds,
+                diagnostics: "route=bounded-dovi-source reason=cancelled-or-superseded primary={\(primary.diagnostics)}")
+        }
+        guard shouldYield?() != true, didYield?() != true else {
+            return AetherEngine.VideoFrameAnalysisCapture(
+                image: nil, sourceTime: targetSeconds,
+                diagnostics: "route=bounded-dovi-source reason=playback-priority-yield primary={\(primary.diagnostics)}")
+        }
+        guard let still, let actualSeconds = still.actualSeconds, actualSeconds.isFinite,
+              abs(actualSeconds - targetSeconds) <= HybridSeekThumbnailPolicy.maximumPreviewTimeError else {
+            return AetherEngine.VideoFrameAnalysisCapture(
+                image: nil, sourceTime: targetSeconds,
+                diagnostics: "route=bounded-dovi-source reason=bounded-source-unavailable primary={\(primary.diagnostics)} targetTime=\(String(format: "%.3f", targetSeconds))")
+        }
+        return AetherEngine.VideoFrameAnalysisCapture(
+            image: still.image,
+            sourceTime: actualSeconds,
+            diagnostics: "route=bounded-dovi-source reason=ok actualTime=\(String(format: "%.3f", actualSeconds)) primary={\(primary.diagnostics)}"
+        )
+    }
+
+    private func isCurrentSceneFrameRequest(
+        _ requestID: UInt64,
+        generation: UInt64,
+        providerGeneration: UInt64,
+        sourceContext: PlaybackThumbnailSourceContext?,
+        engine engineSnapshot: AetherEngine,
+        captureIdentity: AetherSceneFrameAnalysisIdentity,
+        cancellation: PlaybackThumbnailRequestCancellation
+    ) -> Bool {
+        guard isCurrentScrubThumbnailRequest(
+            requestID, generation: generation, providerGeneration: providerGeneration,
+            cancellation: cancellation),
+              thumbnailSourceContext == sourceContext,
+              engine === engineSnapshot,
+              sceneFrameAnalysisIdentity(for: engineSnapshot, hostGeneration: generation) == captureIdentity
+        else { return false }
+        return true
+    }
+
+    private func sceneFrameAnalysisIdentity(
+        for engine: AetherEngine,
+        hostGeneration: UInt64
+    ) -> AetherSceneFrameAnalysisIdentity {
+        let player = engine.nativePlayerLayer?.player ?? engine.currentAVPlayer
+        return AetherSceneFrameAnalysisIdentity(
+            hostGeneration: hostGeneration,
+            engineStartupGeneration: engine.startupProgress?.generation,
+            nativePlayer: player,
+            nativeItem: player?.currentItem
+        )
+    }
+
+    static func sceneFrameAnalysisIdentityMatches(
+        _ captured: AetherSceneFrameAnalysisIdentity,
+        current: AetherSceneFrameAnalysisIdentity
+    ) -> Bool {
+        captured == current
+    }
+
+    private static func isRecoverableDV5ResidentCaptureFailure(_ diagnostics: String) -> Bool {
+        var route: String?
+        var reason: String?
+        for field in diagnostics.split(whereSeparator: \.isWhitespace) {
+            if field.hasPrefix("route=") { route = String(field.dropFirst("route=".count)) }
+            if field.hasPrefix("reason=") { reason = String(field.dropFirst("reason=".count)) }
+        }
+        guard route == "resident-dovi-rpu" else { return false }
+        return [
+            "resident-dv-decode-failed-or-budget-expired",
+            "resident-decode-budget-expired",
+            "resident-segment-cache-miss",
+            "resident-segment-read-failed",
+        ].contains(reason ?? "")
     }
 
     private func generateScrubThumbnail(
@@ -3497,17 +3825,31 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
     }
 
     @objc private func appWillResignActive() {
+        let observedResumeIntent = AetherPlaybackLifecyclePolicy.shouldResumeAfterBackground(
+            state: engine.state,
+            isPlayerPlaying: isPlayerPlaying,
+            isTransportPlaying: isTransportPlaying,
+            previousIntent: playbackWasPlayingBeforeBackground
+        )
         if !engine.pictureInPictureActive {
             let mark = lifecycleReloadToken
             onWillSuspendPlayback?()
             guard lifecycleReloadToken == mark else { return }
         }
+        foregroundReloadActiveCancellationRetryCount = 0
         screensaverDebugLog("[ScreensaverDebug][AetherController] appWillResignActive: state=\(engine.state), isPlayerPlaying=\(isPlayerPlaying), lastKnownPos=\(lastKnownPositionMs)ms, clock=\(engine.clock.currentTime)")
+        let interruptedReload = foregroundReloadTask != nil
         if !engine.pictureInPictureActive {
+            // Invalidate the task before cancellation so its catch path cannot
+            // publish an expected background interruption as a terminal error.
+            lifecycleReloadToken &+= 1
+            if interruptedReload {
+                needsForegroundReload = true
+            }
             foregroundReloadTask?.cancel()
             foregroundReloadTask = nil
         }
-        playbackWasPlayingBeforeBackground = engine.state == .playing || (isPlayerPlaying && engine.state != .paused)
+        playbackWasPlayingBeforeBackground = observedResumeIntent
         screensaverDebugLog("[ScreensaverDebug][AetherController] appWillResignActive: computed playbackWasPlayingBeforeBackground=\(playbackWasPlayingBeforeBackground)")
         #if os(tvOS)
         let pos = lastKnownPositionMs
@@ -3517,34 +3859,43 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
 
         let shouldReload = AetherPlaybackLifecyclePolicy.shouldReloadAfterBackground(state: engine.state)
         screensaverDebugLog("[ScreensaverDebug][AetherController] appWillResignActive: shouldReload=\(shouldReload)")
-        guard shouldReload else { return }
-
-        lifecycleReloadToken &+= 1
+        guard shouldReload || interruptedReload else { return }
         needsForegroundReload = true
         screensaverDebugLog("[ScreensaverDebug][AetherController] appWillResignActive: set needsForegroundReload=true, playbackWasPlayingBeforeBackground=\(playbackWasPlayingBeforeBackground)")
     }
 
     @objc private func appDidEnterBackground() {
+        let observedResumeIntent = AetherPlaybackLifecyclePolicy.shouldResumeAfterBackground(
+            state: engine.state,
+            isPlayerPlaying: isPlayerPlaying,
+            isTransportPlaying: isTransportPlaying,
+            previousIntent: playbackWasPlayingBeforeBackground
+        )
         if !engine.pictureInPictureActive {
             let mark = lifecycleReloadToken
             onWillSuspendPlayback?()
             guard lifecycleReloadToken == mark else { return }
         }
+        foregroundReloadActiveCancellationRetryCount = 0
         let pos = lastKnownPositionMs
         let dur = lastKnownDurationMs
         screensaverDebugLog("[ScreensaverDebug][AetherController] appDidEnterBackground: state=\(engine.state), isPlayerPlaying=\(isPlayerPlaying), pos=\(pos)ms, dur=\(dur)ms, clock=\(engine.clock.currentTime)")
         onPlaybackSuspended?(pos, dur)
 
+        let interruptedReload = foregroundReloadTask != nil
         let shouldReload = AetherPlaybackLifecyclePolicy.shouldReloadAfterBackground(state: engine.state)
         screensaverDebugLog("[ScreensaverDebug][AetherController] appDidEnterBackground: shouldReload=\(shouldReload)")
-        guard shouldReload else { return }
+        guard shouldReload || interruptedReload else { return }
 
         lifecycleReloadToken &+= 1
+        if interruptedReload {
+            needsForegroundReload = true
+        }
         foregroundReloadTask?.cancel()
         foregroundReloadTask = nil
         needsForegroundReload = true
         if !playbackWasPlayingBeforeBackground {
-            playbackWasPlayingBeforeBackground = engine.state == .playing || (isPlayerPlaying && engine.state != .paused)
+            playbackWasPlayingBeforeBackground = observedResumeIntent
         }
         screensaverDebugLog("[ScreensaverDebug][AetherController] appDidEnterBackground: set needsForegroundReload=true, playbackWasPlayingBeforeBackground=\(playbackWasPlayingBeforeBackground)")
     }
@@ -3570,15 +3921,26 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
 
         needsForegroundReload = false
         let shouldResume = playbackWasPlayingBeforeBackground
-        playbackWasPlayingBeforeBackground = false
         let token = lifecycleReloadToken
         screensaverDebugLog("[ScreensaverDebug][AetherController] appDidBecomeActive: starting foreground reload task with shouldResume=\(shouldResume), token=\(token)")
         rebindSurface()
+        var shouldRetryAfterTaskClears = false
         foregroundReloadTask = Task { @MainActor [weak self] in
             guard let self else { return }
             defer {
                 if self.lifecycleReloadToken == token {
                     self.foregroundReloadTask = nil
+                    if shouldRetryAfterTaskClears {
+                        Task { @MainActor [weak self] in
+                            guard let self,
+                                  self.lifecycleReloadToken == token,
+                                  self.foregroundReloadTask == nil,
+                                  self.needsForegroundReload,
+                                  UIApplication.shared.applicationState == .active,
+                                  self.foregroundReloadActiveCancellationRetryCount == AetherPlaybackLifecyclePolicy.maximumActiveCancellationRetries else { return }
+                            self.appDidBecomeActive()
+                        }
+                    }
                 }
             }
             do {
@@ -3586,7 +3948,26 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
                 try await self.engine.reloadAtCurrentPosition()
                 screensaverDebugLog("[ScreensaverDebug][AetherController] engine.reloadAtCurrentPosition completed")
             } catch {
-                guard self.lifecycleReloadToken == token else { return }
+                let disposition = AetherPlaybackLifecyclePolicy.reloadFailureDisposition(
+                    isCancellation: error is CancellationError || Task.isCancelled,
+                    tokenIsCurrent: self.lifecycleReloadToken == token,
+                    applicationIsActive: UIApplication.shared.applicationState == .active,
+                    activeCancellationRetryCount: self.foregroundReloadActiveCancellationRetryCount
+                )
+                switch disposition {
+                case .ignore:
+                    return
+                case .keepPending:
+                    self.needsForegroundReload = true
+                    return
+                case .retryAfterTaskClears:
+                    self.needsForegroundReload = true
+                    self.foregroundReloadActiveCancellationRetryCount += 1
+                    shouldRetryAfterTaskClears = true
+                    return
+                case .report:
+                    break
+                }
                 let message = error.localizedDescription
                 screensaverDebugLog("[ScreensaverDebug][AetherController] engine.reloadAtCurrentPosition FAILED: \(message)")
                 self.currentErrorMessage = message
@@ -3603,6 +3984,15 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
                 screensaverDebugLog("[ScreensaverDebug][AetherController] reload completed but token mismatch or pip active")
                 return
             }
+            guard !Task.isCancelled else {
+                self.needsForegroundReload = true
+                return
+            }
+            guard UIApplication.shared.applicationState == .active else {
+                self.needsForegroundReload = true
+                return
+            }
+            self.foregroundReloadActiveCancellationRetryCount = 0
             self.rebindSurface()
             let resumeAfterReload = shouldResume || self.playbackWasPlayingBeforeBackground
             screensaverDebugLog("[ScreensaverDebug][AetherController] reload completed, asserting post-reload state: resumeAfterReload=\(resumeAfterReload)")
@@ -3611,7 +4001,13 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
             } else {
                 self.engine.pause()
             }
-            guard self.lifecycleReloadToken == token else { return }
+            guard self.lifecycleReloadToken == token,
+                  !Task.isCancelled,
+                  UIApplication.shared.applicationState == .active else {
+                self.needsForegroundReload = true
+                return
+            }
+            self.playbackWasPlayingBeforeBackground = false
             self.onDidRestorePlayback?()
         }
     }
@@ -3837,6 +4233,15 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
             isPlayerEnded = true
             isAtEndOfFile = true
         case .error(let message):
+            if needsForegroundReload || foregroundReloadTask != nil {
+                // Aether may briefly report an error while its lifecycle
+                // reload is being canceled or reopened. The reload task owns
+                // the terminal result for this interval.
+                isPlayerLoading = true
+                isPlayerPlaying = false
+                isPlayerEnded = false
+                break
+            }
             isPlayerLoading = false
             isPlayerPlaying = false
             isPlayerEnded = false
@@ -3998,6 +4403,7 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
                 lang: t.language ?? "",
                 selected: active == t.id,
                 externalFilename: t.isExternal ? (externalSubtitleURLsByTrackID[t.id] ?? "") : "",
+                isForced: t.isForced,
                 isNativelyRenderedSubtitle: t.isNativelyRenderedSubtitle,
                 languageName: t.language ?? "",
                 detail: t.codec
@@ -4159,15 +4565,16 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
         )
         lifecycleReloadToken &+= 1
         needsForegroundReload = false
+        foregroundReloadActiveCancellationRetryCount = 0
         playbackWasPlayingBeforeBackground = false
         foregroundReloadTask?.cancel()
         foregroundReloadTask = nil
         resetAISubtitleStartupHold()
         loadGeneration = generation
         let isRemote = PlaybackBackendPolicy.isRemoteHTTP(request.videoURL.absoluteString)
-        let isRemoteHLS = request.videoURL.pathExtension.lowercased() == "m3u8"
+        let isRemoteHLS = PlaybackBackendPolicy.isHLS(request.videoURL.absoluteString)
+            || request.videoURL.pathExtension.lowercased() == "m3u8"
             || request.videoURL.absoluteString.contains(".m3u8")
-            || request.videoURL.absoluteString.contains("manifest.googlevideo.com")
             || request.videoURL.host?.contains("googlevideo.com") == true
             || request.streamDescription == PlaybackMarkers.trailerSubtitle
         // The hybrid cache is a local HTTP range server on 127.0.0.1.
@@ -4228,10 +4635,10 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
         )
         #if os(tvOS) || os(iOS)
         var nowPlaying: [String: Any] = [:]
-        if let title = request.streamName, !title.isEmpty {
+        if let title = request.nowPlayingTitle ?? request.streamName, !title.isEmpty {
             nowPlaying[MPMediaItemPropertyTitle] = title
         }
-        if let subtitle = request.streamDescription, !subtitle.isEmpty {
+        if let subtitle = request.nowPlayingTitle != nil ? request.nowPlayingSubtitle : request.streamDescription, !subtitle.isEmpty {
             nowPlaying[MPMediaItemPropertyArtist] = subtitle
         }
         nowPlaying[MPNowPlayingInfoPropertyMediaType] = MPNowPlayingInfoMediaType.video.rawValue
@@ -4287,6 +4694,7 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
             panelPresentsDV = AVPlayer.availableHDRModes.contains(.dolbyVision)
         }
 
+        let isLive = request.isLiveStream || request.isSports
         let options = LoadOptions(
             httpHeaders: request.httpHeaders,
             matchContentEnabled: matchContent,
@@ -4295,6 +4703,9 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
             audioBridgeMode: .surroundCompat,
             // Read the active profile for each load; unsupported sources keep the normal bridge.
             objectAudioRendering: SpatialAudioSettings.rendering(),
+            isLive: isLive,
+            liveEdgeCushionSeconds: isLive ? 3.0 : nil,
+            liveJoinStartsImmediately: true,
             nativeRemoteHLS: isRemoteHLS,
             // AetherEngine honors this for ASS/SSA codec tracks only; other text
             // subtitle decoders keep their normal styled/plain cue path.

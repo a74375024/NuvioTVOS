@@ -76,10 +76,11 @@ enum TVHomeDebugTrace {
         String(format: "%.1f", Double(now() - start) / 1_000_000)
     }
 
-    static func breadcrumb(_ message: String) {
+    static func breadcrumb(_ message: @autoclosure () -> String) {
         guard enabled else { return }
+        let text = message()
         let isMain = Thread.isMainThread
-        let item = Breadcrumb(timestamp: now(), message: message, isMainThread: isMain)
+        let item = Breadcrumb(timestamp: now(), message: text, isMainThread: isMain)
         os_unfair_lock_lock(&breadcrumbLock)
         breadcrumbs.append(item)
         if breadcrumbs.count > maxBreadcrumbs {
@@ -109,30 +110,32 @@ enum TVHomeDebugTrace {
     }
 
     @discardableResult
-    static func measure<T>(_ label: String, thresholdMs: Double = 15.0, block: () throws -> T) rethrows -> T {
+    static func measure<T>(_ label: @autoclosure () -> String, thresholdMs: Double = 15.0, block: () throws -> T) rethrows -> T {
         guard enabled else { return try block() }
-        breadcrumb("\(label) begin")
+        let text = label()
+        breadcrumb("\(text) begin")
         let start = now()
         defer {
             let elapsedMs = Double(now() - start) / 1_000_000
-            breadcrumb("\(label) end (\(String(format: "%.1f", elapsedMs))ms)")
+            breadcrumb("\(text) end (\(String(format: "%.1f", elapsedMs))ms)")
             if elapsedMs >= thresholdMs {
-                log("⚠️ [SLOW_OP] \(label) took \(String(format: "%.1f", elapsedMs))ms (threshold \(thresholdMs)ms)")
+                log("⚠️ [SLOW_OP] \(text) took \(String(format: "%.1f", elapsedMs))ms (threshold \(thresholdMs)ms)")
             }
         }
         return try block()
     }
 
     @discardableResult
-    static func measureAsync<T>(_ label: String, thresholdMs: Double = 20.0, block: () async throws -> T) async rethrows -> T {
+    static func measureAsync<T>(_ label: @autoclosure () -> String, thresholdMs: Double = 20.0, block: () async throws -> T) async rethrows -> T {
         guard enabled else { return try await block() }
-        breadcrumb("\(label) begin")
+        let text = label()
+        breadcrumb("\(text) begin")
         let start = now()
         defer {
             let elapsedMs = Double(now() - start) / 1_000_000
-            breadcrumb("\(label) end (\(String(format: "%.1f", elapsedMs))ms)")
+            breadcrumb("\(text) end (\(String(format: "%.1f", elapsedMs))ms)")
             if elapsedMs >= thresholdMs {
-                log("⚠️ [SLOW_OP_ASYNC] \(label) took \(String(format: "%.1f", elapsedMs))ms")
+                log("⚠️ [SLOW_OP_ASYNC] \(text) took \(String(format: "%.1f", elapsedMs))ms")
             }
         }
         return try await block()
@@ -329,6 +332,20 @@ enum TVTab: Hashable, Identifiable, CaseIterable {
 
 /// Main content view - entry point for the app with screen routing
 struct ContentView: View {
+    private struct PartyDetailsDestination {
+        let screen: TVScreen
+        let tab: TVTab
+        let backStack: [(id: String, type: String)]
+        let returnDestination: DetailsReturnDestination
+        let collectionContext: CollectionPlaybackContext?
+    }
+
+    private struct PartyDetailsOrigin {
+        let context: WatchPartyPlaybackContext
+        let media: WatchPartyMedia
+        let destination: PartyDetailsDestination
+    }
+
     @Environment(\.scenePhase) private var scenePhase
     @State private var activeScreen: TVScreen = .login
     @State private var playbackPartyID: UUID?
@@ -337,6 +354,7 @@ struct ContentView: View {
     @State private var choosingPartySource = false
     @State private var partyLaunchTask: Task<Void, Never>?
     @State private var partyLaunchID = UUID()
+    @State private var partyDetailsOrigin: PartyDetailsOrigin?
     @State private var resolvedInitialScreen = false
     /// `nil` until tvOS has actually backgrounded the app, so the initial
     /// `.active` callback is never treated as a resume.
@@ -372,6 +390,7 @@ struct ContentView: View {
     /// Series context for the current playback, captured at play time so the
     /// player can offer/auto-play the next episode. Empty for movies/trailers.
     @State private var playbackEpisodes: [NuvioVideo] = []
+    @State private var partySourceNavigationRevision: UInt = 0
     @State private var playbackCurrentEpisode: NuvioVideo?
     @State private var playbackIsActionPlaybackSession = false
     @State private var playbackOrigin: PlaybackOrigin = .main
@@ -414,6 +433,8 @@ struct ContentView: View {
     @State private var detailsBackStack: [(id: String, type: String)] = []
     @State private var nextDetailsPlaybackRequestID: UInt = 0
     @State private var pendingDetailsPlaybackRequestID: UInt?
+    @State private var presentedAppNoticeDetails: AppNotice?
+    @State private var appNoticeFocusRequestGeneration: UInt = 0
     /// Where the root Details screen should return. This is normally Home, but
     /// a title opened from a collection must return to that collection.
     @State private var detailsReturnDestination: DetailsReturnDestination = .main
@@ -432,6 +453,8 @@ struct ContentView: View {
     @StateObject private var searchViewModel = SearchViewModel()
     @StateObject private var netflixSearchViewModel = NetflixSearchViewModel()
     @StateObject private var libraryViewModel = LibraryViewModel()
+    @StateObject private var releaseUpdateService = ReleaseUpdateService()
+    @StateObject private var announcementService = AnnouncementService()
     // Owned here (not inside TVHomeView) so the Home catalog + focused card
     // survive the details/player push, which tears TVHomeView down. Returning
     // then restores the exact card instead of reloading and jumping to the top.
@@ -546,11 +569,32 @@ struct ContentView: View {
                 .transition(.asymmetric(insertion: .identity, removal: .opacity))
                 .zIndex(999)
             }
+
+            if let notice = visibleAppNotice {
+                AppNoticeBanner(
+                    notice: notice,
+                    currentVersion: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.0.0",
+                    accentColor: AppFocusOutline.color,
+                    focusRequestGeneration: appNoticeFocusRequestGeneration,
+                    isDetailsPresented: presentedAppNoticeDetails != nil,
+                    onShowDetails: { presentedAppNoticeDetails = notice },
+                    onDismiss: { dismissAppNotice(notice) },
+                    onSkip: { skipAppNotice(notice) }
+                )
+                .id(notice.id)
+                .padding(.trailing, 52)
+                .padding(.bottom, 42)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+                .zIndex(10)
+            }
         }
         // Resolve every @AppStorage in the app against the active profile's
         // settings suite, so each profile keeps its own theme, layout, playback
         // preferences, etc. Falls back to the shared store before a profile is picked.
         .defaultAppStorage(ProfileSettings.store(for: profileViewModel.activeProfile?.id))
+        .environmentObject(releaseUpdateService)
+        .environmentObject(announcementService)
         // Apply selected app language (locale + L10n catalog) and refresh UI on change.
         .appliesAppLocale()
         .onChange(of: profileViewModel.activeProfile?.id) { _, _ in
@@ -563,6 +607,7 @@ struct ContentView: View {
             }
         }
         .onChange(of: selectedTab) { _, tab in
+            partySourceNavigationRevision &+= 1
             if isPreparingProfile, tab != .home {
                 liftProfileGate(generation: profileGateGeneration)
             }
@@ -571,9 +616,16 @@ struct ContentView: View {
             // Outside-guide building steps aside while anything plays.
             OutsideGuidePause.shared.set("player", newScreen.isPlayer)
             TVHomeDebugTrace.log("app.activeScreen changed from \(oldScreen) to \(newScreen)")
+            if oldScreen.isPlayer, !newScreen.isPlayer,
+               let transitionID = watchPartyOwner.incomingMediaTransition?.id {
+                watchPartyOwner.cancelIncomingMediaTransition(transitionID)
+            }
             if oldScreen != newScreen, !newScreen.isPlayer, partyLaunchTask != nil {
                 partyLaunchID = UUID(); partyLaunchTask?.cancel(); partyLaunchTask = nil
             }
+        }
+        .onChange(of: visibleAppNotice?.id) { _, noticeID in
+            if noticeID != nil { appNoticeFocusRequestGeneration &+= 1 }
         }
         .overlay {
             if partyLaunchTask != nil {
@@ -597,7 +649,14 @@ struct ContentView: View {
         // catches those stray presses and dismisses the overlay instead. When
         // focus is settled inside Details/Player their own handler fires first,
         // so this only kicks in for the in-between frames.
-        .onExitCommand(perform: isOverlayPresented ? dismissOverlay : nil)
+        .onExitCommand(perform: visibleAppNotice != nil
+            ? dismissVisibleAppNotice
+            : (isOverlayPresented ? dismissOverlay : nil))
+        .sheet(item: $presentedAppNoticeDetails, onDismiss: {
+            appNoticeFocusRequestGeneration &+= 1
+        }) {
+            AppNoticeDetailsSheet(notice: $0)
+        }
         .onChange(of: watchPartyOwner.presentation?.id) { old, new in
             if old == nil, let new, activeScreen.isPlayer, playbackPartyID == nil {
                 // InSight adopted the already-playing PlayerViewModel. Keep its view identity stable.
@@ -611,7 +670,11 @@ struct ContentView: View {
                 }
             }
         }
+        .onChange(of: watchPartyOwner.incomingMediaTransition?.id) { _, transitionID in
+            handleIncomingMediaTransitionChange(transitionID)
+        }
         .onReceive(authManager.contextWillChange.merge(with: profileViewModel.contextWillChange)) { _ in
+            partyDetailsOrigin = nil
             partyLaunchID = UUID()
             partyLaunchTask?.cancel(); partyLaunchTask = nil
             creatingParty = false; choosingPartySource = false
@@ -624,6 +687,8 @@ struct ContentView: View {
             watchPartyOwner.resumeAfterForeground()
         }
         .onAppear {
+            Task { await releaseUpdateService.checkIfNeeded() }
+            Task { await announcementService.checkIfNeeded() }
             if WatchPartyConfiguration.isEnabled {
                 watchPartyOwner.attach(authManager: authManager, profiles: profileViewModel)
             }
@@ -721,6 +786,12 @@ struct ContentView: View {
                 backgroundedAt = Date()
                 syncManager.flushPendingPushes()
             case .active:
+                if backgroundedAt != nil {
+                    releaseUpdateService.beginForegroundSession()
+                    announcementService.beginForegroundSession()
+                }
+                Task { await releaseUpdateService.checkIfNeeded() }
+                Task { await announcementService.checkIfNeeded() }
                 syncManager.refreshAccountIfIdle()
                 presentProfileSelectionAfterBackgroundIfNeeded()
                 watchPartyOwner.resumeAfterForeground()
@@ -805,13 +876,61 @@ struct ContentView: View {
         return fullScreenOverlayPresented
     }
 
+    private var selectedAppNotice: AppNotice? {
+        AppNotice.select(
+            release: releaseUpdateService.latestRelease,
+            releaseIsAvailable: releaseUpdateService.shouldShowNotice,
+            announcementsEnabled: announcementService.isEnabled,
+            activeAnnouncements: announcementService.activeAnnouncements,
+            skippedAnnouncementIDs: announcementService.skippedAnnouncementIDs,
+            dismissedAnnouncementIDs: announcementService.dismissedAnnouncementIDs
+        )
+    }
+
+    private var visibleAppNotice: AppNotice? {
+        guard resolvedInitialScreen,
+              activeScreen == .main,
+              !isPreparingProfile,
+              !isOverlayPresented,
+              partyLaunchTask == nil,
+              selectedTab == .home else {
+            return nil
+        }
+        return selectedAppNotice
+    }
+
+    private func dismissVisibleAppNotice() {
+        guard let visibleAppNotice else { return }
+        dismissAppNotice(visibleAppNotice)
+    }
+
+    private func dismissAppNotice(_ notice: AppNotice) {
+        switch notice {
+        case .release(let release):
+            releaseUpdateService.dismissNotice(tag: release.tagName)
+        case .announcement(let announcement):
+            announcementService.dismiss(id: announcement.id)
+        }
+    }
+
+    private func skipAppNotice(_ notice: AppNotice) {
+        switch notice {
+        case .release(let release):
+            releaseUpdateService.skipCurrentVersion(tag: release.tagName)
+        case .announcement(let announcement):
+            announcementService.skip(id: announcement.id)
+        }
+    }
+
     /// Full-screen overlays already hide Home with alpha zero. Propagating
     /// `.disabled` through that hidden tree changes `isEnabled` for every
     /// resident card and forces the shelves to lay themselves out again while
     /// Details is entering. Keep the environment lock for visible menus, where
     /// Home still needs to stay on screen but must not receive focus.
     private var shouldDisableHomeContent: Bool {
-        isOverlayPresented && !fullScreenOverlayPresented
+        visibleAppNotice != nil
+            || presentedAppNoticeDetails != nil
+            || (isOverlayPresented && !fullScreenOverlayPresented)
     }
 
     /// Details/Player fully replace Home, so the tab view fades to black under
@@ -1773,7 +1892,7 @@ struct ContentView: View {
     /// Host from Details without starting a stream. The server owns room-code
     /// generation; membership and uncertain outcomes stay in WatchPartyService.
     private func createWatchPartyFromDetails(meta: NuvioMeta, episode: NuvioVideo?) {
-        guard WatchPartyConfiguration.isEnabled else { return }
+        guard WatchPartyConfiguration.isEnabled, case .details = activeScreen else { return }
         guard let service = watchPartyOwner.service, partyLaunchTask == nil else { return }
         guard authManager.isAuthenticated, !authManager.sessionNeedsReauthentication,
               profileViewModel.activeProfile != nil else {
@@ -1800,6 +1919,12 @@ struct ContentView: View {
             return
         }
         watchPartyOwner.message = nil
+        let destination = PartyDetailsDestination(
+            screen: activeScreen, tab: selectedTab, backStack: detailsBackStack,
+            returnDestination: detailsReturnDestination, collectionContext: detailsCollectionContext
+        )
+        let detailsGeneration = detailsDidDisappearGeneration
+        partyDetailsOrigin = nil
         let mark = UUID()
         partyLaunchID = mark
         partyLaunchTask = Task { @MainActor in
@@ -1807,7 +1932,10 @@ struct ContentView: View {
             do {
                 try await service.create(media: media, playback: nil)
                 guard !Task.isCancelled, partyLaunchID == mark,
-                      watchPartyOwner.service === service else { return }
+                      watchPartyOwner.service === service,
+                      activeScreen == destination.screen,
+                      detailsDidDisappearGeneration == detailsGeneration else { return }
+                rememberPartyDetailsOrigin(destination, media: media, service: service)
                 creatingParty = false
                 choosingPartySource = false
                 partyLaunchTask = nil
@@ -1815,12 +1943,50 @@ struct ContentView: View {
                 activeScreen = .main
             } catch {
                 guard !Task.isCancelled, partyLaunchID == mark,
-                      watchPartyOwner.service === service else { return }
+                      watchPartyOwner.service === service,
+                      activeScreen == destination.screen,
+                      detailsDidDisappearGeneration == detailsGeneration else { return }
+                rememberPartyDetailsOrigin(destination, media: media, service: service)
                 watchPartyOwner.message = "Watch Party could not create the room. Check the room status before retrying."
                 partyLaunchTask = nil
                 selectedTab = .party
                 activeScreen = .main
             }
+        }
+    }
+
+    private func rememberPartyDetailsOrigin(_ destination: PartyDetailsDestination,
+                                            media: WatchPartyMedia, service: WatchPartyService) {
+        guard watchPartyOwner.service === service,
+              let context = service.session?.playbackContext,
+              service.isCurrent(context.request), context.mediaKey == media.key else { return }
+        partyDetailsOrigin = PartyDetailsOrigin(context: context, media: media, destination: destination)
+    }
+
+    private var partyDetailsBackdrop: WatchPartyMedia? {
+        guard let origin = partyDetailsOrigin, let service = watchPartyOwner.service,
+              service.isCurrent(origin.context.request),
+              let current = service.session?.playbackContext,
+              WatchPartyDetailsPresentationPolicy.sameMembership(origin.context, current) else { return nil }
+        return origin.media
+    }
+
+    private func didExitWatchPartyRoom(_ context: WatchPartyPlaybackContext) {
+        guard let origin = partyDetailsOrigin,
+              WatchPartyDetailsPresentationPolicy.sameMembership(origin.context, context) else { return }
+        partyDetailsOrigin = nil
+        guard let service = watchPartyOwner.service, service.isCurrent(context.request),
+              service.session?.party == nil, activeScreen == .main, selectedTab == .party else { return }
+        creatingParty = false; choosingPartySource = false
+        pendingDetailsPlaybackRequestID = nil
+        reopenStreamPickerOnDetails = false
+        reopenStreamPickerEpisode = nil
+        detailsBackStack = origin.destination.backStack
+        detailsReturnDestination = origin.destination.returnDestination
+        detailsCollectionContext = origin.destination.collectionContext
+        selectedTab = origin.destination.tab
+        withAnimation(.easeInOut(duration: 0.24)) {
+            activeScreen = origin.destination.screen
         }
     }
 
@@ -1871,6 +2037,198 @@ struct ContentView: View {
                     ? "That title or episode doesn't match the room. Choose the matching entry; you can use any source."
                     : "Watch Party could not start. Check the room status and choose your source again."
                 selectedTab = .party; activeScreen = .main
+            }
+        }
+    }
+
+    @MainActor
+    private func changeWatchPartyEpisode(
+        _ episode: NuvioVideo,
+        prepared: PreparedNextStream,
+        sourceViewModel: PlayerViewModel,
+        expectedPresentationID: UUID,
+        expectedSurfaceID: UUID,
+        meta: NuvioMeta
+    ) async -> Bool {
+        guard activeScreen.isPlayer, playerSurfaceID == expectedSurfaceID,
+              playbackPartyID == expectedPresentationID,
+              let presentation = watchPartyOwner.presentation,
+              presentation.id == expectedPresentationID,
+              presentation.mount.isCurrent,
+              presentation.mount.viewModel === sourceViewModel,
+              let service = watchPartyOwner.service,
+              let room = service.session,
+              room.connection == .ready,
+              room.playbackContext == presentation.context,
+              room.party?.hostMemberID == room.memberID else { return false }
+
+        let startupToken = sourceViewModel.startupBenchmarkToken
+        var nextStartupToken: UUID?
+        do {
+            let media = try WatchPartyLaunchPolicy.mediaForPlayback(
+                meta, episode: episode, room: room.party?.media
+            )
+            try await watchPartyOwner.updateRoomMedia(media)
+            try Task.checkCancellation()
+            guard watchPartyOwner.service === service, service.session === room,
+                  room.connection == .ready, room.party?.media.key == media.key,
+                  activeScreen.isPlayer, playerSurfaceID == expectedSurfaceID else {
+                throw WatchPartyPlaybackRuntimeError.staleContext
+            }
+
+            playbackCurrentEpisode = episode
+            PlaybackStartupTiming.cancel(token: startupToken)
+            nextStartupToken = PlaybackStartupTiming.start(title: meta.name)
+            let nextPresentation = try watchPartyOwner.preparePlayback(media: media)
+            presentBuiltInPlayer(
+                url: prepared.url,
+                meta: meta,
+                subtitle: prepared.subtitleLine,
+                httpHeaders: prepared.httpHeaders,
+                externalSubtitles: prepared.subtitles,
+                resumeFrom: nil,
+                origin: playbackOrigin,
+                cacheFileIdentity: prepared.cacheFileIdentity,
+                filename: prepared.filename,
+                videoSize: prepared.videoSize,
+                videoHash: prepared.videoHash,
+                startupBenchmarkToken: nextStartupToken,
+                sourceID: prepared.sourceID,
+                party: nextPresentation
+            )
+            return true
+        } catch {
+            PlaybackStartupTiming.cancel(token: startupToken)
+            PlaybackStartupTiming.cancel(token: nextStartupToken)
+            guard activeScreen.isPlayer, playerSurfaceID == expectedSurfaceID,
+                  playbackPartyID == expectedPresentationID else { return false }
+            if watchPartyOwner.presentation?.id == expectedPresentationID {
+                watchPartyOwner.message = "Couldn't change the Watch Party episode. Try again."
+            } else {
+                playbackPartyID = nil
+                selectedTab = .party
+                activeScreen = .main
+            }
+            return false
+        }
+    }
+
+    @MainActor
+    private func handleIncomingMediaTransitionChange(_ transitionID: UUID?) {
+        guard let transitionID,
+              let transition = watchPartyOwner.incomingMediaTransition,
+              transition.id == transitionID else { return }
+        guard case let .player(_, meta, _, _, _, _) = activeScreen else {
+            watchPartyOwner.cancelIncomingMediaTransition(transitionID)
+            return
+        }
+        let expectedSurfaceID = playerSurfaceID
+        Task { @MainActor in
+            await handleIncomingWatchPartyMediaTransition(
+                transition, expectedSurfaceID: expectedSurfaceID, meta: meta
+            )
+        }
+    }
+
+    @MainActor
+    private func completeIncomingWatchPartyEpisode(
+        transitionID: UUID,
+        context: WatchPartyPlaybackContext,
+        media: WatchPartyMedia,
+        episode: NuvioVideo,
+        prepared: PreparedNextStream,
+        startupToken: UUID,
+        expectedSurfaceID: UUID,
+        meta: NuvioMeta
+    ) async -> Bool {
+        guard activeScreen.isPlayer, playerSurfaceID == expectedSurfaceID,
+              watchPartyOwner.isCurrentIncomingMediaTransition(transitionID, context: context),
+              let service = watchPartyOwner.service,
+              let room = service.session,
+              room.connection == .ready,
+              room.playbackContext == context,
+              room.party?.media.key == media.key,
+              context.mediaKey == media.key else { return false }
+
+        do {
+            let presentation = try watchPartyOwner.preparePlayback(media: media)
+            playbackCurrentEpisode = episode
+            presentBuiltInPlayer(
+                url: prepared.url,
+                meta: meta,
+                subtitle: prepared.subtitleLine,
+                httpHeaders: prepared.httpHeaders,
+                externalSubtitles: prepared.subtitles,
+                resumeFrom: nil,
+                origin: playbackOrigin,
+                cacheFileIdentity: prepared.cacheFileIdentity,
+                filename: prepared.filename,
+                videoSize: prepared.videoSize,
+                videoHash: prepared.videoHash,
+                startupBenchmarkToken: startupToken,
+                sourceID: prepared.sourceID,
+                party: presentation
+            )
+            watchPartyOwner.completeIncomingMediaTransition(transitionID, context: context)
+            return true
+        } catch {
+            PlaybackStartupTiming.cancel(token: startupToken)
+            return false
+        }
+    }
+
+    @MainActor
+    private func handleIncomingWatchPartyMediaTransition(
+        _ transition: WatchPartyAppOwner.IncomingMediaTransition,
+        expectedSurfaceID: UUID,
+        meta: NuvioMeta
+    ) async {
+        let id = transition.id
+        let context = transition.context
+        let viewModel = transition.viewModel
+        guard activeScreen.isPlayer, playerSurfaceID == expectedSurfaceID,
+              watchPartyOwner.isCurrentIncomingMediaTransition(id, context: context) else {
+            watchPartyOwner.cancelIncomingMediaTransition(id)
+            return
+        }
+        guard let plan = transition.plan,
+              let service = watchPartyOwner.service,
+              let room = service.session else {
+            if !watchPartyOwner.showWatchPartyAfterIncomingMediaTransition(id) {
+                selectedTab = .party
+                activeScreen = .main
+            }
+            return
+        }
+
+        let isCurrent: @MainActor () -> Bool = {
+            activeScreen.isPlayer && playerSurfaceID == expectedSurfaceID
+                && watchPartyOwner.isCurrentIncomingMediaTransition(id, context: context)
+        }
+        let waitUntilReady: @MainActor () async -> Bool = {
+            let deadline = Date().addingTimeInterval(20)
+            while service.session === room, room.connection != .ready {
+                guard !Task.isCancelled, isCurrent(),
+                      Date() < deadline else { return false }
+                do { try await Task.sleep(nanoseconds: 100_000_000) }
+                catch { return false }
+            }
+            return !Task.isCancelled && isCurrent()
+        }
+        let resolved = await viewModel.resolveIncomingWatchPartyEpisode(
+            plan, media: transition.media, context: context,
+            transitionID: id, isCurrent: isCurrent,
+            waitUntilReady: waitUntilReady
+        )
+        guard watchPartyOwner.incomingMediaTransition?.id == id else { return }
+        guard activeScreen.isPlayer, playerSurfaceID == expectedSurfaceID else {
+            watchPartyOwner.cancelIncomingMediaTransition(id)
+            return
+        }
+        if !resolved {
+            if !watchPartyOwner.showWatchPartyAfterIncomingMediaTransition(id) {
+                selectedTab = .party
+                activeScreen = .main
             }
         }
     }
@@ -1943,6 +2301,71 @@ struct ContentView: View {
                 partyLaunchTask = nil
                 selectedTab = .party
                 activeScreen = .main
+            }
+        }
+    }
+
+    private func chooseWatchPartySharedSource(_ stream: WatchPartyStream) {
+        guard WatchPartyConfiguration.isEnabled, activeScreen == .main, selectedTab == .party,
+              partyLaunchTask == nil, let service = watchPartyOwner.service,
+              !service.busy, let room = service.session,
+              let context = room.playbackContext, let media = room.party?.media,
+              let memberID = room.memberID, let hostID = room.party?.hostMemberID,
+              memberID != hostID, service.isCurrent(context.request) else { return }
+        let selection: WatchPartySharedStreamSelection
+        do { selection = try room.selectSharedStream(stream) }
+        catch {
+            watchPartyOwner.message = "The shared source changed or is unavailable. Ask the host to share again, or choose your own source."
+            return
+        }
+        watchPartyOwner.message = nil
+        let mark = UUID()
+        let navigationRevision = partySourceNavigationRevision
+        partyLaunchID = mark
+        partyLaunchTask = Task { @MainActor in
+            defer { if partyLaunchID == mark { partyLaunchTask = nil } }
+            // Revalidate the accepted membership and exact source revision after metadata loading.
+            // There is no source-URL probe, automatic playback, resend or persistence here.
+            let isCurrent = {
+                !Task.isCancelled && partyLaunchID == mark && activeScreen == .main
+                    && partySourceNavigationRevision == navigationRevision
+                    && selectedTab == .party && watchPartyOwner.service === service
+                    && service.session === room && service.isCurrent(context.request)
+                    && room.playbackContext == context
+                    && room.isCurrentSharedStreamSelection(selection)
+            }
+            do {
+                let target = try await WatchPartySharedPlaybackResolver.resolve(
+                    stream: selection.candidate.metadata, room: media, isCurrent: isCurrent,
+                    loadMetadata: { id, type in
+                        try await CinemetaCatalogRepository().getMetadata(id: id, type: type)
+                    }
+                )
+                guard isCurrent() else { return }
+                let presentation = try watchPartyOwner.preparePlayback(media: media)
+                presentation.mount.viewModel.markWatchPartySharedSource()
+                creatingParty = false; choosingPartySource = false
+                playbackIsActionPlaybackSession = false
+                playbackEpisodes = target.meta.isSeries ? (target.meta.videos ?? []) : []
+                playbackCurrentEpisode = target.episode
+                reopenStreamPickerOnDetails = false; reopenStreamPickerEpisode = nil
+                pendingDetailsPlaybackRequestID = nil
+                let subtitle = target.episode.map { "S\($0.season) · E\($0.episode) · \($0.title)" } ?? ""
+                presentBuiltInPlayer(
+                    url: target.url, meta: target.meta, subtitle: subtitle,
+                    httpHeaders: target.stream.headers, externalSubtitles: [], resumeFrom: nil,
+                    origin: .main, filename: target.stream.filename, videoSize: target.stream.videoSize,
+                    party: presentation
+                )
+            } catch {
+                guard isCurrent() else { return }
+                if error as? WatchPartySharedPlaybackError == .unsupportedResponseHeaders {
+                    watchPartyOwner.message = "This shared source needs unsupported response headers. Choose your own source."
+                } else if error as? WatchPartySharedPlaybackError == .missingEpisode {
+                    watchPartyOwner.message = "The room's exact episode is unavailable in your catalog. Choose your own source."
+                } else {
+                    watchPartyOwner.message = "The shared source could not be prepared for this title or episode. Ask the host to share again, or choose your own source."
+                }
             }
         }
     }
@@ -2371,7 +2794,10 @@ struct ContentView: View {
             authManager: authManager,
             syncManager: syncManager,
             watchPartyOwner: watchPartyOwner,
+            partyDetailsMedia: partyDetailsBackdrop,
+            onPartyRoomExited: didExitWatchPartyRoom,
             onCreateParty: {
+                partyDetailsOrigin = nil
                 creatingParty = true; choosingPartySource = false
                 reopenStreamPickerOnDetails = false
                 reopenStreamPickerEpisode = nil
@@ -2403,6 +2829,7 @@ struct ContentView: View {
                 }
                 openDetailsRoot(id: media.metaID, type: media.metaType)
             },
+            onChoosePartySharedSource: chooseWatchPartySharedSource,
             partyIsChoosing: creatingParty || choosingPartySource,
             onCancelPartySelection: {
                 creatingParty = false; choosingPartySource = false
@@ -3136,6 +3563,38 @@ struct ContentView: View {
         let party = playbackPartyID.flatMap { id in
             watchPartyOwner.presentation.flatMap { $0.id == id && $0.mount.isCurrent ? $0.mount : nil }
         }
+        let partyRoom = party == nil ? nil : watchPartyOwner.service?.session
+        let partyIsHost = party == nil
+            || (partyRoom?.memberID != nil && partyRoom?.party?.hostMemberID == partyRoom?.memberID)
+        let incomingMediaCompletion: WatchPartyIncomingEpisodePlan.Completion? = {
+            guard party != nil else { return nil }
+            return { transitionID, context, media, episode, prepared, startupToken in
+                await self.completeIncomingWatchPartyEpisode(
+                    transitionID: transitionID, context: context, media: media,
+                    episode: episode, prepared: prepared, startupToken: startupToken,
+                    expectedSurfaceID: surfaceIdentity, meta: meta
+                )
+            }
+        }()
+        let hostEpisodeResolved: (@MainActor (NuvioVideo, PreparedNextStream) async -> Bool)? = {
+            guard party != nil, partyIsHost else { return nil }
+            return { episode, prepared in
+                guard let party, let expectedID = playbackPartyID else { return false }
+                return await self.changeWatchPartyEpisode(
+                    episode, prepared: prepared, sourceViewModel: party.viewModel,
+                    expectedPresentationID: expectedID, expectedSurfaceID: surfaceIdentity, meta: meta
+                )
+            }
+        }()
+        let watchPartySourceChanged: (@MainActor () async -> Void)? = {
+            guard party != nil else { return nil }
+            return {
+                guard let room = watchPartyOwner.service?.session,
+                      let roomParty = room.party,
+                      roomParty.hostMemberID == room.memberID else { return }
+                _ = try? await room.stopSharingStream()
+            }
+        }()
         if playbackPartyID == nil || party != nil {
         PlayerView(
             url: url,
@@ -3151,12 +3610,13 @@ struct ContentView: View {
             videoHash: isStandalonePlaybackSession ? nil : playbackVideoHash,
             cacheFileIdentity: isStandalonePlaybackSession ? nil : playbackCacheFileIdentity,
             sourceID: isStandalonePlaybackSession ? nil : playbackSourceID,
-            episodes: (isStandalonePlaybackSession || party != nil) ? [] : playbackEpisodes,
+            episodes: isStandalonePlaybackSession ? [] : playbackEpisodes,
             currentEpisode: isStandalonePlaybackSession ? nil : playbackCurrentEpisode,
             initialStartupBenchmarkToken: startupBenchmarkToken,
             autoPlayNextEnabled: party == nil && autoPlayNext,
             autoPlayNextCountdownSeconds: autoPlayNextCountdown,
-            resolveNextStream: (isStandalonePlaybackSession || party != nil || !meta.isSeries) ? nil : { episode, startupToken in
+            allowsManualEpisodeSelection: party == nil || partyIsHost,
+            resolveNextStream: (isStandalonePlaybackSession || !meta.isSeries) ? nil : { episode, startupToken in
                 await Self.resolveNextEpisodeStream(
                     episode: episode,
                     seriesMeta: meta,
@@ -3193,14 +3653,14 @@ struct ContentView: View {
                     startupToken: nil
                 )
             },
-            fetchPlaybackSources: (isStandalonePlaybackSession || party != nil || meta.id.hasPrefix("live:")) ? nil : { contentId, type in
+            fetchPlaybackSources: (isStandalonePlaybackSession || meta.id.hasPrefix("live:")) ? nil : { contentId, type in
                 Self.playbackSourcesProgressively(
                     contentId: contentId,
                     type: type,
                     profileId: profileViewModel.activeProfile?.id
                 )
             },
-            resolvePlaybackStream: (isStandalonePlaybackSession || party != nil || meta.id.hasPrefix("live:")) ? nil : { stream, contentId, subtitleLine, startupToken in
+            resolvePlaybackStream: (isStandalonePlaybackSession || meta.id.hasPrefix("live:")) ? nil : { stream, contentId, subtitleLine, startupToken in
                 await Self.resolveChosenStream(
                     stream,
                     contentId: contentId,
@@ -3210,6 +3670,9 @@ struct ContentView: View {
                     startupToken: startupToken
                 )
             },
+            onWatchPartyIncomingMediaResolved: incomingMediaCompletion,
+            onWatchPartyEpisodeResolved: hostEpisodeResolved,
+            onWatchPartySourceChanged: watchPartySourceChanged,
             onRequestSources: (isStandalonePlaybackSession || party != nil || meta.id.hasPrefix("live:")) ? nil : {
                 withAnimation(.easeInOut(duration: 0.28)) {
                     reopenStreamPickerOnDetails = true
@@ -3719,8 +4182,11 @@ private struct TVMainTabView: View {
     let authManager: AuthManager
     let syncManager: NuvioSyncManager
     @ObservedObject var watchPartyOwner: WatchPartyAppOwner
+    var partyDetailsMedia: WatchPartyMedia? = nil
+    var onPartyRoomExited: (WatchPartyPlaybackContext) -> Void = { _ in }
     let onCreateParty: () -> Void
     let onChoosePartySource: (WatchPartyMedia) -> Void
+    var onChoosePartySharedSource: (WatchPartyStream) -> Void = { _ in }
     let partyIsChoosing: Bool
     let onCancelPartySelection: () -> Void
     let onSwitchProfile: () -> Void
@@ -3824,11 +4290,11 @@ private struct TVMainTabView: View {
 
     private func collectionTabTitle(_ destination: CollectionHomeDestination) -> String {
         let duplicates = collectionDestinations.filter {
-            $0.folder.title.caseInsensitiveCompare(destination.folder.title) == .orderedSame
+            $0.sidebarTitle.caseInsensitiveCompare(destination.sidebarTitle) == .orderedSame
         }.count
         return duplicates > 1
-            ? "\(destination.folder.title) • \(destination.collectionTitle)"
-            : destination.folder.title
+            ? "\(destination.sidebarTitle) • \(destination.collectionTitle)"
+            : destination.sidebarTitle
     }
 
     private func refreshCollectionDestinations() {
@@ -4023,10 +4489,19 @@ private struct TVMainTabView: View {
     private var partyTabContent: some View {
         if let service = watchPartyOwner.service {
             WatchPartyLobbyView(owner: watchPartyOwner, service: service,
+                onChooseSharedSource: onChoosePartySharedSource,
+                onReturnToPlayer: { PictureInPictureManager.shared.restoreFullscreenFromApp() },
                 canUseAccount: isAuthenticated && !sessionNeedsReauthentication && activeProfile != nil,
                 isChoosing: partyIsChoosing, onCreate: onCreateParty,
                 onChooseSource: onChoosePartySource, onCancelSelection: onCancelPartySelection,
-                onOpenProfile: onSwitchProfile)
+                onOpenProfile: {
+                    if !isAuthenticated || sessionNeedsReauthentication {
+                        onSignIn()
+                    } else {
+                        onSwitchProfile()
+                    }
+                },
+                detailsMedia: partyDetailsMedia, onRoomExited: onPartyRoomExited)
         } else {
             Text("Sign in and choose a profile to use Watch Party.")
         }
@@ -4579,7 +5054,7 @@ struct TVHomeView: View {
     @State private var isBannerDismissed = false
 
     @State private var localTitlesSection: TVHomeSection?
-    @State private var jellyfinSection: TVHomeSection?
+    @State private var jellyfinSections: [TVHomeSection] = []
     @State private var isLoading = true
     @State private var profileGateFailedLoadIdentity: TVHomeContentIdentity?
     @State private var focusedMeta: NuvioMeta?
@@ -7098,7 +7573,7 @@ struct TVHomeView: View {
             upCount: continueWatchingVisible ? upcomingMetas.count : 0,
             upFirstId: continueWatchingVisible ? upcomingMetas.first?.id : nil,
             localCount: localTitlesSection?.items.count ?? 0,
-            jellyfinCount: jellyfinSection?.items.count ?? 0,
+            jellyfinCount: jellyfinSections.reduce(0) { $0 + $1.items.count },
             storeRevision: store.sectionsRevision,
             hideUnreleased: hideUnreleased,
             cwLandscape: continueWatchingLandscape,
@@ -7123,7 +7598,8 @@ struct TVHomeView: View {
         )
         let pinnedSections = ((continueWatching.isEmpty || !continueWatchingVisible) ? [] : [resumeSection])
             + ((upcomingMetas.isEmpty || !continueWatchingVisible) ? [] : [upcomingSection])
-            + [localTitlesSection, jellyfinSection].compactMap { $0 }
+            + [localTitlesSection].compactMap { $0 }
+            + jellyfinSections
         let allSections = collectionHome == nil ? pinnedSections + store.sections : store.sections
 
         let result: [TVHomeSection]
@@ -7135,7 +7611,8 @@ struct TVHomeView: View {
                 // Collection folder rows don't carry title posters; leave them intact.
                 if !section.collectionFolders.isEmpty
                     || section.id == TVHomeSection.localTitlesId
-                    || section.id == TVHomeSection.jellyfinId {
+                    || section.id == TVHomeSection.jellyfinId
+                    || section.id.hasPrefix(TVHomeSection.jellyfinLibraryIdPrefix) {
                     return section
                 }
                 var copy = section
@@ -8727,24 +9204,73 @@ struct TVHomeView: View {
 
     @MainActor
     private func loadJellyfinSection() async {
+        focusWork.cachedVisibleSections = nil
         guard collectionHome == nil else { return }
         guard contentIdentity.profileId != "none" && !contentIdentity.profileId.isEmpty else {
-            jellyfinSection = nil
+            jellyfinSections = []
             return
         }
         guard jellyfinLocalRowEnabled else {
-            jellyfinSection = nil
+            jellyfinSections = []
             return
         }
-        let metas = JellyfinLibraryIndex.shared.titles().compactMap {
+        let indexedTitles = JellyfinLibraryIndex.shared.titles()
+        let legacyTitles = indexedTitles.filter { $0.libraryID == nil || $0.libraryName == nil }
+        var sections: [TVHomeSection] = []
+        let legacyMetas = Self.jellyfinMetas(legacyTitles)
+        if !legacyMetas.isEmpty {
+            sections.append(TVHomeSection(
+                id: TVHomeSection.jellyfinId,
+                title: L10n.string("home_jellyfin_titles", fallback: "Jellyfin"),
+                items: legacyMetas
+            ))
+        }
+
+        let libraryTitles = indexedTitles.filter { $0.libraryID != nil && $0.libraryName != nil }
+        let groupedTitles = Dictionary(grouping: libraryTitles) {
+            JellyfinHomeLibraryKey(serverID: $0.serverID, libraryID: $0.libraryID!)
+        }
+        let serverOrder = Dictionary(uniqueKeysWithValues: JellyfinServerStore.shared.servers.enumerated().map {
+            ($0.element.id, $0.offset)
+        })
+        let orderedKeys = groupedTitles.keys.sorted { lhs, rhs in
+            let lhsServerOrder = serverOrder[lhs.serverID] ?? Int.max
+            let rhsServerOrder = serverOrder[rhs.serverID] ?? Int.max
+            if lhsServerOrder != rhsServerOrder { return lhsServerOrder < rhsServerOrder }
+            if lhs.serverID != rhs.serverID { return lhs.serverID < rhs.serverID }
+            let lhsName = groupedTitles[lhs]?.first?.libraryName ?? lhs.libraryID
+            let rhsName = groupedTitles[rhs]?.first?.libraryName ?? rhs.libraryID
+            if lhsName != rhsName { return lhsName < rhsName }
+            return lhs.libraryID < rhs.libraryID
+        }
+        for key in orderedKeys {
+            guard let titles = groupedTitles[key],
+                  let libraryName = titles.first?.libraryName else { continue }
+            let metas = Self.jellyfinMetas(titles)
+            guard !metas.isEmpty else { continue }
+            sections.append(TVHomeSection(
+                id: TVHomeSection.jellyfinLibraryId(serverID: key.serverID, libraryID: key.libraryID),
+                title: libraryName,
+                items: metas
+            ))
+        }
+        jellyfinSections = sections
+    }
+
+    @MainActor
+    private static func jellyfinMetas(_ titles: [JellyfinIndexedTitle]) -> [NuvioMeta] {
+        titles.sorted {
+            if $0.name != $1.name { return $0.name < $1.name }
+            return $0.contentId < $1.contentId
+        }.compactMap {
             JellyfinLibraryIndex.shared.meta(forContentId: $0.contentId)
         }
-        jellyfinSection = metas.isEmpty ? nil : TVHomeSection(
-            id: TVHomeSection.jellyfinId,
-            title: L10n.string("home_jellyfin_titles", fallback: "Jellyfin"),
-            items: metas
-        )
     }
+}
+
+private struct JellyfinHomeLibraryKey: Hashable {
+    let serverID: String
+    let libraryID: String
 }
 
 struct TVHomeSection: Identifiable {
@@ -8752,6 +9278,10 @@ struct TVHomeSection: Identifiable {
     static let upcomingId = "upcoming"
     static let localTitlesId = "local_titles"
     static let jellyfinId = "jellyfin_titles"
+    static let jellyfinLibraryIdPrefix = "jellyfin_library_"
+    static func jellyfinLibraryId(serverID: String, libraryID: String) -> String {
+        "\(jellyfinLibraryIdPrefix)\(serverID):\(libraryID)"
+    }
     /// Id prefix for rows built from account-synced collections.
     static let collectionIdPrefix = "collection_"
 

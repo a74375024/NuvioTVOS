@@ -32,6 +32,11 @@ extension PlayerView {
                                 partyPlayback.finish()
                                 return
                             }
+                            viewModel.reloadCurrentStream = reloadCurrentStream
+                            viewModel.fetchPlaybackSources = fetchPlaybackSources
+                            viewModel.resolvePlaybackStream = resolvePlaybackStream
+                            viewModel.onWatchPartySourceChanged = onWatchPartySourceChanged
+                            configureEpisodeControls()
                             PlaybackWakeLock.acquire(ownerID: viewModel.sessionCoordinator.wakeLockOwnerID)
                             syncPlaybackWakeLock()
                             focusRemoteInput()
@@ -49,6 +54,7 @@ extension PlayerView {
                 viewModel.reloadCurrentStream = reloadCurrentStream
                 viewModel.fetchPlaybackSources = fetchPlaybackSources
                 viewModel.resolvePlaybackStream = resolvePlaybackStream
+                viewModel.onWatchPartySourceChanged = onWatchPartySourceChanged
                 viewModel.load(
                     url: url,
                     meta: meta,
@@ -82,20 +88,21 @@ extension PlayerView {
                         filename: filename
                     )
                 }
-                if !isStandalonePlaybackSession, let resolveNextStream {
+                // A shuffle started from the show page applies before the
+                // next episode is worked out.
+                if !isStandalonePlaybackSession, resolveNextStream != nil {
                     viewModel.prepareShuffle(
                         launch: ShuffleLaunchStore.shared.consume(showID: meta.id, episodeID: currentEpisode?.id)
                     )
-                    viewModel.configureNextEpisode(
-                        episodes: episodes,
-                        current: currentEpisode,
-                        autoPlayEnabled: autoPlayNextEnabled,
-                        autoPlayCountdownSeconds: autoPlayNextCountdownSeconds,
-                        resolver: resolveNextStream
-                    )
                 }
+                configureEpisodeControls()
             }
             .onChange(of: partyPlaybackIdentity) { oldIdentity, newIdentity in
+                if oldIdentity != nil, newIdentity == nil {
+                    viewModel.onWatchPartySourceChanged = nil
+                    configureEpisodeControls()
+                    return
+                }
                 // In-place room adoption keeps this PlayerView and its StateObject alive.
                 // Attach the runtime surface without repeating load() for the current source.
                 guard oldIdentity == nil, newIdentity != nil,
@@ -104,10 +111,15 @@ extension PlayerView {
                 do {
                     let attachment = try partyPlayback.attach()
                     partySurface = attachment.surface
+                    viewModel.reloadCurrentStream = reloadCurrentStream
+                    viewModel.fetchPlaybackSources = fetchPlaybackSources
+                    viewModel.resolvePlaybackStream = resolvePlaybackStream
+                    viewModel.onWatchPartySourceChanged = onWatchPartySourceChanged
                     guard viewModel.rebindWatchPartyFullscreen() else {
                         partyPlayback.finish()
                         return
                     }
+                    configureEpisodeControls()
                     PlaybackWakeLock.acquire(ownerID: viewModel.sessionCoordinator.wakeLockOwnerID)
                     syncPlaybackWakeLock()
                 } catch {
@@ -377,5 +389,20 @@ extension PlayerView {
                     focusRemoteInput()
                 }
             }
+    }
+
+    private func configureEpisodeControls() {
+        guard !isStandalonePlaybackSession, let resolveNextStream else { return }
+        viewModel.configureNextEpisode(
+            episodes: episodes,
+            current: currentEpisode,
+            autoPlayEnabled: partyPlayback == nil && autoPlayNextEnabled,
+            autoPlayCountdownSeconds: autoPlayNextCountdownSeconds,
+            resolver: resolveNextStream,
+            allowsManualEpisodeSelection: allowsManualEpisodeSelection,
+            isCurrentPlayerSurface: isCurrentPlayerSurface,
+            onWatchPartyEpisodeResolved: onWatchPartyEpisodeResolved,
+            onWatchPartyIncomingMediaResolved: onWatchPartyIncomingMediaResolved
+        )
     }
 }

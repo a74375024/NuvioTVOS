@@ -18,6 +18,9 @@ struct SubtitleTrack: Identifiable, Equatable {
     /// stream. Lets the subtitle panel tell external tracks apart and map them
     /// back to the `NuvioSubtitle` they were added from.
     var externalFilename: String = ""
+    /// Backend forced disposition. External tracks also use a title fallback
+    /// because subtitle providers do not expose container disposition metadata.
+    var isForced: Bool = false
     var isNativelyRenderedSubtitle: Bool = false
 }
 

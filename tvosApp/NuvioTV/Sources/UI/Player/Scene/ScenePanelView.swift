@@ -1,23 +1,47 @@
 import SwiftUI
 
+struct ScenePanelWatchPartyFocusContext {
+    let entryLocked: Bool
+    let entryFocusTarget: String
+    let entryFallbackTarget: String
+    let onFocusChanged: (String?) -> Void
+    let onMoveUpFromContent: () -> Void
+    let focusTab: (SceneTab) -> Void
+}
+
 struct ScenePanelView: View {
     @ObservedObject var viewModel: SceneViewModel
+    var isAdvancing: Bool = false
     let onDismiss: () -> Void
     let onPlayNextEpisode: (() -> Void)?
-    let watchPartyContent: ((FocusState<String?>.Binding, FocusState<SceneTab?>.Binding) -> AnyView)?
+    let watchPartyContent: ((
+        FocusState<String?>.Binding,
+        ScenePanelWatchPartyFocusContext
+    ) -> AnyView)?
     let watchPartyFocusTarget: String
+
+    private enum FocusSection: Equatable { case tabs, content }
     
     @FocusState private var focusedTab: SceneTab?
     @FocusState private var focusedCardID: String?
+    @State private var activeFocusSection: FocusSection = .tabs
+    @State private var contentFocusAnchors: [SceneTab: String] = [:]
+    @State private var focusHandoffGeneration = 0
+    @State private var pendingTabFocusTarget: SceneTab?
     
     init(
         viewModel: SceneViewModel,
+        isAdvancing: Bool = false,
         onDismiss: @escaping () -> Void,
         onPlayNextEpisode: (() -> Void)? = nil,
-        watchPartyContent: ((FocusState<String?>.Binding, FocusState<SceneTab?>.Binding) -> AnyView)? = nil,
+        watchPartyContent: ((
+            FocusState<String?>.Binding,
+            ScenePanelWatchPartyFocusContext
+        ) -> AnyView)? = nil,
         watchPartyFocusTarget: String = "party.start"
     ) {
         self.viewModel = viewModel
+        self.isAdvancing = isAdvancing
         self.onDismiss = onDismiss
         self.onPlayNextEpisode = onPlayNextEpisode
         self.watchPartyContent = watchPartyContent
@@ -33,6 +57,7 @@ struct ScenePanelView: View {
                 // Tab Header Bar
                 tabHeaderBar
                     .padding(.top, 10)
+                    .focusSection()
                 
                 // Active Tab Content
                 Group {
@@ -44,29 +69,91 @@ struct ScenePanelView: View {
                     case .upNext:
                         upNextTabContent
                     case .watchParty:
-                        watchPartyContent?($focusedCardID, $focusedTab) ?? AnyView(EmptyView())
+                        watchPartyContent?(
+                            $focusedCardID,
+                            ScenePanelWatchPartyFocusContext(
+                                entryLocked: activeFocusSection != .content,
+                                entryFocusTarget: contentFocusAnchor(for: .watchParty) ?? watchPartyFocusTarget,
+                                entryFallbackTarget: watchPartyFocusTarget,
+                                onFocusChanged: rememberWatchPartyFocus,
+                                onMoveUpFromContent: focusSelectedTabFromContent,
+                                focusTab: requestTabFocus
+                            )
+                        ) ?? AnyView(EmptyView())
                     }
                 }
                 // Keep the bottom-anchored panel at a constant size across tab navigation.
                 // The previous 272/300pt switch made InSight visibly jump vertically.
                 .frame(height: 300, alignment: .top)
+                .focusSection()
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         .onExitCommand {
             onDismiss()
         }
+        .onDisappear {
+            focusHandoffGeneration &+= 1
+            pendingTabFocusTarget = nil
+        }
         .onAppear {
-            if focusedTab == nil {
-                focusedTab = viewModel.selectedTab
-            }
+            activeFocusSection = .tabs
+            focusedTab = viewModel.selectedTab
         }
         .onChange(of: focusedTab) { _, newTab in
-            if let newTab, viewModel.selectedTab != newTab {
+            if let pending = pendingTabFocusTarget {
+                guard let newTab else {
+                    reassertPendingTabFocus(pending)
+                    return
+                }
+                if newTab == pending {
+                    activeFocusSection = .tabs
+                } else {
+                    reassertPendingTabFocus(pending)
+                }
+                return
+            }
+            guard let newTab else { return }
+            invalidateFocusHandoff()
+            activeFocusSection = .tabs
+            if viewModel.selectedTab != newTab {
                 withAnimation(.easeInOut(duration: 0.18)) {
                     viewModel.selectTab(newTab)
                 }
             }
+        }
+        .onChange(of: viewModel.selectedTab) { _, newTab in
+            if let pending = pendingTabFocusTarget {
+                if pending != newTab { requestTabFocus(newTab) }
+                else { activeFocusSection = .tabs }
+            } else if focusedTab == newTab {
+                activeFocusSection = .tabs
+            } else {
+                requestTabFocus(newTab)
+            }
+        }
+        .onChange(of: focusedCardID) { _, newID in
+            if let pending = pendingTabFocusTarget {
+                reassertPendingTabFocus(pending)
+                return
+            }
+            guard let newID else { return }
+            activeFocusSection = .content
+            if isValidContentAnchor(newID, for: viewModel.selectedTab) {
+                contentFocusAnchors[viewModel.selectedTab] = newID
+            }
+        }
+        .onChange(of: viewModel.snapshot.actors.map(\.id)) { _, _ in
+            reconcileActiveContentFocus()
+        }
+        .onChange(of: viewModel.snapshot.song?.id) { _, _ in
+            reconcileActiveContentFocus()
+        }
+        .onChange(of: viewModel.nextEpisode?.id) { _, _ in
+            reconcileActiveContentFocus()
+        }
+        .onChange(of: watchPartyFocusTarget) { _, _ in
+            reconcileActiveContentFocus()
         }
         .defaultFocus($focusedTab, viewModel.selectedTab)
     }
@@ -104,6 +191,8 @@ struct ScenePanelView: View {
                 .buttonStyle(PosterCardButtonStyle())
                 .focused($focusedTab, equals: tab)
                 .focusEffectDisabledIfAvailable()
+                .disabled((pendingTabFocusTarget != nil && pendingTabFocusTarget != tab)
+                    || (activeFocusSection == .content && viewModel.selectedTab != tab))
                 .scaleEffect(isTabFocused ? 1.05 : 1.0)
                 .animation(.easeOut(duration: 0.14), value: isTabFocused)
                 .onExitCommand(perform: onDismiss)
@@ -142,11 +231,11 @@ struct ScenePanelView: View {
                         viewModel.openDetail(.song(song))
                     }
                     .focused($focusedCardID, equals: "song-\(song.id)")
+                    .disabled(isContentEntryLocked("song-\(song.id)"))
                     .onExitCommand(perform: onDismiss)
                     .onMoveCommand { direction in
                         if direction == .up {
-                            focusedCardID = nil
-                            focusedTab = viewModel.selectedTab
+                            focusSelectedTabFromContent()
                         }
                     }
                 } else if !recognizedActors.isEmpty {
@@ -160,11 +249,11 @@ struct ScenePanelView: View {
                             viewModel.openDetail(.actor(actor, detail: nil))
                         }
                         .focused($focusedCardID, equals: "actor-\(actor.id)")
+                        .disabled(isContentEntryLocked("actor-\(actor.id)"))
                         .onExitCommand(perform: onDismiss)
                         .onMoveCommand { direction in
                             if direction == .up {
-                                focusedCardID = nil
-                                focusedTab = viewModel.selectedTab
+                                focusSelectedTabFromContent()
                             }
                         }
                     }
@@ -175,11 +264,11 @@ struct ScenePanelView: View {
                             viewModel.openDetail(.song(song))
                         }
                         .focused($focusedCardID, equals: "song-\(song.id)")
+                        .disabled(isContentEntryLocked("song-\(song.id)"))
                         .onExitCommand(perform: onDismiss)
                         .onMoveCommand { direction in
                             if direction == .up {
-                                focusedCardID = nil
-                                focusedTab = viewModel.selectedTab
+                                focusSelectedTabFromContent()
                             }
                         }
                     }
@@ -338,7 +427,11 @@ struct ScenePanelView: View {
         
         VStack(alignment: .leading, spacing: 0) {
             if let next = viewModel.nextEpisode {
+                let isPlayable = EpisodeReleasePolicy.hasAired(next.released)
+                let airDateText = EpisodeReleasePolicy.airDateText(for: next.released).map { "Airs \($0)" } ?? "Upcoming"
+                
                 Button(action: {
+                    guard isPlayable else { return }
                     onPlayNextEpisode?()
                 }) {
                     HStack(spacing: 24) {
@@ -357,12 +450,6 @@ struct ScenePanelView: View {
                                     }
                                 }
                             }
-                            
-                            Image(systemName: "play.fill")
-                                .font(.system(size: 30))
-                                .foregroundColor(.white)
-                                .padding(16)
-                                .background(Circle().fill(Color.black.opacity(0.6)))
                         }
                         
                         VStack(alignment: .leading, spacing: 8) {
@@ -376,25 +463,37 @@ struct ScenePanelView: View {
                                 .foregroundColor(isNextFocused ? .black : .white)
                                 .lineLimit(1)
                             
-                            if let overview = next.overview, !overview.isEmpty {
+                            if !isPlayable {
+                                Text(airDateText)
+                                    .font(.system(size: 16, weight: .medium))
+                                    .foregroundColor(isNextFocused ? Color.black.opacity(0.7) : Color.white.opacity(0.7))
+                            } else if let overview = next.overview, !overview.isEmpty {
                                 Text(overview)
                                     .font(.system(size: 16, weight: .regular))
                                     .foregroundColor(isNextFocused ? Color.black.opacity(0.7) : Color.white.opacity(0.7))
                                     .lineLimit(2)
                             }
-                            
+
                             HStack(spacing: 8) {
-                                Image(systemName: "play.fill")
-                                    .font(.system(size: 14))
-                                Text("Play Next Episode")
-                                    .font(.system(size: 16, weight: .semibold))
+                                if isAdvancing {
+                                    ProgressView()
+                                        .progressViewStyle(CircularProgressViewStyle(tint: isNextFocused && isPlayable ? .black : .white))
+                                        .scaleEffect(0.8)
+                                    Text(L10n.string("player_starting", fallback: "Starting…"))
+                                        .font(.system(size: 16, weight: .semibold))
+                                } else {
+                                    Image(systemName: isPlayable ? "play.fill" : "calendar")
+                                        .font(.system(size: 14))
+                                    Text(isPlayable ? L10n.string("tvos_play_next_episode", fallback: "Play Next Episode") : L10n.string("player_not_yet", fallback: "Not Yet"))
+                                        .font(.system(size: 16, weight: .semibold))
+                                }
                             }
-                            .foregroundColor(.white)
+                            .foregroundColor(isNextFocused && isPlayable ? .black : .white)
                             .padding(.horizontal, 18)
                             .padding(.vertical, 10)
                             .background(
                                 Capsule()
-                                    .fill(isNextFocused ? Color.black : Color.white.opacity(0.2))
+                                    .fill(isNextFocused && isPlayable ? Color.white : Color.white.opacity(0.2))
                             )
                             .padding(.top, 4)
                         }
@@ -408,14 +507,14 @@ struct ScenePanelView: View {
                 }
                 .buttonStyle(PosterCardButtonStyle())
                 .focused($focusedCardID, equals: "upNext")
+                .disabled(isContentEntryLocked("upNext"))
                 .focusEffectDisabledIfAvailable()
                 .scaleEffect(isNextFocused ? 1.03 : 1.0)
                 .animation(.easeOut(duration: 0.14), value: isNextFocused)
                 .onExitCommand(perform: onDismiss)
                 .onMoveCommand { direction in
                     if direction == .up {
-                        focusedCardID = nil
-                        focusedTab = viewModel.selectedTab
+                        focusSelectedTabFromContent()
                     }
                 }
                 .padding(.horizontal, 60)
@@ -435,32 +534,137 @@ struct ScenePanelView: View {
     // MARK: - Focus Management
     
     private func focusFirstCard() {
-        switch viewModel.selectedTab {
-        case .scene:
-            if viewModel.snapshot.actors.isEmpty, let song = viewModel.snapshot.song {
-                focusedTab = nil
-                focusedCardID = "song-\(song.id)"
-            } else if let firstActor = viewModel.snapshot.actors.first {
-                focusedTab = nil
-                focusedCardID = "actor-\(firstActor.id)"
-            } else if let song = viewModel.snapshot.song {
-                focusedTab = nil
-                focusedCardID = "song-\(song.id)"
-            } else {
-                focusedTab = viewModel.selectedTab
-            }
-        case .upNext:
-            if viewModel.nextEpisode != nil {
-                focusedTab = nil
-                focusedCardID = "upNext"
-            } else {
-                focusedTab = viewModel.selectedTab
-            }
-        case .info:
-            focusedTab = viewModel.selectedTab
-        case .watchParty:
-            focusedTab = nil
-            focusedCardID = watchPartyFocusTarget
+        invalidateFocusHandoff()
+        let generation = focusHandoffGeneration
+        let tab = viewModel.selectedTab
+        guard let target = contentFocusAnchor(for: tab) else {
+            requestTabFocus(tab)
+            return
         }
+        activeFocusSection = .content
+        focusedCardID = target
+        DispatchQueue.main.async {
+            guard focusHandoffGeneration == generation,
+                  viewModel.selectedTab == tab,
+                  activeFocusSection == .content else { return }
+            guard let currentTarget = contentFocusAnchor(for: tab) else {
+                focusSelectedTabFromContent()
+                return
+            }
+            if focusedCardID != currentTarget {
+                focusedCardID = currentTarget
+            }
+        }
+    }
+
+    private func focusSelectedTabFromContent() {
+        requestTabFocus(viewModel.selectedTab)
+    }
+
+    private func requestTabFocus(_ tab: SceneTab) {
+        invalidateFocusHandoff()
+        let generation = focusHandoffGeneration
+        pendingTabFocusTarget = tab
+        activeFocusSection = .tabs
+        if viewModel.selectedTab != tab {
+            withAnimation(.easeInOut(duration: 0.18)) {
+                viewModel.selectTab(tab)
+            }
+        }
+        focusedCardID = nil
+        focusedTab = tab
+        DispatchQueue.main.async {
+            guard focusHandoffGeneration == generation,
+                  viewModel.selectedTab == tab,
+                  pendingTabFocusTarget == tab else { return }
+            if focusedTab != tab { focusedTab = tab }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+            guard focusHandoffGeneration == generation,
+                  pendingTabFocusTarget == tab else { return }
+            pendingTabFocusTarget = nil
+        }
+    }
+
+    private func reassertPendingTabFocus(_ tab: SceneTab) {
+        let generation = focusHandoffGeneration
+        DispatchQueue.main.async {
+            guard focusHandoffGeneration == generation,
+                  pendingTabFocusTarget == tab,
+                  viewModel.selectedTab == tab else { return }
+            if focusedTab != tab { focusedTab = tab }
+        }
+    }
+
+    private func invalidateFocusHandoff() {
+        focusHandoffGeneration &+= 1
+        pendingTabFocusTarget = nil
+    }
+
+    private func isContentEntryLocked(_ id: String) -> Bool {
+        guard activeFocusSection != .content else { return false }
+        return contentFocusAnchor(for: viewModel.selectedTab) != id
+    }
+
+    private func contentFocusAnchor(for tab: SceneTab) -> String? {
+        let anchors: [String]
+        switch tab {
+        case .scene:
+            let actors = viewModel.snapshot.actors.map { "actor-\($0.id)" }
+            let song = viewModel.snapshot.song.map { "song-\($0.id)" }
+            anchors = actors.isEmpty ? (song.map { [$0] } ?? []) : actors + (song.map { [$0] } ?? [])
+        case .info:
+            anchors = []
+        case .upNext:
+            anchors = viewModel.nextEpisode == nil ? [] : ["upNext"]
+        case .watchParty:
+            anchors = [contentFocusAnchors[.watchParty] ?? watchPartyFocusTarget]
+        }
+        if let remembered = contentFocusAnchors[tab], anchors.contains(remembered) {
+            return remembered
+        }
+        return anchors.first
+    }
+
+    private func isValidContentAnchor(_ id: String, for tab: SceneTab) -> Bool {
+        switch tab {
+        case .scene:
+            return contentFocusAnchorCandidates(for: tab).contains(id)
+        case .info:
+            return false
+        case .upNext:
+            return id == "upNext" && viewModel.nextEpisode != nil
+        case .watchParty:
+            return id.hasPrefix("party.")
+        }
+    }
+
+    private func contentFocusAnchorCandidates(for tab: SceneTab) -> [String] {
+        guard tab == .scene else { return [] }
+        let actors = viewModel.snapshot.actors.map { "actor-\($0.id)" }
+        let song = viewModel.snapshot.song.map { "song-\($0.id)" }
+        return actors + (song.map { [$0] } ?? [])
+    }
+
+    private func rememberWatchPartyFocus(_ id: String?) {
+        if let pending = pendingTabFocusTarget {
+            reassertPendingTabFocus(pending)
+            return
+        }
+        guard let id, isValidContentAnchor(id, for: .watchParty) else { return }
+        contentFocusAnchors[.watchParty] = id
+        activeFocusSection = .content
+    }
+
+    private func reconcileActiveContentFocus() {
+        guard activeFocusSection == .content else { return }
+        if let focusedCardID, isValidContentAnchor(focusedCardID, for: viewModel.selectedTab) {
+            return
+        }
+        guard let target = contentFocusAnchor(for: viewModel.selectedTab) else {
+            focusSelectedTabFromContent()
+            return
+        }
+        focusedCardID = target
     }
 }

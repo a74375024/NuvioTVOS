@@ -61,6 +61,28 @@ private final class PlayerControlsTestEngine: PlaybackEngineControlling {
 }
 
 @MainActor
+private final class PollingSceneFrameProvider: SceneFrameProviding {
+    let isSupported = true
+    let capabilityMessage: String? = nil
+    private(set) var captureCount = 0
+    var onCapture: ((Int) -> Void)?
+
+    func captureCurrentFrame(maxWidth: Int, context: SceneContext) async -> SceneFrame? {
+        captureCount += 1
+        onCapture?(captureCount)
+        return nil
+    }
+}
+
+private struct EmptyPlaybackSceneCastProvider: SceneCastProviding {
+    func fetchCast(context: SceneContext) async throws -> [SceneCastCandidate] { [] }
+}
+
+private struct EmptyPlaybackSceneSoundtrackProvider: SceneSoundtrackProviding {
+    func fetchSoundtrack(context: SceneContext) async throws -> [SceneTimelineInterval] { [] }
+}
+
+@MainActor
 private final class DeferredNextStreamResolver {
     var onStart: (() -> Void)?
     private var continuation: CheckedContinuation<PreparedNextStream?, Never>?
@@ -120,7 +142,8 @@ final class ActionPlaybackSessionTests: XCTestCase {
     }
 
     @MainActor
-    private func makeModel(isAction: Bool = true) -> PlayerViewModel {
+    private func makeModel(isAction: Bool = true, playbackMeta: NuvioMeta? = nil,
+                           playbackURL: URL? = nil, resumeFrom: Double? = 600) -> PlayerViewModel {
         let coordinator = PlaybackSessionCoordinator(
             engineSettingProvider: { "MPVKit" },
             loadDispatcher: { _, _, _ in }
@@ -131,13 +154,13 @@ final class ActionPlaybackSessionTests: XCTestCase {
             return nil
         }
         model.load(
-            url: URL(fileURLWithPath: "/tmp/action-confirmation.mp4"),
-            meta: meta,
+            url: playbackURL ?? URL(fileURLWithPath: "/tmp/action-confirmation.mp4"),
+            meta: playbackMeta ?? meta,
             subtitle: "S1 · E1 · One",
-            resumeFrom: 600,
+            resumeFrom: resumeFrom,
             playbackOrigin: .details,
             sourceID: "action-source",
-            currentEpisode: episode,
+            currentEpisode: (playbackMeta ?? meta).isSeries ? episode : nil,
             isActionPlaybackSession: isAction
         )
         return model
@@ -161,6 +184,109 @@ final class ActionPlaybackSessionTests: XCTestCase {
         XCTAssertFalse(WatchedStore.contains(meta: meta), file: file, line: line)
         XCTAssertFalse(WatchedStore.containsEpisode(meta: meta, season: 1, episode: 1), file: file, line: line)
         XCTAssertEqual(LastPlaybackStreamStore.load(metaId: meta.id, season: 1, episode: 1)?.url, savedURL, file: file, line: line)
+    }
+
+    @MainActor
+    func testMovieDurationRemainsUnknownUntilFiniteInsteadOfBecomingLive() {
+        let movie = NuvioMeta(id: "tt-vod-duration", name: "Movie", type: "movie")
+        let model = makeModel(playbackMeta: movie, resumeFrom: nil)
+        defer { model.shutdown() }
+        let engine = sample(duration: 0, position: 1_000)
+        engine.hasCoherentTimeSample = false
+
+        for _ in 0..<6 { model.pollForTesting(using: engine) }
+        XCTAssertTrue(model.hasRenderedFirstFrame)
+        XCTAssertEqual(model.status, .playing)
+        XCTAssertFalse(model.isLiveStream, "Playing frames with unknown duration do not prove that a movie is live")
+        XCTAssertEqual(model.time.duration, 0)
+
+        engine.durationMs = 3_600_000
+        engine.positionMs = 5_000
+        engine.hasCoherentTimeSample = true
+        for _ in 0..<2 { model.pollForTesting(using: engine) }
+        XCTAssertFalse(model.isLiveStream)
+        XCTAssertEqual(model.time.duration, 3_600)
+    }
+
+    @MainActor
+    func testRecognizedLiveChannelStaysLiveWithUnknownOrFiniteDuration() {
+        let channel = NuvioMeta(id: "channel:news", name: "News", type: "channel")
+        let model = makeModel(playbackMeta: channel, resumeFrom: nil)
+        defer { model.shutdown() }
+        let engine = sample(duration: 0, position: 1_000)
+        for _ in 0..<6 { model.pollForTesting(using: engine) }
+        XCTAssertTrue(model.isLiveStream)
+        engine.durationMs = 600_000
+        engine.positionMs = 5_000
+        for _ in 0..<2 { model.pollForTesting(using: engine) }
+        XCTAssertTrue(model.isLiveStream, "A positive duration must not override an explicit channel identity")
+    }
+
+    @MainActor
+    func testMovieURLHostQueryAndFragmentDoNotActAsLiveResourceHints() throws {
+        let movie = NuvioMeta(id: "tt-vod-url", name: "Movie", type: "movie")
+        for value in [
+            "https://live.m3u8.example.test/vod/movie.mp4",
+            "https://video.example.test/vod/movie.mp4?label=/live/",
+            "https://video.example.test/vod/movie.mp4#live.m3u8"
+        ] {
+            let model = makeModel(playbackMeta: movie,
+                                  playbackURL: try XCTUnwrap(URL(string: value)), resumeFrom: nil)
+            defer { model.shutdown() }
+            XCTAssertFalse(model.isLiveStream, "Only the resource path may supply a URL hint")
+            let engine = sample(duration: 0, position: 1_000)
+            for _ in 0..<6 { model.pollForTesting(using: engine) }
+            XCTAssertFalse(model.isLiveStream, "Polling must not promote this source merely because duration is unknown")
+        }
+    }
+
+    @MainActor
+    func testLiveResourcePathsRemainRecognizedForMovieTypedAddons() throws {
+        let movieTypedChannel = NuvioMeta(id: "addon-news", name: "News", type: "movie")
+        for value in [
+            "https://video.example.test/live/news.m3u8",
+            "https://video.example.test/iptv/news.m3u8",
+            "https://video.example.test/news/live.m3u8"
+        ] {
+            let model = makeModel(playbackMeta: movieTypedChannel,
+                                  playbackURL: try XCTUnwrap(URL(string: value)), resumeFrom: nil)
+            defer { model.shutdown() }
+            XCTAssertTrue(model.isLiveStream, "Keep source-path hints for addons that use generic metadata types")
+        }
+    }
+
+    @MainActor
+    func testLiveIDAndNameHintsRemainRecognizedWithGenericMetadataTypes() {
+        for item in [
+            NuvioMeta(id: "iptv:news", name: "News", type: "movie"),
+            NuvioMeta(id: "addon-news", name: "[Live] News", type: "series"),
+            NuvioMeta(id: "pp-live:cdnlive~2558809", name: "🔴 LIVE: UFC 333 Volkanovski vs Evloev", type: "tv"),
+            NuvioMeta(id: "custom:123", name: "🔴 [LIVE] Sports", type: "tv"),
+            NuvioMeta(id: "addon-channel", name: "Live: Match", type: "movie"),
+            NuvioMeta(id: "tv:daddylive~456", name: "Stream", type: "tv")
+        ] {
+            let model = makeModel(playbackMeta: item, resumeFrom: nil)
+            defer { model.shutdown() }
+            XCTAssertTrue(model.isLiveStream, "Failed for \(item.id) / \(item.name)")
+        }
+    }
+
+    @MainActor
+    func testKnownLiveHintWaitsForFiniteTimelineBeforeClearingAfterMetadataRefresh() {
+        let hinted = NuvioMeta(id: "addon-news", name: "[Live] News", type: "movie")
+        let model = makeModel(playbackMeta: hinted, resumeFrom: nil)
+        defer { model.shutdown() }
+        let engine = sample(duration: 0, position: 1_000)
+        for _ in 0..<6 { model.pollForTesting(using: engine) }
+        XCTAssertTrue(model.isLiveStream)
+
+        model.activeMeta = NuvioMeta(id: "addon-news", name: "News", type: "movie")
+        model.pollForTesting(using: engine)
+        XCTAssertTrue(model.isLiveStream, "Missing duration must not erase an already recognized live hint")
+        engine.durationMs = 600_000
+        engine.hasCoherentTimeSample = true
+        model.pollForTesting(using: engine)
+        XCTAssertFalse(model.isLiveStream, "A coherent finite timeline may resolve the removed hint")
     }
 
     @MainActor
@@ -646,6 +772,18 @@ final class PlayerControlsSettingsTests: XCTestCase {
         let matched = PlayerViewModel.smartMatchedSubtitles(in: allSubtitles)
         XCTAssertEqual(matched.count, 1, "Smart matching must return at most one subtitle to prevent bulk download")
         XCTAssertEqual(matched.first?.url, "https://titulky.com/file/1.srt")
+
+        let forcedEnglish = NuvioSubtitle(
+            url: "https://subs.example/forced.srt", language: "eng", label: "English Forced"
+        )
+        let fullEnglish = NuvioSubtitle(
+            url: "https://subs.example/full.srt", language: "eng", label: "English Full"
+        )
+        XCTAssertEqual(
+            PlayerViewModel.smartMatchedSubtitles(in: [forcedEnglish, fullEnglish]).map(\.url),
+            [fullEnglish.url]
+        )
+        XCTAssertTrue(PlayerViewModel.smartMatchedSubtitles(in: [forcedEnglish]).isEmpty)
     }
 
     @MainActor
@@ -733,6 +871,126 @@ final class PlayerControlsSettingsTests: XCTestCase {
     }
 
     @MainActor
+    func testLateExternalSubtitlesUseForcedPolicyWhenPreferredAudioIsSelected() {
+        let savedLangs = ProfileSettings.current.string(forKey: SettingsKey.subtitleLanguages)
+        let savedSmart = ProfileSettings.current.object(forKey: SettingsKey.smartSubtitleMatching)
+        let savedAudioLanguage = ProfileSettings.current.string(forKey: SettingsKey.audioLanguage)
+        let savedForced = ProfileSettings.current.object(forKey: SettingsKey.forcedSubtitles)
+        addTeardownBlock {
+            if let savedLangs {
+                ProfileSettings.current.set(savedLangs, forKey: SettingsKey.subtitleLanguages)
+            } else {
+                ProfileSettings.current.removeObject(forKey: SettingsKey.subtitleLanguages)
+            }
+            if let savedSmart {
+                ProfileSettings.current.set(savedSmart, forKey: SettingsKey.smartSubtitleMatching)
+            } else {
+                ProfileSettings.current.removeObject(forKey: SettingsKey.smartSubtitleMatching)
+            }
+            if let savedAudioLanguage {
+                ProfileSettings.current.set(savedAudioLanguage, forKey: SettingsKey.audioLanguage)
+            } else {
+                ProfileSettings.current.removeObject(forKey: SettingsKey.audioLanguage)
+            }
+            if let savedForced {
+                ProfileSettings.current.set(savedForced, forKey: SettingsKey.forcedSubtitles)
+            } else {
+                ProfileSettings.current.removeObject(forKey: SettingsKey.forcedSubtitles)
+            }
+        }
+
+        ProfileSettings.current.set(SubtitleLanguagePreferences.encode(["English"]), forKey: SettingsKey.subtitleLanguages)
+        ProfileSettings.current.set("English", forKey: SettingsKey.audioLanguage)
+        ProfileSettings.current.set(true, forKey: SettingsKey.smartSubtitleMatching)
+        ProfileSettings.current.set(true, forKey: SettingsKey.forcedSubtitles)
+
+        let model = PlayerViewModel(
+            sessionCoordinator: PlaybackSessionCoordinator(aetherControllerFactory: { nil })
+        )
+        model.audioTracks = [AudioTrack(id: "1", name: "English", language: "eng", isSelected: true)]
+        model.subtitles = [
+            SubtitleTrack(id: "off", name: "Off", language: "", isSelected: false),
+            SubtitleTrack(id: "2", name: "English Full", language: "eng", isSelected: true)
+        ]
+
+        let full = NuvioSubtitle(url: "https://subs.example/full.srt", language: "eng", label: "English Full")
+        let forced = NuvioSubtitle(url: "https://subs.example/forced.srt", language: "eng", label: "English Forced")
+        model.mergeExternalSubtitles([full, forced])
+
+        XCTAssertEqual(model.pendingExternalSubtitles.map(\.url), [forced.url])
+        XCTAssertEqual(model.subtitles.first(where: { $0.isSelected })?.id, "off")
+    }
+
+    @MainActor
+    func testLateExternalSubtitlesSelectPreferredEmbeddedLanguageWithOrderedFallback() {
+        let savedLangs = ProfileSettings.current.string(forKey: SettingsKey.subtitleLanguages)
+        let savedAudioLanguage = ProfileSettings.current.string(forKey: SettingsKey.audioLanguage)
+        let savedSmart = ProfileSettings.current.object(forKey: SettingsKey.smartSubtitleMatching)
+        let savedForced = ProfileSettings.current.object(forKey: SettingsKey.forcedSubtitles)
+        addTeardownBlock {
+            if let savedLangs {
+                ProfileSettings.current.set(savedLangs, forKey: SettingsKey.subtitleLanguages)
+            } else {
+                ProfileSettings.current.removeObject(forKey: SettingsKey.subtitleLanguages)
+            }
+            if let savedAudioLanguage {
+                ProfileSettings.current.set(savedAudioLanguage, forKey: SettingsKey.audioLanguage)
+            } else {
+                ProfileSettings.current.removeObject(forKey: SettingsKey.audioLanguage)
+            }
+            if let savedSmart {
+                ProfileSettings.current.set(savedSmart, forKey: SettingsKey.smartSubtitleMatching)
+            } else {
+                ProfileSettings.current.removeObject(forKey: SettingsKey.smartSubtitleMatching)
+            }
+            if let savedForced {
+                ProfileSettings.current.set(savedForced, forKey: SettingsKey.forcedSubtitles)
+            } else {
+                ProfileSettings.current.removeObject(forKey: SettingsKey.forcedSubtitles)
+            }
+        }
+
+        ProfileSettings.current.set(SubtitleLanguagePreferences.encode(["English", "Arabic"]), forKey: SettingsKey.subtitleLanguages)
+        ProfileSettings.current.set("English", forKey: SettingsKey.audioLanguage)
+        ProfileSettings.current.set(true, forKey: SettingsKey.smartSubtitleMatching)
+        ProfileSettings.current.set(false, forKey: SettingsKey.forcedSubtitles)
+
+        let englishExternal = NuvioSubtitle(
+            url: "https://subs.example/english.srt",
+            language: "eng",
+            label: "English Full"
+        )
+        let cases: [(tracks: [SubtitleTrack], expectedID: String)] = [
+            (
+                [
+                    SubtitleTrack(id: "2", name: "English Full", language: "eng", isSelected: false),
+                    SubtitleTrack(id: "3", name: "Arabic Full", language: "ara", isSelected: false)
+                ],
+                "2"
+            ),
+            (
+                [SubtitleTrack(id: "3", name: "Arabic Full", language: "ara", isSelected: false)],
+                "3"
+            )
+        ]
+
+        for testCase in cases {
+            let model = PlayerViewModel(
+                sessionCoordinator: PlaybackSessionCoordinator(aetherControllerFactory: { nil })
+            )
+            model.audioTracks = [AudioTrack(id: "1", name: "English", language: "eng", isSelected: true)]
+            model.subtitles = [
+                SubtitleTrack(id: "off", name: "Off", language: "", isSelected: true)
+            ] + testCase.tracks
+
+            model.mergeExternalSubtitles([englishExternal])
+
+            XCTAssertEqual(model.subtitles.first(where: { $0.isSelected })?.id, testCase.expectedID)
+            XCTAssertTrue(model.pendingExternalSubtitles.isEmpty)
+        }
+    }
+
+    @MainActor
     func testMergeExternalSubtitlesDoesNotQueueWhenExplicitSelectionMade() {
         let savedLangs = ProfileSettings.current.string(forKey: SettingsKey.subtitleLanguages)
         let savedSmart = ProfileSettings.current.object(forKey: SettingsKey.smartSubtitleMatching)
@@ -805,6 +1063,52 @@ final class PlayerControlsSettingsTests: XCTestCase {
 
         XCTAssertEqual(model.availableExternalSubtitles[0].label, "Batman.2022.Proper.WEBRip")
         XCTAssertEqual(model.subtitles[0].name, "Batman.2022.Proper.WEBRip", "Loaded track name must be updated in-place")
+    }
+
+    @MainActor
+    func testWatchPartyChatToastRespectsUserPreference() {
+        let coordinator = PlaybackSessionCoordinator(aetherControllerFactory: { nil })
+        let model = PlayerViewModel(
+            sessionCoordinator: coordinator,
+            scrubThumbnailProvider: nil
+        )
+
+        let chatMessage = WatchPartyChatMessage(
+            id: 42,
+            memberID: "friend-1",
+            name: "Bob",
+            avatarURL: "https://example.com/avatar.jpg",
+            avatarColor: "#00FF00",
+            body: "Great movie!"
+        )
+
+        // 1. By default (no setting stored), toasts are enabled
+        ProfileSettings.current.removeObject(forKey: SettingsKey.partyChatToastsEnabled)
+        defer {
+            ProfileSettings.current.removeObject(forKey: SettingsKey.partyChatToastsEnabled)
+        }
+
+        model.handleWatchPartyChatMessage(chatMessage)
+        XCTAssertNotNil(model.playerToast)
+        XCTAssertEqual(model.playerToast?.message, "Great movie!")
+        XCTAssertEqual(model.playerToast?.senderName, "Bob")
+        XCTAssertEqual(model.playerToast?.avatarColor, "#00FF00")
+        XCTAssertEqual(model.playerToast?.initials, "B")
+
+        // 2. When disabled in settings, chat messages do not trigger toast
+        model.playerToast = nil
+        ProfileSettings.current.set(false, forKey: SettingsKey.partyChatToastsEnabled)
+
+        model.handleWatchPartyChatMessage(chatMessage)
+        XCTAssertNil(model.playerToast)
+
+        // 3. When explicitly re-enabled, toast triggers again
+        ProfileSettings.current.set(true, forKey: SettingsKey.partyChatToastsEnabled)
+
+        model.handleWatchPartyChatMessage(chatMessage)
+        XCTAssertNotNil(model.playerToast)
+        XCTAssertEqual(model.playerToast?.message, "Great movie!")
+        XCTAssertEqual(model.playerToast?.senderName, "Bob")
     }
 }
 @MainActor
@@ -2611,6 +2915,127 @@ final class ExternalPlayerTests: XCTestCase {
 
         // Audio delay should have reset to 0!
         XCTAssertEqual(model.audioDelayMs, 0)
+    }
+}
+
+extension PlayerControlsSettingsTests {
+    @MainActor
+    func testPlaybackPollNotifiesSceneOnObservedPauseAndResumeOnce() async {
+        let frameProvider = PollingSceneFrameProvider()
+        let scene = SceneCoordinator(
+            frameProvider: frameProvider,
+            castProvider: EmptyPlaybackSceneCastProvider(),
+            soundtrackProvider: EmptyPlaybackSceneSoundtrackProvider())
+        let session = PlaybackSessionCoordinator(aetherControllerFactory: { nil })
+        let model = PlayerViewModel(sessionCoordinator: session, sceneCoordinator: scene)
+        defer { scene.closePanel(); model.shutdown() }
+
+        let context = SceneContext(canonicalId: "poll-pause-transition", mediaType: "movie", title: "Pause Transition")
+        model.status = .playing
+        model.showScenePanel = true
+        model.sceneCoordinator.updateContext(context)
+        let firstCapture = expectation(description: "Panel begins its playing capture loop")
+        let pausedCapture = expectation(description: "Observed engine pause captures one frozen frame")
+        let explicitPauseCapture = expectation(description: "Explicit pause captures one frozen frame")
+        frameProvider.onCapture = { count in
+            if count == 1 { firstCapture.fulfill() }
+            if count == 2 { pausedCapture.fulfill() }
+            if count == 3 { explicitPauseCapture.fulfill() }
+        }
+        model.sceneCoordinator.openPanel()
+        await fulfillment(of: [firstCapture], timeout: 2)
+        XCTAssertTrue(scene.isFrameSamplingActive)
+
+        let engine = PlayerControlsTestEngine()
+        engine.isPlayerPlaying = true
+        engine.isTransportPlaying = true
+        engine.hasCoherentTimeSample = true
+        engine.durationMs = 120_000
+        engine.positionMs = 20_000
+        model.pollForTesting(using: engine)
+
+        engine.isPlayerPlaying = false
+        engine.isTransportPlaying = false
+        model.pollForTesting(using: engine)
+        await fulfillment(of: [pausedCapture], timeout: 2)
+        XCTAssertEqual(model.status, .paused)
+        XCTAssertFalse(scene.isFrameSamplingActive, "Paused Insight should retain only its one-shot frame")
+
+        model.pollForTesting(using: engine)
+        XCTAssertEqual(frameProvider.captureCount, 2, "Repeated paused polls must not capture another frame")
+
+        engine.isPlayerPlaying = true
+        engine.isTransportPlaying = true
+        model.pollForTesting(using: engine)
+        XCTAssertEqual(model.status, .playing)
+        XCTAssertTrue(scene.isFrameSamplingActive, "The observed resume should restart scene sampling")
+
+        model.pause()
+        await fulfillment(of: [explicitPauseCapture], timeout: 2)
+        engine.isPlayerPlaying = false
+        engine.isTransportPlaying = false
+        model.pollForTesting(using: engine)
+        XCTAssertEqual(frameProvider.captureCount, 3, "Polling must not duplicate the explicit pause capture")
+        XCTAssertFalse(scene.isFrameSamplingActive)
+    }
+
+    @MainActor
+    func testPausedOpenAndSeekAreOneShotAndBufferingDoesNotResumeSceneScan() async {
+        let frameProvider = PollingSceneFrameProvider()
+        let scene = SceneCoordinator(
+            frameProvider: frameProvider,
+            castProvider: EmptyPlaybackSceneCastProvider(),
+            soundtrackProvider: EmptyPlaybackSceneSoundtrackProvider())
+        let session = PlaybackSessionCoordinator(aetherControllerFactory: { nil })
+        let model = PlayerViewModel(sessionCoordinator: session, sceneCoordinator: scene)
+        defer { scene.closePanel(); model.shutdown() }
+
+        let context = SceneContext(canonicalId: "paused-one-shot", mediaType: "movie", title: "Paused")
+        model.status = .paused
+        model.showScenePanel = true
+        model.sceneCoordinator.updateContext(context)
+        let openCapture = expectation(description: "Paused open captures one frame")
+        let seekCapture = expectation(description: "Paused seek captures one new frame")
+        let resumedCapture = expectation(description: "Playback resumes Insight sampling after buffering")
+        frameProvider.onCapture = { count in
+            if count == 1 { openCapture.fulfill() }
+            if count == 2 { seekCapture.fulfill() }
+            if count == 3 { resumedCapture.fulfill() }
+        }
+        model.sceneCoordinator.openPanel()
+        await fulfillment(of: [openCapture], timeout: 2)
+        XCTAssertFalse(scene.isFrameSamplingActive)
+
+        scene.handleSeek()
+        await fulfillment(of: [seekCapture], timeout: 2)
+        XCTAssertFalse(scene.isFrameSamplingActive, "Paused seek should not leave a polling task armed")
+
+        let engine = PlayerControlsTestEngine()
+        engine.isPlayerLoading = true
+        engine.isPlayerPlaying = false
+        engine.isTransportPlaying = false
+        engine.durationMs = 120_000
+        engine.positionMs = 20_000
+        model.pollForTesting(using: engine)
+        XCTAssertEqual(model.status, .buffering)
+        XCTAssertFalse(scene.isFrameSamplingActive)
+        XCTAssertEqual(frameProvider.captureCount, 2)
+
+        engine.isPlayerLoading = false
+        engine.isPlayerPlaying = true
+        engine.isTransportPlaying = true
+        model.pollForTesting(using: engine)
+        await fulfillment(of: [resumedCapture], timeout: 2)
+        XCTAssertEqual(model.status, .playing)
+        XCTAssertTrue(scene.isFrameSamplingActive)
+
+        model.sceneCoordinator.closePanel()
+        model.showScenePanel = false
+        engine.isPlayerPlaying = false
+        engine.isTransportPlaying = false
+        model.pollForTesting(using: engine)
+        XCTAssertEqual(frameProvider.captureCount, 3, "Closed Insight must not capture from the poll path")
+        XCTAssertFalse(scene.isFrameSamplingActive)
     }
 }
 

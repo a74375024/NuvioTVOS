@@ -1,5 +1,13 @@
 import Foundation
+import OSLog
 import AetherEngine
+
+enum PlaybackDiagnosticSystemLogLevel: Sendable {
+    case notice
+    case warning
+    case error
+    case fault
+}
 
 struct PlaybackDiagnosticLogEntry: Identifiable, Equatable, Sendable {
     let id: UInt64
@@ -8,9 +16,10 @@ struct PlaybackDiagnosticLogEntry: Identifiable, Equatable, Sendable {
     let message: String
 }
 
-/// Recent playback diagnostics retained only in memory for the lifetime of the app.
+/// Recent playback diagnostics kept in memory; selected entries are also retained by unified logging.
 final class PlaybackDiagnosticLogStore: @unchecked Sendable {
     static let shared = PlaybackDiagnosticLogStore()
+    private static let systemLogger = Logger(subsystem: "com.pyksel.nuviotvos", category: "playback-diagnostics")
 
     private let lock = NSLock()
     private let maxEntries: Int
@@ -26,7 +35,7 @@ final class PlaybackDiagnosticLogStore: @unchecked Sendable {
         }
     }()
     private static let sensitiveHeaderExpression = try! NSRegularExpression(
-        pattern: #"(?i)\b(authorization|proxy-authorization|cookie|set-cookie|x-api-key|x-auth-token|x-access-token)\s*:\s*[^\r\n]*"#
+        pattern: #"(?i)[\"']?\b(authorization|proxy-authorization|cookie|set-cookie|x-api-key|x-auth-token|x-access-token|referer|referrer|user-agent|http[-_ ]?header[-_ ]?fields?)\b[\"']?\s*[:=]\s*[^\r\n]*"#
     )
     private static let urlExpression = try! NSRegularExpression(
         pattern: #"(?i)\b[a-z][a-z0-9+.-]*://[^\s\"']+"#
@@ -43,14 +52,18 @@ final class PlaybackDiagnosticLogStore: @unchecked Sendable {
         _ = aetherHandlerInstallation
     }
 
-    func append(source: String, message: String, timestamp: Date = Date()) {
+    func append(
+        source: String,
+        message: String,
+        timestamp: Date = Date(),
+        systemLogLevel: PlaybackDiagnosticSystemLogLevel? = nil
+    ) {
         let safeSource = Self.truncate(source, toUTF8Bytes: 64)
         let safeMessage = Self.truncate(Self.sanitize(message), toUTF8Bytes: maxMessageBytes)
         let byteCount = safeSource.utf8.count + safeMessage.utf8.count
         guard byteCount <= maxStoredBytes else { return }
 
         lock.lock()
-        defer { lock.unlock() }
 
         while !entries.isEmpty,
               entries.count >= maxEntries || storedBytes + byteCount > maxStoredBytes {
@@ -66,6 +79,20 @@ final class PlaybackDiagnosticLogStore: @unchecked Sendable {
         ))
         nextID &+= 1
         storedBytes += byteCount
+        lock.unlock()
+
+        guard let systemLogLevel else { return }
+        let consoleSafeMessage = Self.truncate(Self.sanitizeURLs(safeMessage), toUTF8Bytes: maxMessageBytes)
+        switch systemLogLevel {
+        case .notice:
+            Self.systemLogger.notice("[\(safeSource, privacy: .public)] \(consoleSafeMessage, privacy: .public)")
+        case .warning:
+            Self.systemLogger.warning("[\(safeSource, privacy: .public)] \(consoleSafeMessage, privacy: .public)")
+        case .error:
+            Self.systemLogger.error("[\(safeSource, privacy: .public)] \(consoleSafeMessage, privacy: .public)")
+        case .fault:
+            Self.systemLogger.fault("[\(safeSource, privacy: .public)] \(consoleSafeMessage, privacy: .public)")
+        }
     }
 
     func snapshot() -> [PlaybackDiagnosticLogEntry] {
@@ -104,6 +131,15 @@ final class PlaybackDiagnosticLogStore: @unchecked Sendable {
             mutable.replaceCharacters(in: match.range, with: replacement)
         }
         return mutable as String
+    }
+
+    private static func sanitizeURLs(_ message: String) -> String {
+        let range = NSRange(location: 0, length: (message as NSString).length)
+        return urlExpression.stringByReplacingMatches(
+            in: message,
+            range: range,
+            withTemplate: "[URL redacted]"
+        )
     }
 
     private static func safeURLLabel(_ token: String) -> String {
