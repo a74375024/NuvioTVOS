@@ -119,7 +119,7 @@ struct LiveTVOptionsPanel: View {
             gameSchedule.toggle()
             SportsData.isEnabled = gameSchedule
             SportsData.shared.enabledChanged()
-            store.scheduleSportsRebuild(delay: 0.2)
+            store.scheduleSportsRebuild(delay: 0.2, reason: "setting")
         }
         if gameSchedule {
             LivePanelRow(title: L10n.string("live_schedule_refresh", fallback: "Refresh schedule"),
@@ -131,7 +131,7 @@ struct LiveTVOptionsPanel: View {
                          accessory: .toggle(showUnwatchable)) {
                 showUnwatchable.toggle()
                 SportsData.showsUnwatchable = showUnwatchable
-                store.scheduleSportsRebuild(delay: 0.1)
+                LiveEventsModel.shared.refresh()
             }
         }
 

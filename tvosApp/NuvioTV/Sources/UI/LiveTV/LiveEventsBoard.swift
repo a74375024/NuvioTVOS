@@ -1,4 +1,5 @@
 import SwiftUI
+import Combine
 
 // MARK: - Names and badges
 
@@ -95,22 +96,229 @@ private func notInChannels(_ event: SportsEvent) -> String {
     return L10n.string("live_event_not_in_channels", fallback: "Not in your channels")
 }
 
+private let shortWeekday: DateFormatter = {
+    let formatter = DateFormatter()
+    formatter.setLocalizedDateFormatFromTemplate("EEE")
+    return formatter
+}()
+
+private let longWeekday: DateFormatter = {
+    let formatter = DateFormatter()
+    formatter.setLocalizedDateFormatFromTemplate("EEEE")
+    return formatter
+}()
+
 private func dayTime(_ date: Date, now: Date) -> String {
     let calendar = Calendar.current
     if calendar.isDateInToday(date) { return clock.string(from: date) }
     if calendar.isDateInTomorrow(date) { return L10n.string("live_time_tomorrow", fallback: "Tomorrow") + " " + clock.string(from: date) }
-    let formatter = DateFormatter()
-    formatter.setLocalizedDateFormatFromTemplate("EEE")
-    return formatter.string(from: date) + " " + clock.string(from: date)
+    return shortWeekday.string(from: date) + " " + clock.string(from: date)
+}
+
+/// Where a tile's game is on, worked out once per update (not per draw).
+struct EventWhere: Equatable {
+    var channelName: String?
+    var channelDisplay: String?
+    var logoURLs: [URL] = []
+    var inLineup = false
+    var feeds = 0
+}
+
+// MARK: - Model
+
+/// Live Events' rows, built when their inputs change and every 30 seconds,
+/// never while drawing. If the tile you're on would disappear in an update,
+/// the update waits until you move or 5 seconds pass.
+@MainActor
+final class LiveEventsModel: ObservableObject {
+    static let shared = LiveEventsModel()
+
+    struct Row: Identifiable {
+        let id: String
+        let title: String
+        let events: [SportsEvent]
+        var families: [EventFamily] = []
+        let live: Int
+        var count: Int { events.count + families.count }
+    }
+
+    @Published private(set) var rows: [Row] = []
+    @Published private(set) var hero: SportsEvent?
+    @Published private(set) var now = Date()
+    private(set) var places: [String: EventWhere] = [:]
+
+    private var pending: (rows: [Row], hero: SportsEvent?, places: [String: EventWhere])?
+    private var focusedID: String?
+    private var lastInput = Date()
+    private var sinks: [AnyCancellable] = []
+    private var ticker: AnyCancellable?
+    private var scheduled = false
+    private var builds = 0
+    private var buildMS = 0
+
+    private static let sportOrder = ["NFL", "College Football", "NBA", "WNBA", "College Basketball", "MLB", "NHL",
+                                     "MLS", "Soccer", "Fighting", "Motorsport", "Golf", "Tennis"]
+
+    func start() {
+        guard ticker == nil else { return }
+        CrashRecorder.liveEventsOpen = true
+        let store = LiveTVStore.shared
+        now = Date()
+        sinks = [
+            store.$sportsEvents.dropFirst().sink { [weak self] _ in self?.scheduleRecompute() },
+            store.$events.dropFirst().sink { [weak self] _ in self?.scheduleRecompute() },
+            store.$families.dropFirst().sink { [weak self] _ in self?.scheduleRecompute() }
+        ]
+        ticker = Timer.publish(every: 30, on: .main, in: .common).autoconnect().sink { [weak self] date in
+            guard let self else { return }
+            self.now = date
+            LiveTVStore.shared.sportsTick()
+            self.recompute()
+            if self.builds > 0 {
+                CrashRecorder.note("events board: \(self.builds) row builds, \(self.buildMS) ms in 30 s")
+                self.builds = 0
+                self.buildMS = 0
+            }
+        }
+        recompute()
+    }
+
+    func stop() {
+        CrashRecorder.liveEventsOpen = false
+        sinks = []
+        ticker = nil
+        pending = nil
+    }
+
+    func place(for event: SportsEvent?) -> EventWhere {
+        event.flatMap { places[$0.id] } ?? EventWhere()
+    }
+
+    /// From the board: which tile is focused (nil when none).
+    func focusChanged(to id: String?) {
+        lastInput = Date()
+        let old = focusedID
+        focusedID = id
+        if pending != nil, id != old { applyPending() }
+    }
+
+    /// Settings changed (e.g. games not in my channels).
+    func refresh() { scheduleRecompute() }
+
+    private func scheduleRecompute() {
+        guard !scheduled else { return }
+        scheduled = true
+        // @Published sends before the value changes: read it next turn.
+        DispatchQueue.main.async { [weak self] in
+            self?.scheduled = false
+            self?.recompute()
+        }
+    }
+
+    private func recompute() {
+        let started = Date()
+        let store = LiveTVStore.shared
+        let now = self.now
+        let all = store.sportsEvents.isEmpty ? store.plainSportsEvents : store.sportsEvents
+        var states: [String: SportsEvent.State] = [:]
+        states.reserveCapacity(all.count)
+        for event in all { states[event.id] = event.state(at: now) }
+        func isLive(_ event: SportsEvent) -> Bool {
+            let state = states[event.id]
+            return state == .live || state == .mayHaveEnded
+        }
+        var result: [Row] = []
+        let live = all.filter { isLive($0) && !$0.sources.isEmpty }
+        if !live.isEmpty {
+            result.append(Row(id: "live", title: L10n.string("live_events_now", fallback: "Live now"), events: live, live: live.count))
+        }
+        let horizon = now.addingTimeInterval(8 * 24 * 3600)
+        let showUnwatchable = SportsData.showsUnwatchable
+        var bySport: [String: [SportsEvent]] = [:]
+        for event in all {
+            let state = states[event.id]
+            guard state == .live || state == .mayHaveEnded || state == .upcoming || state == .postponed,
+                  let start = event.start, start < horizon else { continue }
+            if event.sources.isEmpty, !showUnwatchable { continue }
+            bySport[event.league.isEmpty ? "Other" : event.league, default: []].append(event)
+        }
+        let sports = bySport.keys.sorted { a, b in
+            let ia = Self.sportOrder.firstIndex(of: a) ?? 99, ib = Self.sportOrder.firstIndex(of: b) ?? 99
+            return ia != ib ? ia < ib : a < b
+        }
+        for sport in sports {
+            // Games you can watch by time, then the rest (dimmed) by time.
+            let list = (bySport[sport] ?? []).sorted { a, b in
+                if a.sources.isEmpty != b.sources.isEmpty { return !a.sources.isEmpty }
+                let x = a.start ?? .distantFuture, y = b.start ?? .distantFuture
+                return x != y ? x < y : a.id < b.id
+            }
+            let liveCount = list.filter { isLive($0) && !$0.sources.isEmpty }.count
+            result.append(Row(id: "sport|\(sport)", title: sport, events: list, live: liveCount))
+        }
+        let untimed = all.filter { states[$0.id] == .unknownTime && !$0.sources.isEmpty }
+        if !untimed.isEmpty {
+            result.append(Row(id: "untimed", title: L10n.string("live_events_unknown", fallback: "Time not listed"), events: untimed, live: 0))
+        }
+        if !store.families.isEmpty {
+            result.append(Row(id: "families", title: L10n.string("live_event_channels_title", fallback: "Event channels"),
+                              events: [], families: store.families, live: 0))
+        }
+        // Where each shown game is on.
+        var newPlaces: [String: EventWhere] = [:]
+        for row in result {
+            for event in row.events where newPlaces[event.id] == nil {
+                var place = EventWhere()
+                place.feeds = event.feeds.count
+                if let source = event.channels.first, let channel = store.sourceChannel(source) {
+                    place.channelName = channel.name
+                    place.channelDisplay = channel.displayName
+                    place.logoURLs = store.logoSpec(for: channel).urls
+                    place.inLineup = source.kind == .lineup
+                }
+                newPlaces[event.id] = place
+            }
+        }
+        let watchable = all.filter { !$0.sources.isEmpty }
+        let newHero = watchable.first(where: isLive) ?? watchable.first { states[$0.id] == .upcoming }
+        builds += 1
+        buildMS += Int(Date().timeIntervalSince(started) * 1000)
+
+        // Keep the focused tile until you move (or 5 s pass).
+        if let focusedID, contains(rows, focusedID), !contains(result, focusedID), Date().timeIntervalSince(lastInput) < 5 {
+            pending = (result, newHero, newPlaces)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
+                guard let self, self.pending != nil, Date().timeIntervalSince(self.lastInput) >= 5 else { return }
+                self.applyPending()
+            }
+            return
+        }
+        pending = nil
+        places = newPlaces
+        rows = result
+        hero = newHero
+    }
+
+    private func applyPending() {
+        guard let pending else { return }
+        self.pending = nil
+        places = pending.places
+        rows = pending.rows
+        hero = pending.hero
+    }
+
+    private func contains(_ rows: [Row], _ id: String) -> Bool {
+        rows.contains { row in row.events.contains { $0.id == id } }
+    }
 }
 
 // MARK: - Tile
 
 struct LiveEventTile: View {
     let event: SportsEvent
+    let place: EventWhere
     let focused: Bool
     let now: Date
-    @ObservedObject private var store = LiveTVStore.shared
 
     var body: some View {
         let state = event.state(at: now)
@@ -215,13 +423,12 @@ struct LiveEventTile: View {
 
     @ViewBuilder
     private func whereLine(compact: Bool) -> some View {
-        let channelSource = event.channels.first
-        let feeds = event.feeds.count
+        let feeds = place.feeds
         HStack(spacing: 10) {
-            if let channelSource, let channel = store.sourceChannel(channelSource) {
-                ChannelLogoView(urls: store.logoSpec(for: channel).urls, width: compact ? 60 : 80, height: compact ? 20 : 28,
+            if let display = place.channelDisplay {
+                ChannelLogoView(urls: place.logoURLs, width: compact ? 60 : 80, height: compact ? 20 : 28,
                                 focused: focused) {
-                    Text(channel.displayName).font(.system(size: 16, weight: .bold)).lineLimit(1)
+                    Text(display).font(.system(size: 16, weight: .bold)).lineLimit(1)
                 }
                 if feeds > 0 {
                     Text(L10n.format("live_event_backup_feeds", fallback: "+ %d backup feeds", feeds))
@@ -243,12 +450,15 @@ struct LiveEventTile: View {
 
 /// The top of Live Events: the focused game, big.
 struct LiveEventsHero: View {
-    let event: SportsEvent?
+    /// The focused game; nil shows the model's pick (first live game).
+    let focused: SportsEvent?
     let now: Date
-    @ObservedObject private var store = LiveTVStore.shared
+    @ObservedObject private var model = LiveEventsModel.shared
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        let event = focused ?? model.hero
+        let place = model.place(for: event)
+        return VStack(alignment: .leading, spacing: 10) {
             if let event {
                 HStack(spacing: 10) {
                     chipLabel(leagueLine(event),
@@ -277,7 +487,7 @@ struct LiveEventsHero: View {
                     }
                     .frame(width: 420, height: 6)
                 }
-                whereLine(event)
+                whereLine(event, place)
             } else {
                 HStack {
                     Text(L10n.string("live_events_title", fallback: "Live Events"))
@@ -343,17 +553,17 @@ struct LiveEventsHero: View {
     }
 
     @ViewBuilder
-    private func whereLine(_ event: SportsEvent) -> some View {
-        let feeds = event.feeds.count
+    private func whereLine(_ event: SportsEvent, _ place: EventWhere) -> some View {
+        let feeds = place.feeds
         HStack(spacing: 14) {
-            if let source = event.channels.first, let channel = store.sourceChannel(source) {
-                ChannelLogoView(urls: store.logoSpec(for: channel).urls, width: 80, height: 32) {
-                    Text(channel.displayName).font(.system(size: 20, weight: .bold)).foregroundColor(.white)
+            if let display = place.channelDisplay, let name = place.channelName {
+                ChannelLogoView(urls: place.logoURLs, width: 80, height: 32) {
+                    Text(display).font(.system(size: 20, weight: .bold)).foregroundColor(.white)
                 }
                 let parts: [String?] = [
-                    source.kind == .lineup
-                        ? L10n.format("live_event_on_lineup", fallback: "On %@, in your lineup", channel.name)
-                        : L10n.format("live_event_on_guide", fallback: "On %@", channel.name),
+                    place.inLineup
+                        ? L10n.format("live_event_on_lineup", fallback: "On %@, in your lineup", name)
+                        : L10n.format("live_event_on_guide", fallback: "On %@", name),
                     feeds > 0 ? L10n.format("live_event_backups_long", fallback: "%d backup feeds from your provider", feeds) : nil
                 ]
                 Text(parts.compactMap { $0 }.joined(separator: "   ·   "))
@@ -372,10 +582,12 @@ struct LiveEventsHero: View {
 /// The focused game's two team logos, big and faded over a glow, behind
 /// the top right of Live Events.
 struct LiveEventBackdrop: View {
-    let event: SportsEvent?
+    let focused: SportsEvent?
+    @ObservedObject private var model = LiveEventsModel.shared
 
     var body: some View {
-        GeometryReader { geo in
+        let event = focused ?? model.hero
+        return GeometryReader { geo in
             ZStack(alignment: .topTrailing) {
                 if let game = event?.game {
                     ZStack {
@@ -419,9 +631,9 @@ struct LiveEventsBoard: View {
     let onDetail: (SportsEvent) -> Void
     let onWhere: (SportsEvent) -> Void
 
-    @ObservedObject private var store = LiveTVStore.shared
+    private let store = LiveTVStore.shared
+    @ObservedObject private var model = LiveEventsModel.shared
     @ObservedObject private var reminders = LiveReminders.shared
-    @State private var now = Date()
     @FocusState private var focus: String?
     @State private var columnOpen = false
     @State private var columnOrigin: String?
@@ -431,67 +643,11 @@ struct LiveEventsBoard: View {
     @State private var lastRedirect = Date.distantPast
     @Environment(\.isEnabled) private var isEnabled
 
-    let ticker = Timer.publish(every: 30, on: .main, in: .common).autoconnect()
-
-    struct Row: Identifiable {
-        let id: String
-        let title: String
-        let events: [SportsEvent]
-        var families: [EventFamily] = []
-        let live: Int
-        var count: Int { events.count + families.count }
-    }
-
-    private static let sportOrder = ["NFL", "College Football", "NBA", "WNBA", "College Basketball", "MLB", "NHL",
-                                     "MLS", "Soccer", "Fighting", "Motorsport", "Golf", "Tennis"]
-
-    private var rows: [Row] {
-        let all = store.sportsEvents.isEmpty ? store.plainSportsEvents : store.sportsEvents
-        func isLive(_ event: SportsEvent) -> Bool {
-            let state = event.state(at: now)
-            return state == .live || state == .mayHaveEnded
-        }
-        var result: [Row] = []
-        let live = all.filter { isLive($0) && !$0.sources.isEmpty }
-        if !live.isEmpty {
-            result.append(Row(id: "live", title: L10n.string("live_events_now", fallback: "Live now"), events: live, live: live.count))
-        }
-        let horizon = now.addingTimeInterval(8 * 24 * 3600)
-        let showUnwatchable = SportsData.showsUnwatchable
-        var bySport: [String: [SportsEvent]] = [:]
-        for event in all {
-            let state = event.state(at: now)
-            guard state == .live || state == .mayHaveEnded || state == .upcoming || state == .postponed,
-                  let start = event.start, start < horizon else { continue }
-            if event.sources.isEmpty, !showUnwatchable { continue }
-            bySport[event.league.isEmpty ? "Other" : event.league, default: []].append(event)
-        }
-        let sports = bySport.keys.sorted { a, b in
-            let ia = Self.sportOrder.firstIndex(of: a) ?? 99, ib = Self.sportOrder.firstIndex(of: b) ?? 99
-            return ia != ib ? ia < ib : a < b
-        }
-        for sport in sports {
-            // Games you can watch by time, then the rest (dimmed) by time.
-            let list = (bySport[sport] ?? []).sorted { a, b in
-                if a.sources.isEmpty != b.sources.isEmpty { return !a.sources.isEmpty }
-                return (a.start ?? .distantFuture) < (b.start ?? .distantFuture)
-            }
-            let liveCount = list.filter { isLive($0) && !$0.sources.isEmpty }.count
-            result.append(Row(id: "sport|\(sport)", title: sport, events: list, live: liveCount))
-        }
-        let untimed = all.filter { $0.state(at: now) == .unknownTime && !$0.sources.isEmpty }
-        if !untimed.isEmpty {
-            result.append(Row(id: "untimed", title: L10n.string("live_events_unknown", fallback: "Time not listed"), events: untimed, live: 0))
-        }
-        if !store.families.isEmpty {
-            result.append(Row(id: "families", title: L10n.string("live_event_channels_title", fallback: "Event channels"),
-                              events: [], families: store.families, live: 0))
-        }
-        return result
-    }
+    typealias Row = LiveEventsModel.Row
+    private var now: Date { model.now }
 
     var body: some View {
-        let rows = rows
+        let rows = model.rows
         return ScrollViewReader { scroller in
             ZStack(alignment: .topLeading) {
                 ScrollView(.vertical, showsIndicators: false) {
@@ -520,6 +676,7 @@ struct LiveEventsBoard: View {
             .animation(.easeOut(duration: 0.18), value: columnOpen)
             .onChange(of: focus) { old, new in
                 if let new, !new.hasPrefix("h|") { lastFocus = new }
+                model.focusChanged(to: new.flatMap { eventID(fromKey: $0, rows: rows) })
                 handleFocus(old: old, new: new, rows: rows)
             }
             .onChange(of: isEnabled) { _, enabled in
@@ -540,13 +697,13 @@ struct LiveEventsBoard: View {
             }
         }
         .onAppear {
-            now = Date()
-            CrashRecorder.note("events: open, \(store.sportsEvents.count) events")
+            CrashRecorder.note("events: open, \(store.sportsEvents.count) events, \(CrashRecorder.memoryMB()) MB")
+            model.start()
             SportsData.shared.refreshIfNeeded()
-            store.scheduleSportsRebuild(delay: 0.2)
+            store.sportsOpened()
         }
-        .onReceive(ticker) { date in
-            now = date
+        .onDisappear {
+            model.stop()
         }
     }
 
@@ -594,6 +751,12 @@ struct LiveEventsBoard: View {
 
     private func key(_ row: Row, _ id: String) -> String { "\(row.id)|\(id)" }
 
+    /// The event id inside a tile key ("sport|NFL|ev|123" → "ev|123").
+    private func eventID(fromKey key: String, rows: [Row]) -> String? {
+        guard !key.hasPrefix("h|"), let row = rows.first(where: { key.hasPrefix($0.id + "|") }) else { return nil }
+        return String(key.dropFirst(row.id.count + 1))
+    }
+
     private func tileButton(_ event: SportsEvent, row: Row) -> some View {
         let id = key(row, event.id)
         let isFocused = focus == id
@@ -601,7 +764,7 @@ struct LiveEventsBoard: View {
         return Button {
             select(event)
         } label: {
-            LiveEventTile(event: event, focused: isFocused, now: now)
+            LiveEventTile(event: event, place: model.place(for: event), focused: isFocused, now: now)
         }
         .buttonStyle(PosterCardButtonStyle())
         .focused($focus, equals: id)
@@ -921,9 +1084,7 @@ struct LiveEventDetailCard: View {
             } else if calendar.isDateInTomorrow(start) {
                 day = L10n.string("live_time_tomorrow", fallback: "Tomorrow")
             } else {
-                let formatter = DateFormatter()
-                formatter.setLocalizedDateFormatFromTemplate("EEEE")
-                day = formatter.string(from: start)
+                day = longWeekday.string(from: start)
             }
             parts.append("\(day) \(clock.string(from: start))")
         }

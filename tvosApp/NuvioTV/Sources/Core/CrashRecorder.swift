@@ -18,6 +18,8 @@ enum CrashRecorder {
     private static var previousFile: URL { folder.appendingPathComponent("session-previous.log") }
     private static var started = false
     private static var trimTimer: DispatchSourceTimer?
+    /// While Live Events is open, shorter main-thread stalls are noted too.
+    static var liveEventsOpen = false
 
     /// Called once at launch.
     static func start() {
@@ -89,7 +91,12 @@ enum CrashRecorder {
                     waited += 1
                     if waited == 2 || waited % 5 == 0 { note("main thread stuck \(waited) s (\(memoryMB()) MB)") }
                 }
-                if waited >= 2 { note("main thread back after \(Int(Date().timeIntervalSince(sent))) s") }
+                let busy = Int(Date().timeIntervalSince(sent) * 1000)
+                if waited >= 2 {
+                    note("main thread back after \(busy / 1000) s")
+                } else if busy >= 250, liveEventsOpen {
+                    note("main thread busy \(busy) ms")
+                }
                 tick += 1
                 if tick % 10 == 0 {
                     let memory = memoryMB()

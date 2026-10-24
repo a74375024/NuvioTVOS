@@ -16,6 +16,8 @@ struct SportsTeam: Codable, Hashable {
     var short: String?
     var alternates: [String] = []
     var badge: String?
+    /// "Utah", "Los Angeles": only used to match college teams.
+    var location: String? = nil
 
     /// "LAR", or initials when there's no abbreviation.
     var abbreviation: String {
@@ -101,6 +103,13 @@ final class SportsData: ObservableObject {
         /// Last attempt that got nothing, so a failing source isn't asked
         /// again every time Live Events opens.
         var failedAt: Date?
+        /// Failed days in a row (backoff 1 h → 6 h → 24 h; after 3, only Refresh).
+        var failures: Int?
+        /// League → "limit" or "plain": the request form that works.
+        var leagueForm: [String: String]?
+        /// Requests made today, for the log.
+        var requestDay: String?
+        var requestCount: Int?
     }
 
     private var saved = Saved()
@@ -118,32 +127,51 @@ final class SportsData: ObservableObject {
         try? FileManager.default.removeItem(at: folder.appendingPathComponent("sportsdb.json"))
     }
 
-    /// The saved schedule, without any request.
+    private var loading: Task<Void, Never>?
+
+    /// The saved schedule, read in the background, without any request.
     func loadCached() {
         guard !loadedFromDisk else { return }
         loadedFromDisk = true
-        if let data = try? Data(contentsOf: file), let value = try? JSONDecoder().decode(Saved.self, from: data) {
-            saved = value
+        let file = self.file
+        loading = Task { [weak self] in
+            let value = await Task.detached(priority: .utility) { () -> Saved? in
+                guard let data = try? Data(contentsOf: file) else { return nil }
+                return try? JSONDecoder().decode(Saved.self, from: data)
+            }.value
+            guard let self else { return }
+            if let value { self.saved = value }
+            self.publish()
         }
-        publish()
     }
 
     /// Called when Live Events opens: fetches only if the saved schedule is
-    /// from an earlier day.
+    /// from an earlier day, and not while backing off after failures.
     func refreshIfNeeded() {
         loadCached()
-        guard Self.isEnabled, task == nil else { return }
-        if let fetched = saved.fetchedAt, Calendar.current.isDateInToday(fetched),
-           Date().timeIntervalSince(fetched) < 20 * 3600 { return }
-        if let failed = saved.failedAt, Date().timeIntervalSince(failed) < 3600 { return }
-        start(force: false)
+        Task { [weak self] in
+            await self?.loading?.value
+            guard let self, Self.isEnabled, self.task == nil else { return }
+            if let fetched = self.saved.fetchedAt, Calendar.current.isDateInToday(fetched),
+               Date().timeIntervalSince(fetched) < 20 * 3600 { return }
+            let failures = self.saved.failures ?? 0
+            if failures > 0, let failed = self.saved.failedAt {
+                guard failures <= 3 else { return }   // only Refresh from here
+                let wait: [TimeInterval] = [3600, 6 * 3600, 24 * 3600]
+                if Date().timeIntervalSince(failed) < wait[min(failures - 1, 2)] { return }
+            }
+            self.start(force: false)
+        }
     }
 
     /// Options → Refresh schedule: every league, now.
     func refreshNow() {
         loadCached()
-        guard Self.isEnabled, task == nil else { return }
-        start(force: true)
+        Task { [weak self] in
+            await self?.loading?.value
+            guard let self, Self.isEnabled, self.task == nil else { return }
+            self.start(force: true)
+        }
     }
 
     /// Turned off or on in Options.
@@ -223,13 +251,15 @@ final class SportsData: ObservableObject {
             saved.leagueFetched[league.short] = now
             fetchedAny = true
         }
-        CrashRecorder.note("schedule: \(requests) requests, ok=\(fetchedAny)")
+        CrashRecorder.note("schedule: \(requests) leagues, ok=\(fetchedAny), \(saved.requestCount ?? 0) requests today")
         guard fetchedAny || requests == 0 else {
             saved.failedAt = now
+            saved.failures = (saved.failures ?? 0) + 1
             save()
             return
         }
         saved.failedAt = nil
+        saved.failures = 0
         let cutoff = now.addingTimeInterval(-2 * 86_400)
         saved.games = byLeague.values.flatMap { $0 }.filter { $0.start > cutoff }
         saved.fetchedAt = now
@@ -246,7 +276,17 @@ final class SportsData: ObservableObject {
         return now.timeIntervalSince(fetched) < week
     }
 
+    private static let dayKey: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter
+    }()
+
     private func get(_ address: String) async -> (status: Int, data: Data)? {
+        let today = Self.dayKey.string(from: Date())
+        if saved.requestDay != today { saved.requestDay = today; saved.requestCount = 0 }
+        saved.requestCount = (saved.requestCount ?? 0) + 1
         guard let url = URL(string: address) else { return nil }
         var request = URLRequest(url: url)
         request.timeoutInterval = 20
@@ -261,12 +301,19 @@ final class SportsData: ObservableObject {
 
     private func fetchLeague(_ league: League, month: String, from: Date, to: Date) async -> [SportsGame]? {
         let base = "https://site.api.espn.com/apis/site/v2/sports/\(league.path)/scoreboard?dates=\(month)\(league.extra)"
-        guard var result = await get(base + "&limit=1000") else { return nil }
-        if result.status == 400 {
-            // In case the limit isn't accepted with a month.
+        // Remember which form works, so a league is asked once, not twice.
+        let plainForm = saved.leagueForm?[league.short] == "plain"
+        guard var result = await get(plainForm ? base : base + "&limit=1000") else { return nil }
+        if result.status == 200, !plainForm {
+            saved.leagueForm = (saved.leagueForm ?? [:]).merging([league.short: "limit"]) { _, new in new }
+        }
+        if result.status == 400, !plainForm {
             try? await Task.sleep(nanoseconds: 700_000_000)
             guard let retry = await get(base) else { return nil }
             result = retry
+            if retry.status == 200 {
+                saved.leagueForm = (saved.leagueForm ?? [:]).merging([league.short: "plain"]) { _, new in new }
+            }
         }
         guard result.status == 200 else {
             CrashRecorder.note("schedule \(league.short) \(month): HTTP \(result.status)")
@@ -275,10 +322,14 @@ final class SportsData: ObservableObject {
         let data = result.data
         // Parsed off the main thread (a week of college football is a few MB).
         let games = await Task.detached(priority: .utility) { () -> [SportsGame]? in
-            guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let events = object["events"] as? [[String: Any]] else { return nil }
-            // Only the week ahead is kept.
-            return events.compactMap { SportsParse.game($0, league: league) }.filter { $0.start >= from && $0.start <= to }
+            // Only the fields used are decoded; the full object tree is the
+            // fallback if that ever fails. Only the week ahead is kept.
+            let list = SportsParse.decode(data, league: league) ?? autoreleasepool { () -> [SportsGame]? in
+                guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let events = object["events"] as? [[String: Any]] else { return nil }
+                return events.compactMap { SportsParse.game($0, league: league) }
+            }
+            return list?.filter { $0.start >= from && $0.start <= to }
         }.value
         CrashRecorder.note("schedule \(league.short) \(month): \(data.count / 1024) KB, \(games.map { String($0.count) } ?? "unreadable") games")
         return games
@@ -317,12 +368,13 @@ private enum SportsParse {
     private static func team(_ item: [String: Any]?) -> SportsTeam? {
         guard let item, let id = text(item["id"]), let name = text(item["displayName"]) ?? text(item["name"]) else { return nil }
         var alternates: [String] = []
-        for key in ["shortDisplayName", "name", "location"] {
+        for key in ["shortDisplayName", "name"] {
             if let value = text(item[key]), value != name, !alternates.contains(value) { alternates.append(value) }
         }
         var logo = text(item["logo"])
         if logo == nil, let logos = item["logos"] as? [[String: Any]] { logo = logos.first.flatMap { text($0["href"]) } }
-        return SportsTeam(id: id, name: name, short: text(item["abbreviation"]), alternates: alternates, badge: logo)
+        return SportsTeam(id: id, name: name, short: text(item["abbreviation"]), alternates: alternates, badge: logo,
+                          location: text(item["location"]))
     }
 
     private static func networks(_ competition: [String: Any]) -> [String] {
@@ -379,5 +431,144 @@ private enum SportsParse {
     static func date(_ value: String?) -> Date? {
         guard let value else { return nil }
         return minutes.date(from: value) ?? iso.date(from: value)
+    }
+}
+
+// MARK: - Lean decoding (only the fields used; any odd value is skipped, never fatal)
+
+private struct Lenient<T: Decodable>: Decodable {
+    let value: T?
+    init(from decoder: Decoder) { value = try? T(from: decoder) }
+}
+
+private struct LenientText: Decodable {
+    let value: String?
+    init(from decoder: Decoder) {
+        guard let container = try? decoder.singleValueContainer() else { value = nil; return }
+        if let text = try? container.decode(String.self) {
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            value = trimmed.isEmpty || trimmed.lowercased() == "null" ? nil : trimmed
+        } else if let number = try? container.decode(Int.self) {
+            value = String(number)
+        } else if let number = try? container.decode(Double.self) {
+            value = String(number)
+        } else {
+            value = nil
+        }
+    }
+}
+
+private struct LenientBool: Decodable {
+    let value: Bool?
+    init(from decoder: Decoder) { value = try? decoder.singleValueContainer().decode(Bool.self) }
+}
+
+private struct ScoreboardDoc: Decodable { let events: Lenient<[Lenient<ScoreboardEvent>]>? }
+private struct ScoreboardEvent: Decodable {
+    let id: LenientText?
+    let date: LenientText?
+    let week: Lenient<ScoreboardWeek>?
+    let competitions: Lenient<[Lenient<ScoreboardCompetition>]>?
+    let status: Lenient<ScoreboardStatus>?
+}
+private struct ScoreboardWeek: Decodable { let number: LenientText? }
+private struct ScoreboardCompetition: Decodable {
+    let competitors: Lenient<[Lenient<ScoreboardCompetitor>]>?
+    let venue: Lenient<ScoreboardVenue>?
+    let broadcasts: Lenient<[Lenient<ScoreboardBroadcast>]>?
+    let geoBroadcasts: Lenient<[Lenient<ScoreboardGeo>]>?
+    let status: Lenient<ScoreboardStatus>?
+}
+private struct ScoreboardCompetitor: Decodable {
+    let homeAway: LenientText?
+    let team: Lenient<ScoreboardTeam>?
+}
+private struct ScoreboardTeam: Decodable {
+    let id: LenientText?
+    let displayName: LenientText?
+    let shortDisplayName: LenientText?
+    let name: LenientText?
+    let location: LenientText?
+    let abbreviation: LenientText?
+    let logo: LenientText?
+    let logos: Lenient<[Lenient<ScoreboardHref>]>?
+}
+private struct ScoreboardHref: Decodable { let href: LenientText? }
+private struct ScoreboardVenue: Decodable {
+    let fullName: LenientText?
+    let address: Lenient<ScoreboardCity>?
+}
+private struct ScoreboardCity: Decodable { let city: LenientText? }
+private struct ScoreboardBroadcast: Decodable {
+    let market: LenientText?
+    let names: Lenient<[LenientText]>?
+}
+private struct ScoreboardGeo: Decodable {
+    let media: Lenient<ScoreboardShortName>?
+    let market: Lenient<ScoreboardMarket>?
+}
+private struct ScoreboardShortName: Decodable { let shortName: LenientText? }
+private struct ScoreboardMarket: Decodable { let type: LenientText? }
+private struct ScoreboardStatus: Decodable { let type: Lenient<ScoreboardStatusType>? }
+private struct ScoreboardStatusType: Decodable {
+    let name: LenientText?
+    let completed: LenientBool?
+}
+
+extension SportsParse {
+    /// Games from a scoreboard document, decoding only what's used.
+    static func decode(_ data: Data, league: SportsData.League) -> [SportsGame]? {
+        guard let doc = try? JSONDecoder().decode(ScoreboardDoc.self, from: data),
+              let events = doc.events?.value else { return nil }
+        return events.compactMap { $0.value.flatMap { game($0, league: league) } }
+    }
+
+    private static func game(_ event: ScoreboardEvent, league: SportsData.League) -> SportsGame? {
+        guard let id = event.id?.value, let start = date(event.date?.value),
+              let competition = event.competitions?.value?.first?.value,
+              let competitors = competition.competitors?.value?.compactMap({ $0.value }), competitors.count == 2 else { return nil }
+        var home: SportsTeam?
+        var away: SportsTeam?
+        for competitor in competitors {
+            guard let item = competitor.team?.value, let teamID = item.id?.value,
+                  let name = item.displayName?.value ?? item.name?.value else { continue }
+            var alternates: [String] = []
+            for value in [item.shortDisplayName?.value, item.name?.value].compactMap({ $0 }) where value != name && !alternates.contains(value) {
+                alternates.append(value)
+            }
+            let logo = item.logo?.value ?? item.logos?.value?.first?.value?.href?.value
+            let team = SportsTeam(id: teamID, name: name, short: item.abbreviation?.value, alternates: alternates, badge: logo,
+                                  location: item.location?.value)
+            if competitor.homeAway?.value == "home" { home = team } else { away = team }
+        }
+        guard let home, let away else { return nil }
+        let status = (competition.status?.value ?? event.status?.value)?.type?.value
+        let statusName = status?.name?.value?.uppercased() ?? ""
+        var national: [String] = []
+        var other: [String] = []
+        for item in competition.broadcasts?.value ?? [] {
+            guard let broadcast = item.value else { continue }
+            let names = broadcast.names?.value?.compactMap { $0.value } ?? []
+            if broadcast.market?.value?.lowercased() == "national" { national += names } else { other += names }
+        }
+        for item in competition.geoBroadcasts?.value ?? [] {
+            guard let geo = item.value, let name = geo.media?.value?.shortName?.value else { continue }
+            if geo.market?.value?.type?.value?.lowercased() == "national" { national.append(name) } else { other.append(name) }
+        }
+        var seen = Set<String>()
+        let networks = (national + other).filter { seen.insert($0.lowercased()).inserted }
+        var venue: String?
+        if let venueItem = competition.venue?.value, let name = venueItem.fullName?.value {
+            if let city = venueItem.address?.value?.city?.value, !name.contains(city) { venue = "\(name), \(city)" } else { venue = name }
+        }
+        let week = event.week?.value?.number?.value.flatMap { Int($0) }
+        let showsWeek = league.group == "NFL" || league.group == "College Football"
+        return SportsGame(
+            id: "\(league.short)|\(id)", league: league.group, leagueShort: league.short, isSoccer: league.soccer,
+            weekLabel: showsWeek ? week.map { "Week \($0)" } : nil,
+            home: home, away: away, start: start, networks: networks, venue: venue,
+            postponed: statusName.contains("POSTPONED") || statusName.contains("CANCELED") || statusName.contains("CANCELLED"),
+            completed: status?.completed?.value == true || statusName.contains("FINAL")
+        )
     }
 }

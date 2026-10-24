@@ -14,7 +14,7 @@ struct EventSource: Hashable, Codable {
 /// One game or event for Live Events: a TheSportsDB game with everything
 /// found showing it (guide channels and provider event feeds), or a
 /// provider event that matched no game.
-struct SportsEvent: Identifiable, Hashable {
+struct SportsEvent: Identifiable, Hashable, Codable {
     let id: String
     let title: String
     /// Row group: "NFL", "College Football", "Soccer"…
@@ -32,6 +32,15 @@ struct SportsEvent: Identifiable, Hashable {
         lhs.id == rhs.id && lhs.sources == rhs.sources && lhs.game == rhs.game && lhs.listingEnd == rhs.listingEnd
     }
     func hash(into hasher: inout Hasher) { hasher.combine(id) }
+
+    /// The same event under another tile id.
+    func with(id newID: String) -> SportsEvent {
+        guard newID != id else { return self }
+        var copy = SportsEvent(id: newID, title: title, league: league, leagueShort: leagueShort, start: start,
+                               game: game, sources: sources, family: family)
+        copy.listingEnd = listingEnd
+        return copy
+    }
 
     var channels: [EventSource] { sources.filter { $0.kind != .provider } }
     var feeds: [EventSource] { sources.filter { $0.kind == .provider } }
@@ -75,10 +84,15 @@ struct SportsEvent: Identifiable, Hashable {
     }
 }
 
-/// Matches TheSportsDB games with provider event feeds and guide listings.
-/// Pure and off the main thread.
+/// Matches the schedule's games with your channels, provider event feeds and
+/// guide listings. Pure; runs off the main thread.
+///
+/// Cost is kept linear: provider events that don't look like a game skip
+/// matching; team names are looked up through an index (first word →
+/// names) instead of comparing every title with every game; temporary
+/// Foundation objects are released per item.
 enum SportsMatcher {
-    struct GuideListing {
+    struct GuideListing: Hashable {
         let entryID: String
         let inLineup: Bool
         let spanish: Bool
@@ -97,99 +111,164 @@ enum SportsMatcher {
         let spanish: Bool
     }
 
+    struct Stats {
+        var events = 0
+        var filtered = 0
+        var matchedEvents = 0
+        var listings = 0
+        var matchedListings = 0
+        var games = 0
+        var milliseconds: [String: Int] = [:]
+        var aborted: String?
+
+        var summary: String {
+            let steps = milliseconds.sorted { $0.key < $1.key }.map { "\($0.key) \($0.value)" }.joined(separator: ", ")
+            return "games \(games), events \(events) → \(filtered) game-like, \(matchedEvents) matched, "
+                + "listings \(listings) → \(matchedListings) matched; ms: \(steps)" + (aborted.map { "; ABORTED: \($0)" } ?? "")
+        }
+    }
+
+    static let supportedLeagues: Set<String> = ["NFL", "College Football", "NBA", "MLB", "NHL", "MLS", "Soccer"]
+
+    /// - Parameters:
+    ///   - previousIDs: game id → the tile id it was shown under last time,
+    ///     so tiles keep their identity (and focus) across rebuilds.
+    ///   - shouldStop: checked between steps (memory guard); returning a
+    ///     reason stops the build and returns nil.
     static func build(games: [SportsGame], channelSources: [String: [EventSource]], events: [ProviderEvent],
-                      listings: [GuideListing], preferSpanish: Bool, now: Date) -> [SportsEvent] {
-        let variants = Dictionary(games.map { ($0.id, (teamVariants($0.home), teamVariants($0.away))) }, uniquingKeysWith: { a, _ in a })
-        var byGame: [String: SportsEvent] = [:]
-        var unmatched: [ProviderEvent] = []
+                      listings: [GuideListing], preferSpanish: Bool, now: Date, previousIDs: [String: String],
+                      shouldStop: () -> String?) -> (events: [SportsEvent], stats: Stats)? {
+        var stats = Stats()
+        stats.events = events.count
+        stats.games = games.count
+        stats.listings = listings.count
+        var clock = Date()
+        func lap(_ step: String) {
+            stats.milliseconds[step] = Int(Date().timeIntervalSince(clock) * 1000)
+            clock = Date()
+        }
+
+        let index = TeamIndex(games: games)
+        lap("0 index")
+        var byGame: [Int: SportsEvent] = [:]
+        var firstProviderID: [Int: String] = [:]
+        func entry(_ gameIndex: Int) -> SportsEvent {
+            if let value = byGame[gameIndex] { return value }
+            let game = games[gameIndex]
+            return SportsEvent(id: "sev|\(game.id)", title: game.title, league: game.league, leagueShort: game.leagueShort,
+                               start: game.start, game: game, sources: [], family: nil)
+        }
 
         // 0. Channels airing each game's TV network.
-        for game in games {
+        for (gameIndex, game) in games.enumerated() {
             guard let sources = channelSources[game.id], !sources.isEmpty else { continue }
-            byGame[game.id] = SportsEvent(
-                id: "sev|\(game.id)", title: game.title, league: game.league, leagueShort: game.leagueShort,
-                start: game.start, game: game, sources: sources, family: nil
-            )
+            var value = entry(gameIndex)
+            value.sources = sources
+            byGame[gameIndex] = value
         }
 
-        // 1. Provider event feeds → games.
-        let gamesByLeague = Dictionary(grouping: games, by: \.league)
+        // 1. Provider event feeds → games. Only titles that look like a game
+        // (two sides) or are in a league the schedule covers.
+        let low = now.addingTimeInterval(-8 * 3600), high = now.addingTimeInterval(8 * 86_400)
+        var plain: [ProviderEvent] = []
+        var unmatched: [ProviderEvent] = []
         for event in events {
-            let text = normalized(event.title)
-            var best: (SportsGame, TimeInterval)?
-            // Only games of a league the event could be (soccer and MLS
-            // count as one).
-            let candidates: [SportsGame]
-            switch event.league {
-            case "", "Other": candidates = games
-            case "Soccer", "MLS": candidates = (gamesByLeague["Soccer"] ?? []) + (gamesByLeague["MLS"] ?? [])
-            default: candidates = gamesByLeague[event.league] ?? []
-            }
-            for game in candidates {
-                guard compatible(event.league, game), let pair = variants[game.id],
-                      contains(text, pair.0), contains(text, pair.1) else { continue }
-                let gap: TimeInterval
-                if let start = event.start {
-                    gap = abs(start.timeIntervalSince(game.start))
-                    guard gap <= 3 * 3600 else { continue }
-                } else {
-                    guard game.start > now.addingTimeInterval(-6 * 3600), game.start < now.addingTimeInterval(18 * 3600) else { continue }
-                    gap = abs(game.start.timeIntervalSince(now))
+            autoreleasepool {
+                let inWindow = event.start.map { $0 > low && $0 < high } ?? true
+                guard inWindow, looksLikeGame(event.title) || supportedLeagues.contains(event.league) else {
+                    plain.append(event)
+                    return
                 }
-                if best == nil || gap < best!.1 { best = (game, gap) }
-            }
-            guard let game = best?.0 else { unmatched.append(event); continue }
-            var value = byGame[game.id] ?? SportsEvent(
-                id: "sev|\(game.id)", title: game.title, league: game.league, leagueShort: game.leagueShort,
-                start: game.start, game: game, sources: [], family: event.family
-            )
-            for feed in event.feeds where !value.sources.contains(where: { $0.channelID == feed }) {
-                value.sources.append(EventSource(channelID: feed, kind: .provider, spanish: event.spanish,
-                                                 detail: "Provider event channel"))
-            }
-            byGame[game.id] = value
-        }
-
-        // 2. Guide listings → games (only the game itself, not the shows around it).
-        let relevant = games.filter { !$0.completed && $0.start > now.addingTimeInterval(-5 * 3600) && $0.start < now.addingTimeInterval(16 * 3600) }
-        if !relevant.isEmpty {
-            for listing in listings {
-                let text = normalized(listing.title)
-                guard !excluded(text) else { continue }
-                for game in relevant {
-                    let windowStart = game.start.addingTimeInterval(-15 * 60)
-                    let windowEnd = game.start.addingTimeInterval(2 * 3600)
-                    guard listing.start < windowEnd, listing.end > windowStart,
-                          let pair = variants[game.id], contains(text, pair.0), contains(text, pair.1) else { continue }
-                    var value = byGame[game.id] ?? SportsEvent(
-                        id: "sev|\(game.id)", title: game.title, league: game.league, leagueShort: game.leagueShort,
-                        start: game.start, game: game, sources: [], family: nil
-                    )
-                    if value.listingEnd.map({ listing.end > $0 }) ?? true { value.listingEnd = listing.end }
-                    if !value.sources.contains(where: { $0.channelID == listing.entryID }) {
-                        let time = timeFormatter.string(from: listing.start)
-                        value.sources.append(EventSource(
-                            channelID: listing.entryID, kind: listing.inLineup ? .lineup : .guide, spanish: listing.spanish,
-                            detail: listing.inLineup ? "In My Lineup · \(time)" : "In your guide · \(time)"
-                        ))
+                stats.filtered += 1
+                guard !games.isEmpty else { unmatched.append(event); return }
+                let candidates = index.matches(event.title, allowed: { game in
+                    compatible(event.league, games[game])
+                })
+                // An event of unknown league matching games of more than one
+                // league (Panthers, Rangers, Kings…) is too ambiguous.
+                if event.league.isEmpty || event.league == "Other",
+                   Set(candidates.map { games[$0].league }).count > 1 {
+                    unmatched.append(event)
+                    return
+                }
+                var best: (game: Int, gap: TimeInterval)?
+                for gameIndex in candidates {
+                    let game = games[gameIndex]
+                    let gap: TimeInterval
+                    if let start = event.start {
+                        gap = abs(start.timeIntervalSince(game.start))
+                        guard gap <= 3 * 3600 else { continue }
+                    } else {
+                        guard game.start > now.addingTimeInterval(-6 * 3600), game.start < now.addingTimeInterval(18 * 3600) else { continue }
+                        gap = abs(game.start.timeIntervalSince(now))
                     }
-                    byGame[game.id] = value
+                    if best.map({ gap < $0.gap }) ?? true { best = (gameIndex, gap) }
+                }
+                guard let gameIndex = best?.game else { unmatched.append(event); return }
+                stats.matchedEvents += 1
+                var value = entry(gameIndex)
+                for feed in event.feeds where !value.sources.contains(where: { $0.channelID == feed }) {
+                    value.sources.append(EventSource(channelID: feed, kind: .provider, spanish: event.spanish,
+                                                     detail: "Provider event channel"))
+                }
+                if value.family == nil { value.family = event.family }
+                byGame[gameIndex] = value
+                if firstProviderID[gameIndex] == nil { firstProviderID[gameIndex] = event.id }
+            }
+        }
+        lap("1 events")
+        if let reason = shouldStop() { stats.aborted = reason; CrashRecorder.note("sports match: \(stats.summary)"); return nil }
+
+        // 2. Guide listings → games (only the game itself, not the shows
+        // around it). Capped at 2 s.
+        let relevant = Set(games.indices.filter {
+            !games[$0].completed && games[$0].start > now.addingTimeInterval(-5 * 3600) && games[$0].start < now.addingTimeInterval(16 * 3600)
+        })
+        if !relevant.isEmpty {
+            let started = Date()
+            for listing in listings {
+                if Date().timeIntervalSince(started) > 2 { stats.aborted = "listings over 2 s"; break }
+                autoreleasepool {
+                    let text = normalized(listing.title)
+                    guard !excluded(text) else { return }
+                    let candidates = index.matches(listing.title, allowed: { relevant.contains($0) })
+                    for gameIndex in candidates {
+                        let game = games[gameIndex]
+                        guard listing.start < game.start.addingTimeInterval(2 * 3600),
+                              listing.end > game.start.addingTimeInterval(-15 * 60) else { continue }
+                        stats.matchedListings += 1
+                        var value = entry(gameIndex)
+                        if value.listingEnd.map({ listing.end > $0 }) ?? true { value.listingEnd = listing.end }
+                        if !value.sources.contains(where: { $0.channelID == listing.entryID }) {
+                            value.sources.append(EventSource(
+                                channelID: listing.entryID, kind: listing.inLineup ? .lineup : .guide, spanish: listing.spanish,
+                                detail: listing.inLineup ? "In My Lineup" : "In your channels"
+                            ))
+                        }
+                        byGame[gameIndex] = value
+                    }
                 }
             }
         }
+        lap("2 listings")
+        if let reason = shouldStop() { stats.aborted = reason; CrashRecorder.note("sports match: \(stats.summary)"); return nil }
 
-        // Games with no way to watch still show (schedule, results).
-        for game in games where byGame[game.id] == nil {
-            byGame[game.id] = SportsEvent(
-                id: "sev|\(game.id)", title: game.title, league: game.league, leagueShort: game.leagueShort,
-                start: game.start, game: game, sources: [], family: nil
-            )
+        // 3. Games no channel shows still appear (dimmed). Ids stay stable:
+        // last time's id, else the provider event it was first shown as.
+        var used = Set<String>()
+        var result: [SportsEvent] = []
+        result.reserveCapacity(games.count + unmatched.count + plain.count)
+        for gameIndex in games.indices {
+            let value = entry(gameIndex)
+            let game = games[gameIndex]
+            var id = previousIDs[game.id] ?? firstProviderID[gameIndex] ?? value.id
+            if used.contains(id) { id = "sev|\(game.id)" }
+            guard used.insert(id).inserted else { continue }
+            result.append(value.with(id: id))
         }
 
-        // 3. Provider events that matched no game: grouped forgivingly
-        // (either team order, start within 90 minutes). Each title's pair
-        // key is worked out once and looked up, not compared pairwise
-        // (thousands of events made that quadratic).
+        // 4. Provider events that matched no game: grouped by matchup
+        // (either team order, start within 90 minutes) through a key lookup.
         var loose: [SportsEvent] = []
         var byPair: [String: [Int]] = [:]
         for event in unmatched {
@@ -202,40 +281,154 @@ enum SportsMatcher {
                     }
                     return
                 }
-                loose.append(SportsEvent(
-                    id: event.id, title: event.title, league: event.league, leagueShort: shortLeague(event.league),
-                    start: event.start, game: nil,
-                    sources: event.feeds.map { EventSource(channelID: $0, kind: .provider, spanish: event.spanish, detail: "Provider event channel") },
-                    family: event.family
-                ))
+                loose.append(plainEvent(event))
                 if let key { byPair[key, default: []].append(loose.count - 1) }
             }
         }
-
-        // Source order: My Lineup, other guide channels, provider feeds;
-        // Spanish after English unless the viewer picked US Spanish.
-        func ordered(_ sources: [SportsEvent]) -> [SportsEvent] {
-            sources.map { event in
-                var copy = event
-                copy.sources = event.sources.enumerated().sorted { a, b in
-                    let sa = (preferSpanish ? !a.element.spanish : a.element.spanish) ? 1 : 0
-                    let sb = (preferSpanish ? !b.element.spanish : b.element.spanish) ? 1 : 0
-                    if a.element.kind != b.element.kind { return a.element.kind.rawValue < b.element.kind.rawValue }
-                    if sa != sb { return sa < sb }
-                    return a.offset < b.offset
-                }.map(\.element)
-                return copy
-            }
+        for event in loose + plain.map({ plainEvent($0) }) where used.insert(event.id).inserted {
+            result.append(event)
         }
-        var seenIDs = Set<String>()
-        let unique = (Array(byGame.values) + loose).filter { seenIDs.insert($0.id).inserted }
-        return ordered(unique).sorted {
-            switch ($0.start, $1.start) {
-            case let (a?, b?): return a == b ? $0.title < $1.title : a < b
+        lap("3 assemble")
+
+        // Source order: My Lineup, other channels, provider feeds; Spanish
+        // after English unless the viewer picked US Spanish.
+        let ordered: [SportsEvent] = result.map { event in
+            guard event.sources.count > 1 else { return event }
+            var copy = event
+            copy.sources = event.sources.enumerated().sorted { a, b in
+                let sa = (preferSpanish ? !a.element.spanish : a.element.spanish) ? 1 : 0
+                let sb = (preferSpanish ? !b.element.spanish : b.element.spanish) ? 1 : 0
+                if a.element.kind != b.element.kind { return a.element.kind.rawValue < b.element.kind.rawValue }
+                if sa != sb { return sa < sb }
+                return a.offset < b.offset
+            }.map(\.element)
+            return copy
+        }
+        let sorted = ordered.sorted { a, b in
+            switch (a.start, b.start) {
+            case let (x?, y?): return x != y ? x < y : (a.title != b.title ? a.title < b.title : a.id < b.id)
             case (_?, nil): return true
             case (nil, _?): return false
-            default: return $0.title < $1.title
+            default: return a.title != b.title ? a.title < b.title : a.id < b.id
             }
+        }
+        lap("4 order")
+        CrashRecorder.note("sports match: \(stats.summary)")
+        return (sorted, stats)
+    }
+
+    /// "rams|seahawks", or the tidied title when it has no two sides.
+    static func matchupKey(_ title: String) -> String {
+        pairKey(title) ?? normalized(title)
+    }
+
+    private static func plainEvent(_ event: ProviderEvent) -> SportsEvent {
+        SportsEvent(
+            id: event.id, title: event.title, league: event.league, leagueShort: shortLeague(event.league),
+            start: event.start, game: nil,
+            sources: event.feeds.map { EventSource(channelID: $0, kind: .provider, spanish: event.spanish, detail: "Provider event channel") },
+            family: event.family
+        )
+    }
+
+    /// Two sides: "A vs B", "A v B", "A @ B", "A at B", "A - B" (after a
+    /// "Network:" style prefix).
+    static func looksLikeGame(_ title: String) -> Bool {
+        var text = " " + title.lowercased() + " "
+        if let colon = text.firstIndex(of: ":"), text.distance(from: text.startIndex, to: colon) < 30 {
+            text = " " + String(text[text.index(after: colon)...])
+        }
+        for separator in [" vs ", " vs. ", " v ", " v. ", " @ ", " at ", " - "] where text.contains(separator) {
+            return true
+        }
+        return text.contains("@")
+    }
+
+    /// Team names of a set of games, looked up by their first word.
+    struct TeamIndex {
+        struct Name {
+            let game: Int
+            let side: Int          // 0 home, 1 away
+            let team: String       // team id, to keep one team's names apart from another's
+            let words: [String]
+            /// The abbreviation as written ("LAR"), for names that are one.
+            let abbreviation: String?
+        }
+
+        private var byFirstWord: [String: [Name]] = [:]
+
+        init(games: [SportsGame]) {
+            for (gameIndex, game) in games.enumerated() {
+                for (side, team) in [game.home, game.away].enumerated() {
+                    let college = game.league == "College Football"
+                    var seen = Set<String>()
+                    for variant in SportsMatcher.teamVariants(team, college: college) {
+                        let words = variant.split(separator: " ").map(String.init)
+                        guard let first = words.first, seen.insert(variant).inserted else { continue }
+                        byFirstWord[first, default: []].append(Name(game: gameIndex, side: side, team: team.id, words: words, abbreviation: nil))
+                    }
+                    if let short = team.short?.trimmingCharacters(in: .whitespaces), short.count >= 2, short.count <= 5 {
+                        let word = short.lowercased()
+                        if seen.insert(word).inserted {
+                            byFirstWord[word, default: []].append(Name(game: gameIndex, side: side, team: team.id, words: [word],
+                                                                       abbreviation: short.uppercased()))
+                        }
+                    }
+                }
+            }
+        }
+
+        private struct Hit {
+            let name: Name
+            let start: Int
+            let end: Int
+            var length: Int { end - start }
+        }
+
+        /// Games whose two teams both appear in `title`, on separate words.
+        func matches(_ title: String, allowed: (Int) -> Bool) -> [Int] {
+            let words = SportsMatcher.normalized(title).split(separator: " ").map(String.init)
+            guard words.count >= 2 else { return [] }
+            // Words as written, for "abbreviations count only in capitals".
+            let written = Set(title.split(whereSeparator: { !($0.isLetter || $0.isNumber) }).map(String.init))
+            var hits: [Hit] = []
+            for position in words.indices {
+                guard let names = byFirstWord[words[position]] else { continue }
+                for name in names where allowed(name.game) {
+                    let end = position + name.words.count
+                    guard end <= words.count, Array(words[position..<end]) == name.words else { continue }
+                    hits.append(Hit(name: name, start: position, end: end))
+                }
+            }
+            guard hits.count >= 2 else { return [] }
+            // The longest name wins its words: "michigan state" keeps
+            // "michigan" (another team) from counting.
+            let kept = hits.filter { hit in
+                !hits.contains { other in
+                    other.name.team != hit.name.team && other.length > hit.length && other.start <= hit.start && other.end >= hit.end
+                }
+            }
+            var byGame: [Int: [Hit]] = [:]
+            for hit in kept { byGame[hit.name.game, default: []].append(hit) }
+            var result: [Int] = []
+            for (game, list) in byGame {
+                let home = list.filter { $0.name.side == 0 }
+                let away = list.filter { $0.name.side == 1 }
+                func strong(_ hit: Hit) -> Bool { hit.name.abbreviation.map { written.contains($0) } ?? true }
+                func full(_ hit: Hit) -> Bool { hit.name.abbreviation == nil }
+                var found = false
+                for h in home where !found {
+                    for a in away where !found {
+                        guard h.end <= a.start || a.end <= h.start else { continue }
+                        // An abbreviation in lower case only counts next to a full name.
+                        if (strong(h) && strong(a)) || (full(h) && a.name.abbreviation != nil) || (full(a) && h.name.abbreviation != nil) {
+                            found = true
+                        }
+                    }
+                }
+                if found { result.append(game) }
+            }
+            return result.sorted()
         }
     }
 
@@ -270,10 +463,11 @@ enum SportsMatcher {
     private static let genericWords: Set<String> = ["fc", "cf", "sc", "afc", "club", "city", "united", "the", "team", "state",
                                                     "university", "college", "real", "athletic", "sporting", "new", "san", "los", "las", "st"]
 
-    /// Ways a team is written: full name, alternates, the nickname (last
-    /// word or two), and its abbreviation (3+ letters).
-    static func teamVariants(_ team: SportsTeam) -> [String] {
+    /// Ways a team is written: full name, short names, the nickname (last
+    /// word or two); the place name only for college teams ("Utah").
+    static func teamVariants(_ team: SportsTeam, college: Bool) -> [String] {
         var names = [team.name] + team.alternates
+        if college, let location = team.location { names.append(location) }
         let words = normalized(team.name).split(separator: " ").map(String.init)
         if words.count >= 2 {
             let last = words[words.count - 1]
@@ -281,13 +475,9 @@ enum SportsMatcher {
             let lastTwo = words.suffix(2).joined(separator: " ")
             if !genericWords.contains(words[words.count - 2]) { names.append(lastTwo) }
         }
-        if let short = team.short, short.count >= 3 { names.append(short) }
         var seen = Set<String>()
-        return names.map { normalized($0) }.filter { $0.count > 3 && seen.insert($0).inserted }
-    }
-
-    static func contains(_ text: String, _ variants: [String]) -> Bool {
-        variants.contains { text.contains($0) }
+        return names.map { normalized($0).trimmingCharacters(in: .whitespaces) }
+            .filter { $0.count >= 3 && !genericWords.contains($0) && seen.insert($0).inserted }
     }
 
     private static func compatible(_ league: String, _ game: SportsGame) -> Bool {

@@ -1,6 +1,7 @@
 import Foundation
 import Combine
 import UIKit
+import os
 
 /// Live TV from the Emby / Jellyfin servers signed in under Settings →
 /// Jellyfin. Raw server channels are turned into one guide entry per real
@@ -102,7 +103,8 @@ final class LiveTVStore: ObservableObject {
     @Published private(set) var events: [LiveEvent] = [] {
         didSet {
             plainEventsMemo = nil
-            scheduleSportsRebuild(delay: 1)
+            eventsRevision &+= 1
+            scheduleSportsRebuild(delay: 1, reason: "events")
         }
     }
     private var plainEventsMemo: [SportsEvent]?
@@ -130,7 +132,9 @@ final class LiveTVStore: ObservableObject {
     @Published private(set) var programs: [String: [LiveTVProgram]] = [:] {
         didSet {
             programsRevision &+= 1
-            scheduleSportsRebuild(delay: 6)
+            // Guide data no longer triggers a games rebuild; the sports
+            // listings are pulled from it on their own schedule.
+            guideChangedForSports()
         }
     }
     @Published private(set) var state: LoadState = .idle
@@ -2550,30 +2554,67 @@ final class LiveTVStore: ObservableObject {
     }
 
     // MARK: Sports events
+    //
+    // Rebuilds run off the main thread and only when an input changes:
+    // provider events, the schedule, the lineup / hidden groups, the sports
+    // listings, a 30-minute time bucket, the Spanish preference or the
+    // schedule switch. Guide data doesn't trigger them; sports listings are
+    // pulled from it after a quiet minute, at most every 10 minutes, or when
+    // Live Events opens. The last result is saved and shown on next launch.
 
+    private var sportsSinks: [AnyCancellable] = []
     private var sportsRebuildTask: Task<Void, Never>?
     private var sportsRebuildDue: Date?
     private var sportsRebuildRunning = false
-    private var sportsRebuildAgain = false
-    private var sportsSink: AnyCancellable?
+    private var sportsRebuildAgain: String?
+    private var sportsFingerprint: String?
+    private var sportsRebuildTimes: [Date] = []
+    private var eventsRevision = 0
+    private var sportsListings: [SportsMatcher.GuideListing] = []
+    private var sportsListingsRevision = 0
+    private var listingsExtractedAt: Date?
+    private var listingsChangedAt: Date?
+    private var listingsPendingSince: Date?
+    private var listingsTask: Task<Void, Never>?
+    private var listingsExtracting = false
+    /// Channel entry id → indices into `sportsEvents` (for event backups).
+    private var sportsBackupIndex: [String: [Int]] = [:]
+    private var sportsPersistLoaded = false
+    private var sportsPersistedFingerprint: String?
 
-    /// Re-matches games, guide listings and event feeds a moment after any
-    /// of them change. Throttled, not debounced: guide listings arrive every
-    /// few seconds while the guide loads, and a debounce that restarts on
-    /// each one would never get to run.
-    func scheduleSportsRebuild(delay: Double = 0.5) {
+    private static var sportsCacheFile: URL {
+        let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
+        return caches.appendingPathComponent("LiveTV", isDirectory: true).appendingPathComponent("live-events.json")
+    }
+
+    func scheduleSportsRebuild(delay: Double = 0.5, reason: String = "request") {
         SportsData.shared.loadCached()
-        if sportsSink == nil {
-            sportsSink = SportsData.shared.$revision.dropFirst().sink { [weak self] _ in
-                self?.scheduleSportsRebuild(delay: 0.3)
-            }
+        if sportsSinks.isEmpty {
+            sportsSinks.append(SportsData.shared.$revision.dropFirst().sink { [weak self] _ in
+                guard let self else { return }
+                self.scheduleSportsRebuild(delay: 0.3, reason: "schedule")
+                // First schedule of the session: the guide's game listings too.
+                if self.listingsExtractedAt == nil {
+                    Task { [weak self] in
+                        try? await Task.sleep(nanoseconds: 500_000_000)
+                        await self?.extractSportsListings(reason: "schedule")
+                    }
+                }
+            })
+            sportsSinks.append($entriesRevision.dropFirst().sink { [weak self] _ in
+                self?.scheduleSportsRebuild(delay: 3, reason: "lineup")
+            })
+            sportsSinks.append($hiddenGroups.dropFirst().sink { [weak self] _ in
+                self?.scheduleSportsRebuild(delay: 1, reason: "hidden")
+            })
+            loadSavedSportsEvents()
         }
         if sportsRebuildRunning {
-            sportsRebuildAgain = true
+            sportsRebuildAgain = reason
             return
         }
         let due = Date().addingTimeInterval(delay)
-        // Already queued to run sooner: that run picks this change up.
         if let pending = sportsRebuildDue, pending <= due { return }
         sportsRebuildTask?.cancel()
         sportsRebuildDue = due
@@ -2582,144 +2623,258 @@ final class LiveTVStore: ObservableObject {
             guard !Task.isCancelled, let self else { return }
             self.sportsRebuildDue = nil
             self.sportsRebuildRunning = true
-            await self.rebuildSportsEvents()
+            await self.rebuildSportsEvents(reason: reason)
             self.sportsRebuildRunning = false
-            if self.sportsRebuildAgain {
-                self.sportsRebuildAgain = false
-                self.scheduleSportsRebuild(delay: 8)
+            if let again = self.sportsRebuildAgain {
+                self.sportsRebuildAgain = nil
+                self.scheduleSportsRebuild(delay: 2, reason: again)
             }
         }
     }
 
-    private func rebuildSportsEvents() async {
+    /// Live Events opened: fresh sports listings if they're over 10 minutes
+    /// old, and a rebuild if anything changed.
+    func sportsOpened() {
+        if listingsExtractedAt.map({ Date().timeIntervalSince($0) > 600 }) ?? true {
+            Task { [weak self] in await self?.extractSportsListings(reason: "open") }
+        }
+        scheduleSportsRebuild(delay: 0.2, reason: "open")
+    }
+
+    /// Live Events' 30-second tick: only rebuilds when the 30-minute time
+    /// bucket moved on (the fingerprint skips everything else).
+    func sportsTick() {
+        scheduleSportsRebuild(delay: 0.5, reason: "tick")
+    }
+
+    private func guideChangedForSports() {
         let now = Date()
-        let games = SportsData.shared.games
-        let started = Date()
-        CrashRecorder.note("sports rebuild: start (\(games.count) games, \(events.count) provider events)")
-        // Copies are cheap (copy-on-write); all the scanning happens off
-        // the main thread.
-        let rawEvents = events
-        let programs = games.isEmpty ? [:] : self.programs
-        let entryInfo = self.entryInfo
-        let lineup = Set(lineupIDs)
-        let eligible = Set(browseEntries.map(\.id)).union(lineup)
-        let preferSpanish = prefs.countries.contains("US-ES")
-        let channelSources = networkSources(for: games)
-        let built = await Task.detached(priority: .utility) { () -> [SportsEvent] in
-            let spanishWords = "\\b(spanish|espanol|español|deportes|telemundo|univision|tudn|unimas)\\b"
-            let providerEvents = rawEvents.map { event in
-                SportsMatcher.ProviderEvent(
-                    id: event.id, title: event.title, league: event.league, start: event.start, feeds: event.feeds,
-                    family: event.family, spanish: event.market == "US-ES" || RX.test(spanishWords, event.title, caseInsensitive: true)
-                )
-            }
-            // Guide listings of games: only on sports, local and Spanish
-            // channels, and only titles that name two sides.
-            let low = now.addingTimeInterval(-5 * 3600), high = now.addingTimeInterval(16 * 3600)
-            var listings: [SportsMatcher.GuideListing] = []
-            let kinds: Set<LineupCategory> = [.sports, .local, .spanish]
-            for (id, list) in programs where id.hasPrefix("e|") && eligible.contains(id) {
-                guard let info = entryInfo[id], kinds.contains(info.category) else { continue }
-                let spanish = info.category == .spanish || info.market == "US-ES"
-                for program in list where program.end > low && program.start < high {
-                    let title = program.episodeTitle.map { "\(program.title) \($0)" } ?? program.title
-                    let lower = title.lowercased()
-                    guard lower.contains(" vs") || lower.contains(" at ") || lower.contains("@") || lower.contains(" v ") else { continue }
-                    listings.append(SportsMatcher.GuideListing(entryID: id, inLineup: lineup.contains(id), spanish: spanish,
-                                                               title: title, start: program.start, end: program.end))
+        listingsChangedAt = now
+        if listingsPendingSince == nil { listingsPendingSince = now }
+        guard listingsTask == nil else { return }
+        listingsTask = Task { [weak self] in
+            while true {
+                try? await Task.sleep(nanoseconds: 15_000_000_000)
+                guard let self else { return }
+                let now = Date()
+                let quiet = now.timeIntervalSince(self.listingsChangedAt ?? now)
+                let waiting = now.timeIntervalSince(self.listingsPendingSince ?? now)
+                let sinceLast = self.listingsExtractedAt.map { now.timeIntervalSince($0) } ?? .infinity
+                if quiet >= 60 || (waiting >= 600 && sinceLast >= 600) {
+                    self.listingsTask = nil
+                    await self.extractSportsListings(reason: quiet >= 60 ? "quiet" : "deadline")
+                    return
                 }
             }
-            return SportsMatcher.build(games: games, channelSources: channelSources, events: providerEvents, listings: listings,
-                                       preferSpanish: preferSpanish, now: now)
+        }
+    }
+
+    /// Game listings from the guide: sports, local and Spanish channels in
+    /// My Lineup or the browse list, titles with two sides, −5 h to +16 h.
+    private func extractSportsListings(reason: String) async {
+        guard !listingsExtracting, !SportsData.shared.games.isEmpty else { return }
+        listingsExtracting = true
+        defer { listingsExtracting = false }
+        let started = Date()
+        listingsPendingSince = nil
+        let kinds: Set<LineupCategory> = [.sports, .local, .spanish]
+        let lineup = lineupIDs
+        var subsetMap: [String: [LiveTVProgram]] = [:]
+        var metaMap: [String: (inLineup: Bool, spanish: Bool)] = [:]
+        for id in lineup.union(browseEntries.map(\.id)) {
+            guard let info = entryInfo[id], kinds.contains(info.category), let list = programs[id] else { continue }
+            subsetMap[id] = list
+            metaMap[id] = (lineup.contains(id), info.category == .spanish || info.market == "US-ES")
+        }
+        let subset = subsetMap
+        let meta = metaMap
+        let mainMS = Int(Date().timeIntervalSince(started) * 1000)
+        let now = Date()
+        let extracted = await Task.detached(priority: .utility) { () -> [SportsMatcher.GuideListing] in
+            let low = now.addingTimeInterval(-5 * 3600), high = now.addingTimeInterval(16 * 3600)
+            var listings: [SportsMatcher.GuideListing] = []
+            for (id, list) in subset {
+                autoreleasepool {
+                    guard let info = meta[id] else { return }
+                    for program in list where program.end > low && program.start < high {
+                        let title = program.episodeTitle.map { "\(program.title) \($0)" } ?? program.title
+                        guard SportsMatcher.looksLikeGame(title) else { continue }
+                        listings.append(SportsMatcher.GuideListing(entryID: id, inLineup: info.inLineup, spanish: info.spanish,
+                                                                   title: title, start: program.start, end: program.end))
+                    }
+                }
+            }
+            return listings.sorted { $0.start != $1.start ? $0.start < $1.start : ($0.entryID != $1.entryID ? $0.entryID < $1.entryID : $0.title < $1.title) }
         }.value
-        CrashRecorder.note("sports rebuild: \(built.count) shown, \(built.filter { !$0.sources.isEmpty }.count) watchable, "
-                           + "\(Int(Date().timeIntervalSince(started) * 1000)) ms")
-        if built != sportsEvents { sportsEvents = built }
+        listingsExtractedAt = Date()
+        let changed = extracted != sportsListings
+        CrashRecorder.note("sports listings (\(reason)): \(extracted.count) from \(subset.count) channels, "
+                           + "\(Int(Date().timeIntervalSince(started) * 1000)) ms (main \(mainMS) ms)\(changed ? "" : ", unchanged")")
+        guard changed else { return }
+        sportsListings = extracted
+        sportsListingsRevision &+= 1
+        scheduleSportsRebuild(delay: 0.5, reason: "listings")
+    }
+
+    private func rebuildSportsEvents(reason: String) async {
+        let now = Date()
+        let games = SportsData.shared.games
+        let preferSpanish = prefs.countries.contains("US-ES")
+        let bucket = Int(now.timeIntervalSince1970 / 1800)
+        let fingerprint = [eventsRevision, SportsData.shared.revision, entriesRevision, hiddenGroups.count,
+                           sportsListingsRevision, bucket].map { String($0) }.joined(separator: "|")
+            + "|\(preferSpanish)|\(SportsData.isEnabled)"
+        guard fingerprint != sportsFingerprint else { return }
+        let available = os_proc_available_memory()
+        guard available == 0 || available > 400 * 1_048_576 else {
+            CrashRecorder.note("sports rebuild (\(reason)) skipped: only \(available / 1_048_576) MB free")
+            return
+        }
+        sportsRebuildTimes = sportsRebuildTimes.filter { now.timeIntervalSince($0) < 60 } + [now]
+        if sportsRebuildTimes.count > 4 { CrashRecorder.note("sports rebuild: \(sportsRebuildTimes.count) in the last minute") }
+        let started = Date()
+        let memoryBefore = CrashRecorder.memoryMB()
+        // Snapshots (copy-on-write); everything heavy runs off the main thread.
+        let rawEvents = events
+        let listings = sportsListings
+        let lineup = lineupIDs
+        let lineupEntries = lineupIDs.compactMap { entry(id: $0) }
+        let browse = browseEntries
+        let entryInfo = self.entryInfo
+        let hidden = hiddenGroups
+        var previousMap: [String: String] = [:]
+        for event in sportsEvents { if let game = event.game { previousMap[game.id] = event.id } }
+        let previousIDs = previousMap
+        let mainMS = Int(Date().timeIntervalSince(started) * 1000)
+        let result = await Task.detached(priority: .utility) { () -> (events: [SportsEvent], stats: SportsMatcher.Stats)? in
+            let spanishWords = "\\b(spanish|espanol|español|deportes|telemundo|univision|tudn|unimas)\\b"
+            var providerEvents: [SportsMatcher.ProviderEvent] = []
+            providerEvents.reserveCapacity(rawEvents.count)
+            for event in rawEvents {
+                autoreleasepool {
+                    providerEvents.append(SportsMatcher.ProviderEvent(
+                        id: event.id, title: event.title, league: event.league, start: event.start, feeds: event.feeds,
+                        family: event.family, spanish: event.market == "US-ES" || RX.test(spanishWords, event.title, caseInsensitive: true)
+                    ))
+                }
+            }
+            let channelSources = SportsNetworkMap.networkSources(for: games, lineup: lineup, lineupEntries: lineupEntries,
+                                                            browse: browse, entryInfo: entryInfo, hidden: hidden)
+            return SportsMatcher.build(
+                games: games, channelSources: channelSources, events: providerEvents, listings: listings,
+                preferSpanish: preferSpanish, now: now, previousIDs: previousIDs,
+                shouldStop: {
+                    let free = os_proc_available_memory()
+                    if free != 0, free < 300 * 1_048_576 { return "only \(free / 1_048_576) MB free" }
+                    let grown = CrashRecorder.memoryMB() - memoryBefore
+                    if grown > 150 { return "memory grew \(grown) MB" }
+                    return nil
+                }
+            )
+        }.value
+        let memoryAfter = CrashRecorder.memoryMB()
+        guard let result else {
+            CrashRecorder.note("sports rebuild (\(reason)) stopped; keeping the last result")
+            return
+        }
+        sportsFingerprint = fingerprint
+        let built = result.events
+        CrashRecorder.note("sports rebuild (\(reason)): \(built.count) shown, \(built.filter { !$0.sources.isEmpty }.count) watchable, "
+                           + "\(Int(Date().timeIntervalSince(started) * 1000)) ms (main \(mainMS) ms), memory \(memoryBefore)→\(memoryAfter) MB")
+        if built != sportsEvents {
+            setSportsEvents(built)
+            saveSportsEvents(built, rawEvents: rawEvents)
+        }
         SportsData.shared.noteWatchable(Set(built.filter { !$0.sources.isEmpty && $0.game != nil }.map(\.leagueShort)))
     }
 
-    // MARK: Networks → channels
-
-    /// Short names used in TV listings for networks, as the channel is named.
-    private static let networkAliases: [String: String] = [
-        "nfl net": "NFL Network", "nfl netwrk": "NFL Network", "mlb net": "MLB Network", "nhl net": "NHL Network",
-        "usa net": "USA Network", "usa": "USA Network", "cbssn": "CBS Sports Network", "btn": "Big Ten Network",
-        "secn": "SEC Network", "accn": "ACC Network", "espnews": "ESPNews", "golf": "Golf Channel"
-    ]
-    private static let broadcastNetworks: Set<String> = ["ABC", "CBS", "NBC", "FOX", "CW", "TELEMUNDO", "UNIVISION", "UNIMAS"]
-
-    /// "core:FS1" / "net:FOX" for a network name, or nil (streaming
-    /// services, regional networks).
-    private static func networkKey(_ name: String) -> String? {
-        let key = ChannelCatalog.coreKey(name).key
-        if let alias = networkAliases[key] { return "core:\(alias)" }
-        if let core = ChannelCatalog.coreMatch(name) { return "core:\(core.name)" }
-        let word = key.replacingOccurrences(of: " ", with: "").uppercased()
-        if broadcastNetworks.contains(word) { return "net:\(word)" }
-        return nil
+    private func setSportsEvents(_ value: [SportsEvent]) {
+        sportsEvents = value
+        var index: [String: [Int]] = [:]
+        for (position, event) in value.enumerated() {
+            for source in event.sources where source.kind != .provider {
+                index[source.channelID, default: []].append(position)
+            }
+        }
+        sportsBackupIndex = index
     }
 
-    /// For each game, the channels you have airing its network: My Lineup
-    /// first, then the rest of your channels (two at most of each).
-    private func networkSources(for games: [SportsGame]) -> [String: [EventSource]] {
-        guard !games.isEmpty else { return [:] }
-        let lineup = Set(lineupIDs)
-        var index: [String: [(id: String, inLineup: Bool, spanish: Bool)]] = [:]
-        var seen = Set<String>()
-        for entry in lineupIDs.compactMap({ self.entry(id: $0) }) + browseEntries {
-            guard seen.insert(entry.id).inserted, let info = entryInfo[entry.id], !isHidden(entry) else { continue }
-            let key: String
-            if let core = info.core {
-                key = "core:\(core)"
-            } else if info.category == .local, let word = ChannelCatalog.networkWord(info.name) {
-                key = "net:\(word)"
-            } else {
-                continue
-            }
-            let spanish = info.category == .spanish || info.market == "US-ES"
-            index[key, default: []].append((entry.id, lineup.contains(entry.id), spanish))
-        }
-        var keys: [String: String?] = [:]
-        func cachedKey(_ network: String) -> String? {
-            if let cached = keys[network] { return cached }
-            let value = Self.networkKey(network)
-            keys[network] = value
-            return value
-        }
-        // Broadcast networks split up some games by region (several NFL
-        // games on FOX at 1 PM): those only count when the guide listing
-        // confirms which one your station has.
-        var regional = Set<String>()
-        var byNetwork: [String: [Date]] = [:]
-        for game in games where !game.completed {
-            for network in game.networks.prefix(1) {
-                guard let k = cachedKey(network), k.hasPrefix("net:") else { continue }
-                if byNetwork[k, default: []].contains(where: { abs($0.timeIntervalSince(game.start)) < 90 * 60 }) {
-                    regional.insert("\(k)|\(Int(game.start.timeIntervalSince1970 / 10_800))")
-                }
-                byNetwork[k, default: []].append(game.start)
-            }
-        }
-        var result: [String: [EventSource]] = [:]
-        for game in games where !game.completed {
-            var sources: [EventSource] = []
-            for network in game.networks {
-                guard let key = cachedKey(network), let entries = index[key] else { continue }
-                if key.hasPrefix("net:") {
-                    let bucket = Int(game.start.timeIntervalSince1970 / 10_800)
-                    let overlapping = (byNetwork[key] ?? []).filter { abs($0.timeIntervalSince(game.start)) < 90 * 60 }.count > 1
-                    if overlapping || regional.contains("\(key)|\(bucket)") { continue }
-                }
-                let mine = Array(entries.filter { $0.inLineup }.prefix(2))
-                let others = mine.isEmpty ? Array(entries.filter { !$0.inLineup }.prefix(2)) : []
-                for item in mine + others where !sources.contains(where: { $0.channelID == item.id }) {
-                    sources.append(EventSource(channelID: item.id, kind: item.inLineup ? .lineup : .guide, spanish: item.spanish,
-                                               detail: item.inLineup ? "In My Lineup" : "In your channels"))
+    // MARK: Saved result (shown instantly on the next launch)
+
+    private struct SavedSportsEvents: Codable {
+        var version = 1
+        var savedAt: Date
+        var events: [SportsEvent]
+        /// Provider feed id → the matchup it was showing when saved.
+        var feedKeys: [String: String]
+    }
+
+    private func saveSportsEvents(_ value: [SportsEvent], rawEvents: [LiveEvent]) {
+        let games = value.filter { $0.game != nil && !$0.sources.isEmpty }
+        let fingerprint = games.map { "\($0.id):\($0.sources.count)" }.joined(separator: ",")
+        guard fingerprint != sportsPersistedFingerprint else { return }
+        sportsPersistedFingerprint = fingerprint
+        let file = Self.sportsCacheFile
+        Task.detached(priority: .background) {
+            var titleOfFeed: [String: String] = [:]
+            for event in rawEvents { for feed in event.feeds { titleOfFeed[feed] = event.title } }
+            var keys: [String: String] = [:]
+            for event in games {
+                for source in event.feeds {
+                    autoreleasepool {
+                        if let title = titleOfFeed[source.channelID] { keys[source.channelID] = SportsMatcher.matchupKey(title) }
+                    }
                 }
             }
-            if !sources.isEmpty { result[game.id] = sources }
+            let saved = SavedSportsEvents(savedAt: Date(), events: games, feedKeys: keys)
+            if let data = try? JSONEncoder().encode(saved) { try? data.write(to: file, options: .atomic) }
         }
-        return result
+    }
+
+    /// Last launch's games, checked: provider feeds must still show the
+    /// same matchup (event slots get renamed through the day); until the
+    /// channel list has loaded, only guide and network channels are kept.
+    private func loadSavedSportsEvents() {
+        guard !sportsPersistLoaded else { return }
+        sportsPersistLoaded = true
+        let file = Self.sportsCacheFile
+        let rawEvents = events
+        Task { [weak self] in
+            let checked = await Task.detached(priority: .utility) { () -> (events: [SportsEvent], age: Int, dropped: Int)? in
+                guard let data = try? Data(contentsOf: file),
+                      let saved = try? JSONDecoder().decode(SavedSportsEvents.self, from: data), saved.version == 1 else { return nil }
+                var current: [String: String] = [:]
+                for event in rawEvents {
+                    autoreleasepool {
+                        let key = SportsMatcher.matchupKey(event.title)
+                        for feed in event.feeds { current[feed] = key }
+                    }
+                }
+                let now = Date()
+                var dropped = 0
+                let events: [SportsEvent] = saved.events.compactMap { event in
+                    guard event.state(at: now) != .finished else { return nil }
+                    var copy = event
+                    copy.sources = event.sources.filter { source in
+                        guard source.kind == .provider else { return true }
+                        let keep = !rawEvents.isEmpty && current[source.channelID] != nil && current[source.channelID] == saved.feedKeys[source.channelID]
+                        if !keep { dropped += 1 }
+                        return keep
+                    }
+                    return copy
+                }
+                return (events, Int(now.timeIntervalSince(saved.savedAt) / 60), dropped)
+            }.value
+            guard let self, let checked, self.sportsEvents.isEmpty else { return }
+            let resolvable = checked.events.map { event -> SportsEvent in
+                guard !self.browseEntries.isEmpty else { return event }
+                var copy = event
+                copy.sources = event.sources.filter { self.sourceChannel($0) != nil }
+                return copy
+            }
+            self.setSportsEvents(resolvable)
+            CrashRecorder.note("sports saved result: \(resolvable.count) games, \(checked.age) min old, \(checked.dropped) stale feeds dropped")
+        }
     }
 
     func sourceChannel(_ source: EventSource) -> LiveTVChannel? {
@@ -2784,9 +2939,10 @@ final class LiveTVStore: ObservableObject {
 
     /// Feeds of a game airing now on an entry, as extra backups for it.
     private func eventBackups(forEntry id: String) -> [LiveTVChannel] {
-        guard !sportsEvents.isEmpty else { return [] }
+        guard let positions = sportsBackupIndex[id] else { return [] }
         let now = Date()
-        for event in sportsEvents where event.sources.contains(where: { $0.channelID == id && $0.kind != .provider }) {
+        for position in positions where position < sportsEvents.count {
+            let event = sportsEvents[position]
             guard let start = event.start, start < now.addingTimeInterval(15 * 60) else { continue }
             let state = event.state(at: now)
             guard state == .live || state == .mayHaveEnded || state == .upcoming else { continue }
@@ -3319,5 +3475,87 @@ final class LiveTVStore: ObservableObject {
             await self?.runProviderBuild(sourceID: source, name: "Demo provider", url: file, channels: scoped, key: nil)
             self?.providerTask = nil
         }
+    }
+}
+
+/// Maps a game's TV networks to the viewer's channels. Pure, runs off the
+/// main thread.
+enum SportsNetworkMap {
+
+    /// Short names used in TV listings for networks, as the channel is named.
+    private static let networkAliases: [String: String] = [
+        "nfl net": "NFL Network", "nfl netwrk": "NFL Network", "mlb net": "MLB Network", "nhl net": "NHL Network",
+        "usa net": "USA Network", "usa": "USA Network", "cbssn": "CBS Sports Network", "btn": "Big Ten Network",
+        "secn": "SEC Network", "accn": "ACC Network", "espnews": "ESPNews", "golf": "Golf Channel"
+    ]
+    private static let broadcastNetworks: Set<String> = ["ABC", "CBS", "NBC", "FOX", "CW", "TELEMUNDO", "UNIVISION", "UNIMAS"]
+
+    /// "core:FS1" / "net:FOX" for a network name, or nil (streaming
+    /// services, regional networks).
+    private static func networkKey(_ name: String) -> String? {
+        let key = ChannelCatalog.coreKey(name).key
+        if let alias = networkAliases[key] { return "core:\(alias)" }
+        if let core = ChannelCatalog.coreMatch(name) { return "core:\(core.name)" }
+        let word = key.replacingOccurrences(of: " ", with: "").uppercased()
+        if broadcastNetworks.contains(word) { return "net:\(word)" }
+        return nil
+    }
+
+    /// For each game, the channels you have airing its network: My Lineup
+    /// first, then the rest of your channels (two at most of each). Pure, so
+    /// it runs off the main thread.
+    static func networkSources(for games: [SportsGame], lineup: Set<String>, lineupEntries: [LiveTVChannel],
+                                           browse: [LiveTVChannel], entryInfo: [String: LiveTVEntryInfo],
+                                           hidden: Set<String>) -> [String: [EventSource]] {
+        guard !games.isEmpty else { return [:] }
+        var index: [String: [(id: String, inLineup: Bool, spanish: Bool)]] = [:]
+        var seen = Set<String>()
+        for entry in lineupEntries + browse {
+            guard seen.insert(entry.id).inserted, let info = entryInfo[entry.id],
+                  !hidden.contains(entry.group ?? "Other") else { continue }
+            let key: String
+            if let core = info.core {
+                key = "core:\(core)"
+            } else if info.category == .local, let word = ChannelCatalog.networkWord(info.name) {
+                key = "net:\(word)"
+            } else {
+                continue
+            }
+            let spanish = info.category == .spanish || info.market == "US-ES"
+            index[key, default: []].append((entry.id, lineup.contains(entry.id), spanish))
+        }
+        var keys: [String: String?] = [:]
+        func cachedKey(_ network: String) -> String? {
+            if let cached = keys[network] { return cached }
+            let value = networkKey(network)
+            keys[network] = value
+            return value
+        }
+        // Broadcast networks split some games by region (several NFL games
+        // on FOX at 1 PM): those only count when a guide listing confirms
+        // which one your station has.
+        var byNetwork: [String: [Date]] = [:]
+        for game in games where !game.completed {
+            if let network = game.networks.first, let key = cachedKey(network), key.hasPrefix("net:") {
+                byNetwork[key, default: []].append(game.start)
+            }
+        }
+        var result: [String: [EventSource]] = [:]
+        for game in games where !game.completed {
+            var sources: [EventSource] = []
+            for network in game.networks {
+                guard let key = cachedKey(network), let entries = index[key] else { continue }
+                if key.hasPrefix("net:"),
+                   (byNetwork[key] ?? []).filter({ abs($0.timeIntervalSince(game.start)) < 90 * 60 }).count > 1 { continue }
+                let mine = Array(entries.filter { $0.inLineup }.prefix(2))
+                let others = mine.isEmpty ? Array(entries.filter { !$0.inLineup }.prefix(2)) : []
+                for item in mine + others where !sources.contains(where: { $0.channelID == item.id }) {
+                    sources.append(EventSource(channelID: item.id, kind: item.inLineup ? .lineup : .guide, spanish: item.spanish,
+                                               detail: item.inLineup ? "In My Lineup" : "In your channels"))
+                }
+            }
+            if !sources.isEmpty { result[game.id] = sources }
+        }
+        return result
     }
 }
