@@ -235,7 +235,9 @@ extension PlayerView {
             // Tap or hold left/right seek is active during video playback,
             // when controls are hidden or when the timeline is focused.
             isActive: PlayerWindowInputCapturePolicy.allowsCapture(
-                existingConditions: didReportPlaybackStarted
+                // Live TV and Channels take the remote right away (flip, mini
+                // guide), even before a channel's first frame.
+                existingConditions: (didReportPlaybackStarted || viewModel.isLiveTVSession || viewModel.isChannelPlayback)
                 && !isWakingFromBackground
                 && !liveOverlay.blocksPlayerInput
                 && viewModel.currentErrorDiagnostic == nil
@@ -408,8 +410,8 @@ extension PlayerView {
             .ignoresSafeArea()
             .contentShape(Rectangle())
             .focusable(
-                didReportPlaybackStarted
-                    && (!viewModel.showControls || viewModel.isSwitchingSource || viewModel.showPauseOverlay)
+                (didReportPlaybackStarted || viewModel.isLiveTVSession || viewModel.isChannelPlayback)
+                    && (!viewModel.showControls || !didReportPlaybackStarted || viewModel.isSwitchingSource || viewModel.showPauseOverlay)
                     && !viewModel.isScrubbing
                     && !viewModel.isHoldingSeek
                     && viewModel.currentErrorDiagnostic == nil

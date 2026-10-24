@@ -2217,7 +2217,6 @@ class PlayerViewModel: ObservableObject {
         for segment in skipIntervals {
             if current < max(segment.startTime - 0.35, 0) {
                 dismissedSkipIntervalIds.remove(segment.id)
-                autoSkippedIntervalIds.remove(segment.id)
                 if autoHiddenSkipIntervalId == segment.id {
                     autoHiddenSkipIntervalId = nil
                 }
@@ -3739,6 +3738,7 @@ class PlayerViewModel: ObservableObject {
         // session. The normal progress save path will still handle a fresh
         // playback whose timeline is not ready yet.
         if isTrackablePlayback,
+           !keepsContinueWatchingPlace,
            let activeMeta,
            time.current > 0,
            time.duration > 0,
@@ -4430,7 +4430,6 @@ class PlayerViewModel: ObservableObject {
         for segment in skipIntervals {
             if target < max(segment.startTime - 0.35, 0) {
                 dismissedSkipIntervalIds.remove(segment.id)
-                autoSkippedIntervalIds.remove(segment.id)
                 if autoHiddenSkipIntervalId == segment.id {
                     autoHiddenSkipIntervalId = nil
                 }
@@ -8079,7 +8078,10 @@ extension PlayerViewModel {
         // never join Multiview: providers cap streams per account, and a
         // second tile would be refused or knock the first one off.
         guard activeMeta?.id.hasPrefix("live:") != true else { return false }
-        return isLiveStream && multiviewChannel != nil
+        // A stream with no duration once it's playing is live too (add-on
+        // streams without a live hint in their name or address).
+        let noDuration = hasRenderedFirstFrame && !(time.duration > 0)
+        return (isLiveStream || noDuration) && multiviewChannel != nil
     }
 
     /// The stream on screen right now, captured for a Multiview tile. Uses the
