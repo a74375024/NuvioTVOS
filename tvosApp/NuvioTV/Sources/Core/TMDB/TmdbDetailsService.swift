@@ -1555,7 +1555,7 @@ struct TmdbResponseCache<Value> {
 }
 
 private actor TmdbDetailsCache {
-    private var values = TmdbResponseCache<TmdbDetailsResponse>(capacity: 256)
+    private var values = TmdbResponseCache<TmdbDetailsResponse>(capacity: 640)
     private var inFlight: [String: Task<TmdbDetailsResponse?, Never>] = [:]
 
     func resolve(
@@ -1627,7 +1627,7 @@ private actor TmdbFindCache {
 }
 
 private actor TmdbLocalizedDetailsCache {
-    private var values = TmdbResponseCache<TmdbLocalizedDetailsResponse>(capacity: 256)
+    private var values = TmdbResponseCache<TmdbLocalizedDetailsResponse>(capacity: 640)
     private var generation: UInt64 = 0
 
     func snapshotGeneration() -> UInt64 {

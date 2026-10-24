@@ -447,23 +447,25 @@ struct ChannelsView: View {
 /// while tuning in or between programs, and the cable-style info banner
 /// shown over playback when a program starts.
 struct ChannelTransitionOverlay: View {
-    @ObservedObject private var store = ChannelSessionStore.shared
+    private let store = ChannelSessionStore.shared
+    /// Only the card and banner: this view doesn't redraw for guide changes.
+    @ObservedObject private var chrome = ChannelSessionStore.shared.chrome
     @FocusState private var buttonFocused: Bool
 
     var body: some View {
         ZStack {
-            if let overlay = store.overlay {
+            if let overlay = chrome.overlay {
                 content(for: overlay)
                     .transition(.opacity)
                     .onAppear { DispatchQueue.main.async { buttonFocused = true } }
-            } else if let banner = store.banner {
+            } else if let banner = chrome.banner {
                 ChannelInfoBanner(banner: banner, number: store.number(of: banner.channelID))
                     .transition(.move(edge: .bottom).combined(with: .opacity))
                     .allowsHitTesting(false)
             }
         }
-        .animation(.easeInOut(duration: 0.3), value: store.overlay)
-        .animation(.easeInOut(duration: 0.35), value: store.banner)
+        .animation(.easeInOut(duration: 0.3), value: chrome.overlay)
+        .animation(.easeInOut(duration: 0.35), value: chrome.banner)
     }
 
     @ViewBuilder

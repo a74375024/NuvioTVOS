@@ -344,6 +344,11 @@ final class CinemetaCatalogRepository: CatalogRepository {
     private let baseURL = URL(string: "https://v3-cinemeta.strem.io")!
     private static var cachedMetaById: [String: NuvioMeta] = [:]
     private static var cachedFullMetaIds: Set<String> = []
+    /// When each full entry was fetched. A series' episode list is only
+    /// trusted for `seriesEpisodeLifetime`; after that the entry stays as a
+    /// preview (Details still opens at once) and the next request refetches.
+    private static var cachedFullMetaAt: [String: Date] = [:]
+    static let seriesEpisodeLifetime: TimeInterval = 12 * 60 * 60
     private static var cachedMetadataContext: String?
     // Read live settings, never the TaskLocal snapshot of an older request.
     static var metadataCacheContext: String {
@@ -361,6 +366,7 @@ final class CinemetaCatalogRepository: CatalogRepository {
         if cachedMetadataContext != context {
             cachedMetaById.removeAll()
             cachedFullMetaIds.removeAll()
+            cachedFullMetaAt.removeAll()
             cachedMetadataContext = context
         }
         return true
@@ -381,10 +387,16 @@ final class CinemetaCatalogRepository: CatalogRepository {
         }
     }
 
+    /// Entries in the shared metadata cache (all / full), for the log.
+    static func metadataCacheCounts() -> (all: Int, full: Int) {
+        metadataCacheQueue.sync { (cachedMetaById.count, cachedFullMetaIds.count) }
+    }
+
     static func clearMetadataCache() {
         metadataCacheQueue.sync(flags: .barrier) {
             cachedMetaById.removeAll()
             cachedFullMetaIds.removeAll()
+            cachedFullMetaAt.removeAll()
             cachedMetadataContext = nil
         }
     }
@@ -392,7 +404,10 @@ final class CinemetaCatalogRepository: CatalogRepository {
     func isCachedFullMetadata(id: String) -> Bool {
         let context = Self.metadataCacheContext
         return Self.metadataCacheQueue.sync {
-            Self.cachedMetadataContext == context && Self.cachedFullMetaIds.contains(id) && Self.cachedMetaById[id] != nil
+            guard Self.cachedMetadataContext == context, Self.cachedFullMetaIds.contains(id),
+                  let meta = Self.cachedMetaById[id] else { return false }
+            guard meta.isSeries, let at = Self.cachedFullMetaAt[id] else { return true }
+            return Date().timeIntervalSince(at) < Self.seriesEpisodeLifetime
         }
     }
 
@@ -401,12 +416,15 @@ final class CinemetaCatalogRepository: CatalogRepository {
         guard !Task.isCancelled else { return }
         Self.metadataCacheQueue.sync(flags: .barrier) {
             guard Self.prepareMetadataCache(for: context) else { return }
+            let now = Date()
             if let requestedID {
                 Self.cachedMetaById[requestedID] = meta
                 Self.cachedFullMetaIds.insert(requestedID)
+                Self.cachedFullMetaAt[requestedID] = now
             }
             Self.cachedMetaById[meta.id] = meta
             Self.cachedFullMetaIds.insert(meta.id)
+            Self.cachedFullMetaAt[meta.id] = now
         }
     }
 
@@ -477,6 +495,7 @@ final class CinemetaCatalogRepository: CatalogRepository {
         Self.metadataCacheQueue.sync(flags: .barrier) {
             _ = Self.cachedMetaById.removeValue(forKey: id)
             Self.cachedFullMetaIds.remove(id)
+            Self.cachedFullMetaAt.removeValue(forKey: id)
         }
     }
 
@@ -2171,6 +2190,20 @@ final class CinemetaCatalogRepository: CatalogRepository {
             hasMore: !items.isEmpty,
             page: 1,
             nextSkip: skip + items.count
+        )
+    }
+
+    /// A catalog page exactly as the add-on returned it: no TMDB lookups and
+    /// nothing written to the shared metadata cache (Channels' pools, which
+    /// need the add-on's own English genre names).
+    func plainCatalogPage(baseURL source: URL, contentType: String, catalogId: String, skip: Int, genre: String?) async throws -> [NuvioMeta] {
+        try await fetchCatalog(
+            sourceBaseURL: source,
+            type: contentType,
+            catalogId: catalogId,
+            skip: skip == 0 ? nil : skip,
+            search: nil,
+            genre: genre
         )
     }
 

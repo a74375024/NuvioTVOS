@@ -78,6 +78,131 @@ private struct CalendarModel {
     var firstCardID: String? { newItems.first?.id ?? sections.first?.events.first.map { "u|" + $0.id } }
 }
 
+/// Builds the Calendar's rows from the store's events and your watched
+/// history (one history read per show per build), only when one of them
+/// changes or an episode's air time passes.
+@MainActor
+private final class CalendarScreenModel: ObservableObject {
+    @Published private(set) var model = CalendarModel()
+    /// When the next episode airs (it moves from Coming Up to New).
+    private var nextBoundary: Date?
+    private var builtDay: Date?
+    private var stale = true
+
+    func markStale() { stale = true }
+
+    func isDue(at date: Date) -> Bool {
+        if stale { return true }
+        if let builtDay, Calendar.current.startOfDay(for: date) != builtDay { return true }
+        return nextBoundary.map { date >= $0 } ?? false
+    }
+
+    private struct Pending {
+        let event: CalendarEvent
+        let season: Int
+        let episode: Int
+    }
+
+    func rebuild(events allEvents: [CalendarEvent], filter: CalendarShowFilter, now: Date, reason: String) {
+        let started = Date()
+        let calendar = Calendar.current
+        let today = calendar.startOfDay(for: now)
+        let events = allEvents.filter { filter.includes($0) }
+
+        func aired(_ event: CalendarEvent) -> Bool {
+            if event.day < today { return true }
+            guard event.day == today else { return false }
+            // Date-only listings count as out on the day.
+            return event.airTime.map { $0 <= now } ?? true
+        }
+
+        // New for You: unwatched aired episodes, grouped per show.
+        var watchedByShow: [String: Set<String>] = [:]
+        var pendingByShow: [String: [Pending]] = [:]
+        for event in events where aired(event) {
+            let numbers = event.kind == .seasonDrop
+                ? Array(event.episode..<(event.episode + max(1, event.episodeCount)))
+                : [event.episode]
+            let watched: Set<String>
+            if let known = watchedByShow[event.showID] {
+                watched = known
+            } else {
+                watched = WatchedStore.watchedEpisodeKeys(metaId: event.showID)
+                watchedByShow[event.showID] = watched
+            }
+            for number in numbers where !watched.contains("\(event.season):\(number)") {
+                pendingByShow[event.showID, default: []].append(Pending(event: event, season: event.season, episode: number))
+            }
+        }
+        var started_: [String: ContinueWatchingItem] = [:]
+        for item in ContinueWatchingStore.items() {
+            guard let season = item.season, let episode = item.episode else { continue }
+            let key = "\(item.meta.id):\(season):\(episode)"
+            if started_[key] == nil { started_[key] = item }
+        }
+        var newItems: [NewShowItem] = []
+        for (showID, pending) in pendingByShow {
+            let ordered = pending.sorted { $0.season != $1.season ? $0.season < $1.season : $0.episode < $1.episode }
+            guard let next = ordered.first, let last = ordered.last else { continue }
+            var progress: Double?
+            if let item = started_["\(showID):\(next.season):\(next.episode)"], item.isUpNext != true,
+               item.duration > 0, item.position > 0 {
+                progress = min(1, item.position / item.duration)
+            }
+            newItems.append(NewShowItem(
+                showID: showID, showType: next.event.showType, showName: next.event.showName,
+                event: next.event, season: next.season, episode: next.episode,
+                lastSeason: last.season, lastEpisode: last.episode,
+                newCount: ordered.count,
+                latestDay: ordered.map(\.event.day).max() ?? next.event.day,
+                progress: progress
+            ))
+        }
+        newItems.sort {
+            if $0.latestDay != $1.latestDay { return $0.latestDay > $1.latestDay }
+            return $0.showName.localizedCaseInsensitiveCompare($1.showName) == .orderedAscending
+        }
+
+        // Coming up: this week, next week, later this month.
+        let upcoming = events.filter { !aired($0) }
+        let weekEnd = calendar.date(byAdding: .day, value: 7, to: today) ?? today
+        let nextWeekEnd = calendar.date(byAdding: .day, value: 14, to: today) ?? today
+        let monthEnd = calendar.date(byAdding: .day, value: ReleaseCalendarStore.futureDays + 1, to: today) ?? today
+        let lastOfWeek = calendar.date(byAdding: .day, value: 6, to: today) ?? today
+        let lastOfNextWeek = calendar.date(byAdding: .day, value: 13, to: today) ?? today
+        var sections: [UpcomingSection] = []
+        let thisWeek = upcoming.filter { $0.day < weekEnd }
+        if !thisWeek.isEmpty {
+            sections.append(UpcomingSection(
+                id: "week", title: L10n.string("calendar_this_week", fallback: "Coming Up This Week"),
+                subtitle: "\(ReleaseCalendarView.shortDate(today)) – \(ReleaseCalendarView.shortDate(lastOfWeek))", events: thisWeek))
+        }
+        let nextWeek = upcoming.filter { $0.day >= weekEnd && $0.day < nextWeekEnd }
+        if !nextWeek.isEmpty {
+            sections.append(UpcomingSection(
+                id: "next", title: L10n.string("calendar_next_week", fallback: "Next Week"),
+                subtitle: "\(ReleaseCalendarView.shortDate(weekEnd)) – \(ReleaseCalendarView.shortDate(lastOfNextWeek))", events: nextWeek))
+        }
+        let later = upcoming.filter { $0.day >= nextWeekEnd && $0.day < monthEnd }
+        if !later.isEmpty {
+            sections.append(UpcomingSection(
+                id: "later", title: L10n.string("calendar_later", fallback: "Later This Month"),
+                subtitle: "from \(ReleaseCalendarView.shortDate(nextWeekEnd))", events: later))
+        }
+        model = CalendarModel(newItems: newItems, sections: sections)
+        nextBoundary = upcoming.compactMap { event -> Date? in
+            guard event.day == today || event.day == calendar.date(byAdding: .day, value: 1, to: today) else { return nil }
+            return event.airTime ?? event.day
+        }.min()
+        builtDay = today
+        stale = false
+        let ms = Int(Date().timeIntervalSince(started) * 1000)
+        if ms >= 30 {
+            CrashRecorder.note("calendar rows (\(reason)): \(events.count) events, \(newItems.count) new, \(ms) ms")
+        }
+    }
+}
+
 /// Release calendar for the TV shows in the Library and shows being watched:
 /// what's new to watch now (one card per show, Select plays the next new
 /// episode), then what's coming this week, next week and later this month.
@@ -92,8 +217,10 @@ struct ReleaseCalendarView: View {
     @AppStorage(SettingsKey.amoled) private var amoled = false
     @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
     @AppStorage("nuvio.tv.calendar.filter") private var filterRaw = CalendarShowFilter.all.rawValue
-    /// Bumped when watched state changes so "new" counts refresh.
-    @State private var watchedRevision = 0
+    /// The rows, built only when the data changes (not on focus moves).
+    @StateObject private var screen = CalendarScreenModel()
+    /// Off screen nothing is rebuilt; it catches up on return.
+    @State private var isVisible = false
     @State private var now = Date()
     @FocusState private var focusedCard: String?
     /// The card the panel describes (the last one focused).
@@ -104,7 +231,7 @@ struct ReleaseCalendarView: View {
     private var filter: CalendarShowFilter { CalendarShowFilter(rawValue: filterRaw) ?? .all }
 
     var body: some View {
-        let model = makeModel()
+        let model = screen.model
         let focus = panelFocus(in: model)
         ZStack(alignment: .topLeading) {
             Color.nuvioBackground(amoled: amoled, body: bodyColor).ignoresSafeArea()
@@ -119,22 +246,53 @@ struct ReleaseCalendarView: View {
         }
         .defaultFocus($focusedCard, model.firstCardID)
         .onAppear {
+            isVisible = true
             now = Date()
+            rebuild("open")
             refresh(force: false)
         }
+        .onDisappear { isVisible = false }
         .onChange(of: focusedCard) { _, card in
             if let card { panelCardID = card }
         }
-        .task(id: model.newItems.prefix(16).map(\.availabilityKey).joined(separator: ",")) {
-            store.checkAvailability(model.newItems.prefix(16).map(\.availabilityKey))
+        // Sources for the card you rest on, nothing else.
+        .task(id: focusedNewItem(in: model)?.availabilityKey) {
+            guard let item = focusedNewItem(in: model) else { return }
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            guard !Task.isCancelled else { return }
+            await store.probeAvailability(showID: item.showID, season: item.season, episode: item.episode)
         }
-        .onReceive(ticker) { now = $0 }
-        .onReceive(NotificationCenter.default.publisher(for: WatchedStore.changedNotification)) { _ in
-            watchedRevision &+= 1
+        .onChange(of: filterRaw) { _, _ in rebuild("filter") }
+        // @Published fires before the value changes: use the value it sends.
+        .onReceive(store.$events.dropFirst()) { events in rebuild("events", events: events) }
+        .onReceive(ticker) { date in
+            guard isVisible else { return }
+            now = date
+            if screen.isDue(at: date) { rebuild("time") }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: WatchedStore.changedNotification).receive(on: RunLoop.main)) { _ in
+            rebuild("watched")
+        }
+        .onReceive(NotificationCenter.default.publisher(for: ContinueWatchingStore.changedNotification).receive(on: RunLoop.main)) { _ in
+            rebuild("progress")
         }
         .onReceive(NotificationCenter.default.publisher(for: LibraryStore.changedNotification)) { _ in
             refresh(force: false)
         }
+    }
+
+    /// Rebuilds the rows now when on screen, else when the tab comes back.
+    private func rebuild(_ reason: String, events: [CalendarEvent]? = nil) {
+        guard isVisible else {
+            screen.markStale()
+            return
+        }
+        screen.rebuild(events: events ?? store.events, filter: filter, now: Date(), reason: reason)
+    }
+
+    private func focusedNewItem(in model: CalendarModel) -> NewShowItem? {
+        guard let id = focusedCard, id.hasPrefix("n|") else { return nil }
+        return model.newItems.first { $0.id == id }
     }
 
     private func refresh(force: Bool) {
@@ -151,9 +309,9 @@ struct ReleaseCalendarView: View {
             Text(L10n.string("calendar_title", fallback: "Calendar"))
                 .font(.system(size: 38, weight: .bold))
                 .foregroundColor(.white)
-            if store.isRefreshing {
+            if store.isRefreshing && store.lookupCount > 0 {
                 ProgressView().tint(.white).scaleEffect(0.7)
-                Text(L10n.format("calendar_checking_shows", fallback: "Checking %d shows…", store.showCount))
+                Text(L10n.format("calendar_checking_shows", fallback: "Checking %d shows…", store.lookupCount))
                     .font(.system(size: 20))
                     .foregroundColor(.white.opacity(0.55))
             }
@@ -444,95 +602,6 @@ struct ReleaseCalendarView: View {
         }
     }
 
-    // MARK: - Model
-
-    private struct Pending {
-        let event: CalendarEvent
-        let season: Int
-        let episode: Int
-    }
-
-    private func makeModel() -> CalendarModel {
-        _ = watchedRevision
-        let calendar = Calendar.current
-        let today = calendar.startOfDay(for: now)
-        let events = store.events.filter { filter.includes($0) }
-
-        func aired(_ event: CalendarEvent) -> Bool {
-            if event.day < today { return true }
-            guard event.day == today else { return false }
-            // Date-only listings count as out on the day.
-            return event.airTime.map { $0 <= now } ?? true
-        }
-
-        // New for You: unwatched aired episodes, grouped per show.
-        var pendingByShow: [String: [Pending]] = [:]
-        for event in events where aired(event) {
-            let numbers = event.kind == .seasonDrop
-                ? Array(event.episode..<(event.episode + max(1, event.episodeCount)))
-                : [event.episode]
-            for number in numbers where !WatchedStore.containsEpisode(metaId: event.showID, season: event.season, episode: number) {
-                pendingByShow[event.showID, default: []].append(Pending(event: event, season: event.season, episode: number))
-            }
-        }
-        var started: [String: ContinueWatchingItem] = [:]
-        for item in ContinueWatchingStore.items() {
-            guard let season = item.season, let episode = item.episode else { continue }
-            let key = "\(item.meta.id):\(season):\(episode)"
-            if started[key] == nil { started[key] = item }
-        }
-        var newItems: [NewShowItem] = []
-        for (showID, pending) in pendingByShow {
-            let ordered = pending.sorted { ($0.season, $0.episode) < ($1.season, $1.episode) }
-            guard let next = ordered.first, let last = ordered.last else { continue }
-            var progress: Double?
-            if let item = started["\(showID):\(next.season):\(next.episode)"], item.isUpNext != true,
-               item.duration > 0, item.position > 0 {
-                progress = min(1, item.position / item.duration)
-            }
-            newItems.append(NewShowItem(
-                showID: showID, showType: next.event.showType, showName: next.event.showName,
-                event: next.event, season: next.season, episode: next.episode,
-                lastSeason: last.season, lastEpisode: last.episode,
-                newCount: ordered.count,
-                latestDay: ordered.map(\.event.day).max() ?? next.event.day,
-                progress: progress
-            ))
-        }
-        newItems.sort {
-            if $0.latestDay != $1.latestDay { return $0.latestDay > $1.latestDay }
-            return $0.showName.localizedCaseInsensitiveCompare($1.showName) == .orderedAscending
-        }
-
-        // Coming up: this week, next week, later this month.
-        let upcoming = events.filter { !aired($0) }
-        let weekEnd = calendar.date(byAdding: .day, value: 7, to: today) ?? today
-        let nextWeekEnd = calendar.date(byAdding: .day, value: 14, to: today) ?? today
-        let monthEnd = calendar.date(byAdding: .day, value: ReleaseCalendarStore.futureDays + 1, to: today) ?? today
-        let lastOfWeek = calendar.date(byAdding: .day, value: 6, to: today) ?? today
-        let lastOfNextWeek = calendar.date(byAdding: .day, value: 13, to: today) ?? today
-        var sections: [UpcomingSection] = []
-        let thisWeek = upcoming.filter { $0.day < weekEnd }
-        if !thisWeek.isEmpty {
-            sections.append(UpcomingSection(
-                id: "week", title: L10n.string("calendar_this_week", fallback: "Coming Up This Week"),
-                subtitle: "\(Self.shortDate(today)) – \(Self.shortDate(lastOfWeek))", events: thisWeek))
-        }
-        let nextWeek = upcoming.filter { $0.day >= weekEnd && $0.day < nextWeekEnd }
-        if !nextWeek.isEmpty {
-            sections.append(UpcomingSection(
-                id: "next", title: L10n.string("calendar_next_week", fallback: "Next Week"),
-                subtitle: "\(Self.shortDate(weekEnd)) – \(Self.shortDate(lastOfNextWeek))", events: nextWeek))
-        }
-        let later = upcoming.filter { $0.day >= nextWeekEnd && $0.day < monthEnd }
-        if !later.isEmpty {
-            sections.append(UpcomingSection(
-                id: "later", title: L10n.string("calendar_later", fallback: "Later This Month"),
-                subtitle: "from \(Self.shortDate(nextWeekEnd))", events: later))
-        }
-        return CalendarModel(newItems: newItems, sections: sections)
-    }
-
     // MARK: - Text
 
     private func episodeLine(season: Int, episode: Int, title: String?, extra: String?) -> String {
@@ -560,7 +629,7 @@ struct ReleaseCalendarView: View {
             badges.append(Badge(text: "SEASON PREMIERE", color: Color(red: 1, green: 0.82, blue: 0.35), symbol: nil))
         }
         switch store.availability[item.availabilityKey] {
-        case .ready?: badges.append(Badge(text: "READY TO WATCH", color: .white, symbol: "checkmark"))
+        case .ready(let count)?: badges.append(Badge(text: "\(count) SOURCE\(count == 1 ? "" : "S")", color: .white, symbol: "checkmark"))
         case .notYet?: badges.append(Badge(text: "NO SOURCES YET", color: Color.white.opacity(0.55), symbol: "clock"))
         default: break
         }
@@ -581,7 +650,7 @@ struct ReleaseCalendarView: View {
             parts.append("\(Int(((1 - progress) * 100).rounded()))% left")
         }
         switch store.availability[item.availabilityKey] {
-        case .ready(let count)?: parts.append("\(count) source\(count == 1 ? "" : "s") ready")
+        case .ready(let count)?: parts.append("\(count) source\(count == 1 ? "" : "s") found")
         case .notYet?: parts.append("No sources yet (new episodes can take a few hours to appear)")
         case .checking?: parts.append("Checking sources…")
         default: break

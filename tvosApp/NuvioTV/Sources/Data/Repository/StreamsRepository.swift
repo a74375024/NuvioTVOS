@@ -25,6 +25,27 @@ final class StreamsRepository: ObservableObject {
     private var activeJob: Task<Void, Never>?
     private var activeRequestKey: String?
     private var activeAddonManifestURLs: [URL]?
+    /// Who started the current search (file name), for the log.
+    private var activeOrigin = ""
+
+    /// Side lookups: stream lists found without taking over the current
+    /// search (Channels' next program, Calendar's focused card). One runs at
+    /// a time; a few results are kept briefly, and a later `load` for the same
+    /// title uses them instead of asking the add-ons again.
+    private struct SideResult {
+        let groups: [AddonStreamGroup]
+        let at: Date
+        let urls: [URL]
+        let withSubtitles: Bool
+        let lifetime: TimeInterval
+        var isFresh: Bool { Date().timeIntervalSince(at) < lifetime }
+    }
+    private var sideResults: [String: SideResult] = [:]
+    private var sideTask: Task<[AddonStreamGroup]?, Never>?
+    private var sideKey: String?
+    private var sideWithSubtitles = false
+    static let sideLifetime: TimeInterval = 15 * 60
+    private static let sideLimit = 4
 
     /// Actor-backed success-only cache (no permanent failure entries).
     private static let manifestCache = StreamManifestCache()
@@ -133,7 +154,8 @@ final class StreamsRepository: ObservableObject {
         videoId: String,
         season: Int? = nil,
         episode: Int? = nil,
-        forceRefresh: Bool = false
+        forceRefresh: Bool = false,
+        origin: String = #fileID
     ) {
         let se = (season == nil && episode == nil)
             ? Self.seasonEpisode(fromVideoId: videoId)
@@ -153,8 +175,45 @@ final class StreamsRepository: ObservableObject {
             return
         }
 
+        let from = Self.shortOrigin(origin)
+        if let previous = activeRequestKey, previous != key, current.isAnyLoading {
+            CrashRecorder.note("streams: \(from) replaced a search still loading (\(Self.shortKey(previous)) by \(activeOrigin) → \(Self.shortKey(key)))")
+        }
         activeRequestKey = key
         activeAddonManifestURLs = addonManifestURLs
+        activeOrigin = from
+
+        // Found moments ago by a side lookup: use it.
+        if !forceRefresh, let side = sideResults[key], side.withSubtitles, side.urls == addonManifestURLs, side.isFresh {
+            activeJob?.cancel()
+            activeJob = nil
+            publish(groups: side.groups, requestKey: key, forceLoading: false)
+            CrashRecorder.note("streams: \(from) used the side lookup for \(Self.shortKey(key)) (\(side.groups.flatMap(\.streams).count) streams)")
+            return
+        }
+        // A side lookup for it is running: wait for that instead of asking twice.
+        if !forceRefresh, sideKey == key, sideWithSubtitles, let pending = sideTask {
+            state = StreamsDiscoveryState(
+                requestKey: key,
+                revision: state.revision &+ 1,
+                groups: [],
+                isAnyLoading: true,
+                hasResolvedTargets: false
+            )
+            activeJob?.cancel()
+            activeJob = Task { [weak self] in
+                let groups = await pending.value
+                guard let self, !Task.isCancelled, self.activeRequestKey == key else { return }
+                if let groups {
+                    self.publish(groups: groups, requestKey: key, forceLoading: false)
+                    CrashRecorder.note("streams: \(from) joined the side lookup for \(Self.shortKey(key))")
+                } else {
+                    await self.runDiscovery(requestKey: key, type: type, videoId: videoId, addonManifestURLs: addonManifestURLs)
+                }
+            }
+            return
+        }
+
         state = StreamsDiscoveryState(
             requestKey: key,
             revision: state.revision &+ 1,
@@ -189,14 +248,15 @@ final class StreamsRepository: ObservableObject {
         videoId: String,
         season: Int? = nil,
         episode: Int? = nil,
-        forceRefresh: Bool = false
+        forceRefresh: Bool = false,
+        origin: String = #fileID
     ) async -> [NuvioStream] {
         let se = (season == nil && episode == nil)
             ? Self.seasonEpisode(fromVideoId: videoId)
             : (season, episode)
         let key = Self.requestKey(type: type, videoId: videoId, season: se.0, episode: se.1)
 
-        load(type: type, videoId: videoId, season: se.0, episode: se.1, forceRefresh: forceRefresh)
+        load(type: type, videoId: videoId, season: se.0, episode: se.1, forceRefresh: forceRefresh, origin: origin)
 
         // Wait until this key is no longer loading (or a newer key took over).
         while !Task.isCancelled {
@@ -212,6 +272,155 @@ final class StreamsRepository: ObservableObject {
             try? await Task.sleep(nanoseconds: 50_000_000)
         }
         return state.requestKey == key ? state.allStreams : []
+    }
+
+    // MARK: - Side lookups
+
+    nonisolated static func shortOrigin(_ fileID: String) -> String {
+        let name = fileID.split(separator: "/").last.map(String.init) ?? fileID
+        return name.hasSuffix(".swift") ? String(name.dropLast(6)) : name
+    }
+
+    /// "series tt123:2:5" from a request key, for the log.
+    nonisolated static func shortKey(_ key: String) -> String {
+        let parts = key.components(separatedBy: "::")
+        guard parts.count >= 2 else { return key }
+        return "\(parts[0]) \(parts[1])"
+    }
+
+    /// The streams the add-ons list for a title, found without replacing the
+    /// search on screen. Reuses the current search when it's the same title,
+    /// waits while a search you started is still loading, and runs one at a
+    /// time. nil: no answer (cancelled, or no add-ons).
+    /// `withSubtitles`: also fetch external subtitles, so a later `load` can
+    /// use the result as is. `cancellable`: stop the lookup when the caller
+    /// is cancelled (Calendar's focus moved on).
+    func sideStreams(
+        type: String,
+        videoId: String,
+        reason: String,
+        withSubtitles: Bool,
+        cancellable: Bool = false,
+        keepFor: TimeInterval = StreamsRepository.sideLifetime
+    ) async -> [NuvioStream]? {
+        let se = Self.seasonEpisode(fromVideoId: videoId)
+        let key = Self.requestKey(type: type, videoId: videoId, season: se.season, episode: se.episode)
+        let urls = CinemetaCatalogRepository.configuredStreamAddonManifestURLs
+        // One at a time: wait for another title's lookup (or a cancelled
+        // one for this title) to end first.
+        while let running = sideTask, sideKey != key || running.isCancelled {
+            _ = await running.value
+            // Let its bookkeeping finish before looking again.
+            try? await Task.sleep(nanoseconds: 50_000_000)
+            if Task.isCancelled { return nil }
+        }
+        // The search on screen is for this title: use it, once it's done.
+        if state.requestKey == key, activeAddonManifestURLs == urls {
+            var waited = 0
+            while state.requestKey == key, state.isAnyLoading, waited < 150, !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 200_000_000)
+                waited += 1
+            }
+            if state.requestKey == key, state.hasResolvedTargets, !state.isAnyLoading {
+                return state.allStreams
+            }
+        }
+        if let side = sideResults[key], side.urls == urls, side.withSubtitles || !withSubtitles, side.isFresh {
+            return side.groups.flatMap(\.streams)
+        }
+        let task: Task<[AddonStreamGroup]?, Never>
+        if let running = sideTask, sideKey == key {
+            task = running
+        } else {
+            let started = Date()
+            task = Task { [weak self] () -> [AddonStreamGroup]? in
+                guard let self else { return nil }
+                // A search you started goes first (up to 20 s).
+                var waited = 0
+                while self.state.isAnyLoading, self.activeRequestKey != key, waited < 100, !Task.isCancelled {
+                    try? await Task.sleep(nanoseconds: 200_000_000)
+                    waited += 1
+                }
+                guard !Task.isCancelled else { return nil }
+                return await self.sideDiscovery(type: type, videoId: videoId, urls: urls, withSubtitles: withSubtitles)
+            }
+            sideTask = task
+            sideKey = key
+            sideWithSubtitles = withSubtitles
+            Task { [weak self] in
+                let groups = await task.value
+                guard let self else { return }
+                if self.sideKey == key {
+                    self.sideTask = nil
+                    self.sideKey = nil
+                }
+                guard let groups else {
+                    CrashRecorder.note("streams side lookup (\(reason)) for \(Self.shortKey(key)): stopped")
+                    return
+                }
+                self.sideResults[key] = SideResult(groups: groups, at: Date(), urls: urls, withSubtitles: withSubtitles,
+                                                   lifetime: keepFor)
+                if self.sideResults.count > Self.sideLimit {
+                    let oldest = self.sideResults.sorted { $0.value.at < $1.value.at }.prefix(self.sideResults.count - Self.sideLimit)
+                    for item in oldest { self.sideResults.removeValue(forKey: item.key) }
+                }
+                let count = groups.reduce(0) { $0 + $1.streams.count }
+                let failed = groups.filter { $0.error != nil }.count
+                CrashRecorder.note("streams side lookup (\(reason)) for \(Self.shortKey(key)): \(count) streams from \(groups.count) add-ons"
+                                   + (failed > 0 ? ", \(failed) failed" : "") + " in \(String(format: "%.1f", Date().timeIntervalSince(started))) s")
+            }
+        }
+        if cancellable {
+            let groups = await withTaskCancellationHandler {
+                await task.value
+            } onCancel: {
+                task.cancel()
+            }
+            return groups?.flatMap(\.streams)
+        }
+        return await task.value?.flatMap(\.streams)
+    }
+
+    /// The add-on queries of `runDiscovery`, returned instead of published.
+    private func sideDiscovery(type: String, videoId: String, urls: [URL], withSubtitles: Bool) async -> [AddonStreamGroup]? {
+        let ownedGroups = [localStreamGroup(videoId: videoId), jellyfinStreamGroup(videoId: videoId)].compactMap { $0 }
+        guard !urls.isEmpty else { return ownedGroups }
+        let manifestsByURL = await Self.loadManifestsConcurrently(urls: urls)
+        guard !Task.isCancelled else { return nil }
+        var targets: [StreamAddonTarget] = []
+        for url in urls {
+            guard let manifest = manifestsByURL[url], manifest.supportsResource("stream", type: type, id: videoId) else { continue }
+            targets.append(StreamAddonTarget(
+                addonId: Self.stableAddonId(manifest: manifest, manifestURL: url),
+                displayName: manifest.displayName ?? CinemetaCatalogRepository.streamAddonName(for: url),
+                manifestURL: url,
+                logo: manifest.logo
+            ))
+        }
+        var byID: [String: AddonStreamGroup] = [:]
+        await withTaskGroup(of: GroupUpdate.self) { group in
+            for target in targets {
+                group.addTask { await Self.fetchAddonGroup(target: target, type: type, videoId: videoId) }
+            }
+            for await update in group {
+                byID[update.addonId] = update.group
+            }
+        }
+        guard !Task.isCancelled else { return nil }
+        // Configured order, like a normal search.
+        var groups = ownedGroups + targets.compactMap { byID[$0.addonId] }
+        if withSubtitles {
+            let subtitles = await fetchExternalSubtitles(type: type, videoId: videoId, manifestURLs: urls)
+            guard !Task.isCancelled else { return nil }
+            if !subtitles.isEmpty {
+                groups = groups.map { group in
+                    var copy = group
+                    copy.streams = group.streams.map { $0.mergingExternalSubtitles(subtitles) }
+                    return copy
+                }
+            }
+        }
+        return groups
     }
 
     // MARK: - Discovery
