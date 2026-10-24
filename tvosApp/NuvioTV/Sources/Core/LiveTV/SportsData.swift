@@ -829,8 +829,23 @@ extension SportsParse {
             }
             var parts: [String: Part] = [:]
             let anyPart = bouts.contains { cardPart($0) != nil }
+            // The schedule doesn't label parts, but each bout has its part's
+            // start time: the latest time is the main card, the one before
+            // the prelims, earlier ones the early prelims.
+            var byTime: [Int: String] = [:]
+            if !anyPart {
+                let minutes = Set(bouts.compactMap { bout in
+                    (date(text(bout["startDate"])) ?? date(text(bout["date"]))).map { Int($0.timeIntervalSince1970 / 60) }
+                })
+                if minutes.count >= 2 {
+                    for (position, minute) in minutes.sorted(by: >).enumerated() {
+                        byTime[minute] = position == 0 ? "main" : (position == 1 ? "prelims" : "early")
+                    }
+                }
+            }
             for bout in bouts {
-                let key = anyPart ? (cardPart(bout) ?? "main") : ""
+                let boutMinute = (date(text(bout["startDate"])) ?? date(text(bout["date"]))).map { Int($0.timeIntervalSince1970 / 60) }
+                let key = anyPart ? (cardPart(bout) ?? "main") : (byTime.isEmpty ? "" : (boutMinute.flatMap { byTime[$0] } ?? "main"))
                 var part = parts[key] ?? Part()
                 part.count += 1
                 if let start = date(text(bout["startDate"])) ?? date(text(bout["date"])) {

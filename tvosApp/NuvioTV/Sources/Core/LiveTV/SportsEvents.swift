@@ -282,20 +282,28 @@ enum SportsMatcher {
             guard parts.count == 3 else { continue }
             cards["\(parts[0])|\(parts[1])", default: []].append(gameIndex)
         }
-        var fightEventIDs = Set<String>()
         for event in events {
             autoreleasepool {
                 let inWindow = event.start.map { $0 > low && $0 < high } ?? true
-                // A card named by its number goes by the card; one named only by
-                // its fighters ("UFC: Pereira vs Hill") by the fighters first.
+                // A card named by its number goes by the card and its times; one
+                // named only by its fighters ("UFC: Pereira vs Hill") by the fighters.
                 if inWindow, !cards.isEmpty, event.league == "Fighting", let key = fightKey(event.title),
                    !key.number.isEmpty || !looksLikeGame(event.title) {
-                    let candidates = fightCandidates(key, cards: cards, games: games)
-                    if !candidates.isEmpty {
+                    let targets = fightTargets(key, start: event.guessed ? nil : event.start, cards: cards, games: games)
+                    if !targets.isEmpty {
                         stats.filtered += 1
                         stats.fightFeeds += 1
-                        fightEventIDs.insert(event.id)
-                        pending.append((event, candidates))
+                        for gameIndex in targets {
+                            var value = entry(gameIndex)
+                            for feed in event.feeds where !value.sources.contains(where: { $0.channelID == feed }) {
+                                value.sources.append(EventSource(channelID: feed, kind: .provider, spanish: event.spanish,
+                                                                 detail: "Provider event channel"))
+                            }
+                            if value.family == nil { value.family = event.family }
+                            byGame[gameIndex] = value
+                            if firstProviderID[gameIndex] == nil, targets.count == 1 { firstProviderID[gameIndex] = event.id }
+                        }
+                        stats.matchedEvents += 1
                         return
                     }
                 }
@@ -379,20 +387,14 @@ enum SportsMatcher {
                         !games[$0].completed && games[$0].start > now.addingTimeInterval(-6 * 3600)
                             && games[$0].start < now.addingTimeInterval(7 * 86_400)
                     }.sorted { games[$0].start < games[$1].start }
-                    // A fight feed with no day only joins a card at its clock time
-                    // (or the only card it can be).
-                    let fight = fightEventIDs.contains(event.id)
                     if let start = event.start {
-                        chosen = open.first(where: { clockGap(games[$0].start, start) <= 75 * 60 }) ?? (fight ? nil : open.first)
+                        chosen = open.first(where: { clockGap(games[$0].start, start) <= 75 * 60 }) ?? open.first
                     } else {
-                        chosen = fight ? (open.count == 1 ? open.first : nil) : open.first
+                        chosen = open.first
                     }
                     if chosen != nil { stats.guessedMatched += 1 }
                 }
                 guard let gameIndex = chosen else {
-                    // A fight feed far from the card's time keeps a tile of
-                    // its own (fight times in the schedule can be rough).
-                    if fightEventIDs.contains(event.id) { plain.append(item.event); return }
                     stats.replays += 1
                     return
                 }
@@ -698,17 +700,53 @@ enum SportsMatcher {
         return FightKey(org: org, number: number == "0" ? "" : number, part: part, fightPass: text.contains(" fight pass "))
     }
 
-    /// The scheduled card parts a fight feed can be: same promotion and
-    /// number, and the part it names (the main card when it names none).
-    static func fightCandidates(_ key: FightKey, cards: [String: [Int]], games: [SportsGame]) -> [Int] {
-        guard let list = cards["\(key.org)|\(key.number)"] else { return [] }
+    /// The scheduled card parts a fight feed is for (same promotion and
+    /// number):
+    /// - a feed naming its part goes there, unless its time says otherwise
+    ///   ("Prelims" listed at the early prelims' start goes to those);
+    /// - a feed naming none goes to the part closest to its time, or to every
+    ///   part when it starts by the first one (it carries the whole night);
+    /// - a feed more than 3 h from any part, or naming none and with no
+    ///   time, isn't placed (it keeps a tile of its own).
+    static func fightTargets(_ key: FightKey, start: Date?, cards: [String: [Int]], games: [SportsGame]) -> [Int] {
+        guard var list = cards["\(key.org)|\(key.number)"]?.sorted(by: { games[$0].start < games[$1].start }) else { return [] }
         func part(_ gameIndex: Int) -> String {
             games[gameIndex].cardKey?.components(separatedBy: "|").last ?? ""
         }
-        let parts = Set(list.map(part))
-        var wanted = key.part ?? "main"
-        if key.fightPass, wanted == "prelims", parts.contains("early") { wanted = "early" }
-        return list.filter { part($0) == wanted || part($0).isEmpty }
+        func gap(_ gameIndex: Int) -> TimeInterval {
+            start.map { abs(games[gameIndex].start.timeIntervalSince($0)) } ?? 0
+        }
+        /// "UFC|600061267": one card (Fight Nights share an empty number).
+        func card(_ gameIndex: Int) -> String {
+            games[gameIndex].id.components(separatedBy: "|").dropLast().joined(separator: "|")
+        }
+        // Several cards under one key (Fight Nights): the one nearest in time,
+        // or none when there's no time to tell them apart.
+        if Set(list.map(card)).count > 1 {
+            guard start != nil, let closest = list.min(by: { gap($0) < gap($1) }) else { return [] }
+            let chosen = card(closest)
+            list = list.filter { card($0) == chosen }
+        }
+        guard let first = list.first else { return [] }
+        let nearest = list.min { gap($0) < gap($1) }
+        // A card that isn't split: one game.
+        if list.allSatisfy({ part($0).isEmpty }) {
+            return start == nil || gap(first) <= 6 * 3600 ? [first] : []
+        }
+        if var wanted = key.part {
+            if key.fightPass, wanted == "prelims", list.contains(where: { part($0) == "early" }) { wanted = "early" }
+            let labeled = list.filter { part($0) == wanted }
+            guard start != nil else { return labeled }
+            if let match = labeled.first, gap(match) <= 45 * 60 { return [match] }
+            if let nearest, gap(nearest) <= 30 * 60 { return [nearest] }
+            return labeled.filter { gap($0) <= 3 * 3600 }
+        }
+        guard let start else { return [] }
+        if start <= games[first].start.addingTimeInterval(30 * 60), start >= games[first].start.addingTimeInterval(-3 * 3600) {
+            return list
+        }
+        guard let nearest, gap(nearest) <= 3 * 3600 else { return [] }
+        return [nearest]
     }
 
     /// "rams|seahawks", or the tidied title when it has no two sides.

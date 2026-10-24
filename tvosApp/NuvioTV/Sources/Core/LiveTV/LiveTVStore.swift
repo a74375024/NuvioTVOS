@@ -2818,8 +2818,13 @@ final class LiveTVStore: ObservableObject {
         var savedMap: [String: (outside: [OutsideGuide.RawProgram]?, provider: [OutsideGuide.RawProgram]?)] = [:]
         var metaMap: [String: (inLineup: Bool, spanish: Bool, rank: Int)] = [:]
         // Every such channel you have, not only My Lineup's: any station
-        // whose guide shows the game is a way to watch it.
-        for id in lineup.union(browseEntries.map(\.id)) {
+        // whose guide shows the game is a way to watch it. Sports channels of
+        // unknown country too (they're not in the browse list).
+        var candidates = lineup.union(browseEntries.map(\.id))
+        for (id, info) in entryInfo where info.market == nil && info.category == .sports && info.kind == .channel {
+            candidates.insert(id)
+        }
+        for id in candidates {
             guard let info = entryInfo[id], kinds.contains(info.category) else { continue }
             let list = programs[id]
             // Saved listings are kept per provider channel (the entry's members).
@@ -2939,6 +2944,7 @@ final class LiveTVStore: ObservableObject {
         let lineup = lineupIDs
         let lineupEntries = lineupIDs.compactMap { entry(id: $0) }
         let browse = browseEntries
+        let allEntries = entries
         let entryInfo = self.entryInfo
         let hidden = hiddenGroups
         var previousMap: [String: String] = [:]
@@ -2980,7 +2986,7 @@ final class LiveTVStore: ObservableObject {
         } else {
             let indexStarted = Date()
             channelIndex = await Task.detached(priority: .utility) {
-                SportsNetworkMap.channelIndex(lineup: lineup, lineupEntries: lineupEntries, browse: browse,
+                SportsNetworkMap.channelIndex(lineup: lineup, lineupEntries: lineupEntries, browse: browse, all: allEntries,
                                               entryInfo: entryInfo, hidden: hidden, rosters: rosters, markets: markets)
             }.value
             sportsChannelIndex = (indexKey, channelIndex)
@@ -3944,7 +3950,11 @@ enum SportsNetworkMap {
         return nil
     }
 
+    /// - Parameter all: every entry; sports channels of unknown country
+    ///   ("UFC PPV Main Card") count too, though they're not in the browse
+    ///   list (that only has your chosen countries').
     static func channelIndex(lineup: Set<String>, lineupEntries: [LiveTVChannel], browse: [LiveTVChannel],
+                             all: [LiveTVChannel] = [],
                              entryInfo: [String: LiveTVEntryInfo], hidden: Set<String>,
                              rosters: [SportsMatcher.RosterLeague], markets: LiveTVStore.StationMarkets) -> ChannelIndex {
         var index = ChannelIndex()
@@ -3955,10 +3965,13 @@ enum SportsNetworkMap {
             teamLists.append((roster.short, SportsMatcher.TeamIndex(teams: roster.teams, college: false)))
         }
         var seen = Set<String>()
-        for entry in lineupEntries + browse {
+        for (pass, list) in [lineupEntries, browse, all].enumerated() {
+          for entry in list {
             autoreleasepool {
                 guard seen.insert(entry.id).inserted, let info = entryInfo[entry.id],
                       !hidden.contains(entry.group ?? "Other"), info.kind == .channel else { return }
+                // From the full list, only sports channels of unknown country.
+                if pass == 2, info.market != nil || info.category != .sports { return }
                 let spanish = info.category == .spanish || info.market == "US-ES"
                 let inLineup = lineup.contains(entry.id)
                 let item = ChannelIndex.Item(id: entry.id, inLineup: inLineup, spanish: spanish,
@@ -3997,6 +4010,7 @@ enum SportsNetworkMap {
                     }
                 }
             }
+          }
         }
         return index
     }
