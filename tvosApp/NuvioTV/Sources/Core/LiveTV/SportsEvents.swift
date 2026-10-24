@@ -29,9 +29,13 @@ struct SportsEvent: Identifiable, Hashable, Codable {
     var listingEnd: Date?
     /// For an event with no game: the two schools named in it (logos only).
     var teams: [SportsTeam]?
+    /// When every provider feed that carried it moved on to something else
+    /// (the provider's sign it's over).
+    var feedsEndedAt: Date? = nil
 
     static func == (lhs: SportsEvent, rhs: SportsEvent) -> Bool {
-        lhs.id == rhs.id && lhs.sources == rhs.sources && lhs.game == rhs.game && lhs.listingEnd == rhs.listingEnd && lhs.teams == rhs.teams
+        lhs.id == rhs.id && lhs.sources == rhs.sources && lhs.game == rhs.game && lhs.listingEnd == rhs.listingEnd
+            && lhs.teams == rhs.teams && lhs.feedsEndedAt == rhs.feedsEndedAt
     }
     func hash(into hasher: inout Hasher) { hasher.combine(id) }
 
@@ -42,6 +46,7 @@ struct SportsEvent: Identifiable, Hashable, Codable {
                                game: game, sources: sources, family: family)
         copy.listingEnd = listingEnd
         copy.teams = teams
+        copy.feedsEndedAt = feedsEndedAt
         return copy
     }
 
@@ -52,9 +57,9 @@ struct SportsEvent: Identifiable, Hashable, Codable {
     /// after that it's dropped from Live now.
     var expectedLength: TimeInterval {
         switch league {
-        case "NFL", "College Football": return 3.6 * 3600
-        case "MLB": return 3.1 * 3600
-        case "NBA", "WNBA", "NHL", "College Basketball": return 2.6 * 3600
+        case "NFL", "College Football", "Football": return 3.6 * 3600
+        case "MLB", "Baseball": return 3.1 * 3600
+        case "NBA", "WNBA", "NHL", "College Basketball", "Basketball", "Hockey": return 2.6 * 3600
         case "Soccer", "MLS": return 2.1 * 3600
         case "Fighting": return 5 * 3600
         case "Motorsport", "Golf": return 4 * 3600
@@ -73,6 +78,7 @@ struct SportsEvent: Identifiable, Hashable, Codable {
         guard let start else { return .unknownTime }
         if now < start { return .upcoming }
         if let game, game.completed { return .finished }
+        if let feedsEndedAt, now >= feedsEndedAt { return .finished }
         var end = start.addingTimeInterval(expectedLength)
         if let listingEnd, listingEnd > end, listingEnd < start.addingTimeInterval(8 * 3600) { end = listingEnd }
         if now < end { return .live }
@@ -283,10 +289,20 @@ enum SportsMatcher {
         var others = loose + plain.map({ plainEvent($0) })
         if !schools.isEmpty {
             let schoolIndex = TeamIndex(teams: schools)
+            // College sports by name; elsewhere (soccer, plain "Football",
+            // hockey, "Other") only with a college sign in the title or feed.
+            let collegeLeagues: Set<String> = ["College Football", "College Basketball", "Volleyball", "Field Hockey",
+                                               "Lacrosse", "Softball", "Wrestling", "Baseball"]
             let pro: Set<String> = ["NFL", "NBA", "WNBA", "MLB", "NHL", "MLS"]
+            let clue = "\\b(ncaa\\w*|college|university|univ|women's|men's|espn\\+|accn|acc network|secn|sec network|btn\\+?|big ten)"
             for position in others.indices where !pro.contains(others[position].league) {
                 autoreleasepool {
-                    guard looksLikeGame(others[position].title), let pair = schoolIndex.pair(others[position].title) else { return }
+                    let event = others[position]
+                    let family = event.family ?? ""
+                    guard collegeLeagues.contains(event.league)
+                            || RX.test(clue, event.title + " " + family, caseInsensitive: true)
+                            || RX.test("\\bflo", family, caseInsensitive: true) else { return }
+                    guard looksLikeGame(event.title), let pair = schoolIndex.pair(event.title) else { return }
                     others[position].teams = [pair.0, pair.1]
                     stats.schoolPairs += 1
                 }
@@ -556,17 +572,26 @@ enum SportsMatcher {
     }
 
     /// The event's league is known and is the game's (soccer and MLS as one).
+    /// A sport named without its level ("Football: …") covers its pro and
+    /// college leagues.
+    static let sportFamilies: [String: Set<String>] = [
+        "Football": ["NFL", "College Football"],
+        "Basketball": ["NBA", "WNBA", "College Basketball"],
+        "Hockey": ["NHL", "Hockey"],
+        "Baseball": ["MLB", "MiLB", "Baseball"],
+        "Soccer": ["Soccer", "MLS"],
+        "MLS": ["Soccer", "MLS"],
+    ]
+
     private static func sameLeague(_ league: String, _ game: SportsGame) -> Bool {
         if league.isEmpty || league == "Other" { return false }
         if league == game.league { return true }
-        let soccer: Set<String> = ["Soccer", "MLS"]
-        return soccer.contains(league) && soccer.contains(game.league)
+        return sportFamilies[league]?.contains(game.league) == true
     }
 
     private static func compatible(_ league: String, _ game: SportsGame) -> Bool {
         if league.isEmpty || league == "Other" || league == game.league { return true }
-        let soccer: Set<String> = ["Soccer", "MLS"]
-        return soccer.contains(league) && soccer.contains(game.league)
+        return sportFamilies[league]?.contains(game.league) == true
     }
 
     /// Studio and highlight shows around a game, not the game itself.

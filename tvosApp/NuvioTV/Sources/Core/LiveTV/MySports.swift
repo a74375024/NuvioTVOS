@@ -77,7 +77,8 @@ final class MySports: ObservableObject {
         let leagues = SportsData.leagues
         for event in events {
             let text = (event.title + " " + event.family).lowercased()
-            for league in leagues where league.group == event.league || (league.soccer && event.league == "Soccer") {
+            let family = SportsMatcher.sportFamilies[event.league] ?? []
+            for league in leagues where league.group == event.league || family.contains(league.group) || (league.soccer && event.league == "Soccer") {
                 if !league.keywords.isEmpty {
                     guard league.keywords.contains(where: { text.contains($0) }) else { continue }
                 } else if league.short == "NCAAM", text.contains("women") {
@@ -97,7 +98,8 @@ final class MySports: ObservableObject {
     /// (once per game, so removing one by hand sticks).
     func scheduleTeamReminders(_ events: [SportsEvent]) {
         guard prefs.reminders, !prefs.teams.isEmpty else { return }
-        var done = Set(UserDefaults.standard.stringArray(forKey: Self.remindedKey) ?? [])
+        var order = UserDefaults.standard.stringArray(forKey: Self.remindedKey) ?? []
+        var done = Set(order)
         let now = Date()
         var changed = false
         for event in events {
@@ -108,8 +110,10 @@ final class MySports: ObservableObject {
                 LiveReminders.shared.toggle(channel: target.channel, program: target.program)
             }
             done.insert(event.id)
+            order.append(event.id)
             changed = true
         }
-        if changed { UserDefaults.standard.set(Array(done.suffix(200)), forKey: Self.remindedKey) }
+        // Oldest first, so trimming drops the oldest.
+        if changed { UserDefaults.standard.set(Array(order.suffix(200)), forKey: Self.remindedKey) }
     }
 }

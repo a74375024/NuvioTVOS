@@ -337,7 +337,7 @@ enum ChannelCatalog {
                       traits[channel.id]?.kind != .placeholder,
                       !RX.test("^\\W*(ended|end)\\b", text, caseInsensitive: true) else { continue }
                 named += 1
-                let (title, start) = parseEvent(text, now: now)
+                let (title, start) = parseEvent(text, now: now, market: market)
                 guard !title.isEmpty else { continue }
                 if let start, now.timeIntervalSince(start) > 8 * 3600 { continue }       // long over
                 if let start, start.timeIntervalSince(now) > 6 * 24 * 3600 { continue }  // stale or far off
@@ -847,11 +847,36 @@ enum ChannelCatalog {
     /// Title and start time from an event name. Handles the formats seen in
     /// IPTV lineups; times without a zone are US Eastern unless written
     /// European-style ("22 October 2026 17:45", taken as UK time).
-    static func parseEvent(_ text: String, now: Date) -> (String, Date?) {
+    /// The zone a provider writes unmarked times in, from its country tag.
+    static func eventZone(market: String?) -> TimeZone? {
+        let id: String?
+        switch market?.uppercased() {
+        case "AU": id = "Australia/Sydney"
+        case "NZ": id = "Pacific/Auckland"
+        case "UK", "GB", "IE": id = "Europe/London"
+        case "MX": id = "America/Mexico_City"
+        case "CA": id = "America/Toronto"
+        case "ES": id = "Europe/Madrid"
+        case "FR": id = "Europe/Paris"
+        case "DE": id = "Europe/Berlin"
+        case "IT": id = "Europe/Rome"
+        case "NL": id = "Europe/Amsterdam"
+        case "PT": id = "Europe/Lisbon"
+        case "BR": id = "America/Sao_Paulo"
+        default: id = nil
+        }
+        return id.flatMap { TimeZone(identifier: $0) }
+    }
+
+    static func parseEvent(_ text: String, now: Date, market: String? = nil) -> (String, Date?) {
         var title = text
         var start: Date?
-        let eastern = TimeZone(identifier: "America/New_York") ?? .current
-        let london = TimeZone(identifier: "Europe/London") ?? .current
+        let usEastern = TimeZone(identifier: "America/New_York") ?? .current
+        // Unmarked times follow the provider's country when it has one;
+        // otherwise US formats are Eastern and European formats UK time.
+        let providerZone = eventZone(market: market)
+        let eastern = providerZone ?? usEastern
+        let london = providerZone ?? TimeZone(identifier: "Europe/London") ?? .current
         let months = ["jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6, "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12]
         let calendarYear = Calendar(identifier: .gregorian).component(.year, from: now)
 
@@ -869,6 +894,10 @@ enum ChannelCatalog {
         func hour24(_ h: Int, _ ampm: String) -> Int {
             let pm = ampm.lowercased() == "pm"
             return h % 12 + (pm ? 12 : 0)
+        }
+        /// US Eastern when the match says "ET", else the provider's zone.
+        func zoneOf(_ r: Range<String.Index>) -> TimeZone {
+            RX.test("\\bET\\b", String(title[r])) ? usEastern : eastern
         }
         func groups(_ pattern: String) -> ([String], Range<String.Index>)? {
             guard let regex = RX.get(pattern, caseInsensitive: true),
@@ -920,17 +949,28 @@ enum ChannelCatalog {
             }
             title.removeSubrange(r)
         }
-        // (2026 10 21 19:30:55) or "start:2026 10 17 20:25:00 stop:…"
-        if start == nil, let (p, r) = groups("(?:\\(|start:\\s*)(\\d{4}) (\\d{2}) (\\d{2}) (\\d{2}):(\\d{2})(?::\\d{2})?\\)?(?:\\s*stop:\\s*[\\d :]+)?") {
+        // (2026 10 21 19:30:55), (2026-10-22 15:00:25) or "start:2026 10 17 20:25:00 stop:…"
+        if start == nil, let (p, r) = groups("(?:\\(|start:\\s*)(\\d{4})[ -](\\d{2})[ -](\\d{2})[ T](\\d{2}):(\\d{2})(?::\\d{2})?\\)?(?:\\s*stop:\\s*[\\d :-]+)?") {
             if let y = Int(p[0]), y < 2090, let mo = Int(p[1]), let d = Int(p[2]), let h = Int(p[3]), let mi = Int(p[4]) {
                 start = date(y, mo, d, h, mi, eastern)
+            }
+            title.removeSubrange(r)
+        }
+        // "- 22/10 11:30" (24-hour): day/month, or month/day when only that
+        // reads as a date; when both do, the one nearer today.
+        if start == nil, let (p, r) = groups("(?:^|\\s)-?\\s*(\\d{1,2})/(\\d{1,2})\\s+(\\d{1,2}):(\\d{2})\\b(?!\\s*(?:AM|PM))") {
+            if let a = Int(p[0]), let b = Int(p[1]), let h = Int(p[2]), let mi = Int(p[3]), h < 24, mi < 60 {
+                var options: [Date] = []
+                if b >= 1, b <= 12, a >= 1, a <= 31, let d = nearestYear(b, a, h, mi, eastern) { options.append(d) }
+                if a >= 1, a <= 12, b >= 1, b <= 31, let d = nearestYear(a, b, h, mi, eastern) { options.append(d) }
+                start = options.min { abs($0.timeIntervalSince(now)) < abs($1.timeIntervalSince(now)) }
             }
             title.removeSubrange(r)
         }
         // (10.21 7:30PM ET)
         if start == nil, let (p, r) = groups("\\((\\d{1,2})\\.(\\d{1,2}) (\\d{1,2}):(\\d{2})\\s*(AM|PM)(?: ET)?\\)") {
             if let mo = Int(p[0]), let d = Int(p[1]), let h = Int(p[2]), let mi = Int(p[3]) {
-                start = nearestYear(mo, d, hour24(h, p[4]), mi, eastern)
+                start = nearestYear(mo, d, hour24(h, p[4]), mi, zoneOf(r))
             }
             title.removeSubrange(r)
         }
@@ -951,14 +991,14 @@ enum ChannelCatalog {
         // Wed 21st Oct 8:00PM ET
         if start == nil, let (p, r) = groups("(?:[A-Za-z]{3}\\s+)?(\\d{1,2})(?:st|nd|rd|th)\\s+([A-Za-z]{3})[a-z]*\\s+(\\d{1,2}):(\\d{2})\\s*(AM|PM)(?:\\s*ET)?") {
             if let d = Int(p[0]), let mo = months[p[1].lowercased()], let h = Int(p[2]), let mi = Int(p[3]) {
-                start = nearestYear(mo, d, hour24(h, p[4]), mi, eastern)
+                start = nearestYear(mo, d, hour24(h, p[4]), mi, zoneOf(r))
             }
             title.removeSubrange(r)
         }
         // Oct 21 2:30AM ET
         if start == nil, let (p, r) = groups("\\b([A-Za-z]{3})[a-z]*\\.? (\\d{1,2}),? (\\d{1,2}):(\\d{2})\\s*(AM|PM)(?:\\s*ET)?") {
             if let mo = months[p[0].lowercased()], let d = Int(p[1]), let h = Int(p[2]), let mi = Int(p[3]) {
-                start = nearestYear(mo, d, hour24(h, p[4]), mi, eastern)
+                start = nearestYear(mo, d, hour24(h, p[4]), mi, zoneOf(r))
             }
             title.removeSubrange(r)
         } else if let (_, r) = groups("\\b[A-Za-z]{3}[a-z]*\\.? \\d{1,2},? \\d{1,2}:\\d{2}\\s*(AM|PM)(?:\\s*ET)?") {
@@ -968,11 +1008,12 @@ enum ChannelCatalog {
         if start == nil, let (p, r) = groups("\\b(\\d{1,2})(?:[:.]?(\\d{2}))?\\s*(AM|PM)(?:\\s*ET)?\\b") {
             if let h = Int(p[0]) {
                 let mi = Int(p[1]) ?? 0
+                let zone = zoneOf(r)
                 var cal = Calendar(identifier: .gregorian)
-                cal.timeZone = eastern
+                cal.timeZone = zone
                 let today = cal.dateComponents([.year, .month, .day], from: now)
                 if let y = today.year, let mo = today.month, let d = today.day {
-                    start = date(y, mo, d, hour24(h, p[2]), mi, eastern)
+                    start = date(y, mo, d, hour24(h, p[2]), mi, zone)
                 }
             }
             title.removeSubrange(r)
@@ -1016,8 +1057,14 @@ enum ChannelCatalog {
         if let range = RX.range("^\\s*[a-z][a-z ]{1,20}(?=:)", in: titleText) {
             let sport = titleText[range].trimmingCharacters(in: .whitespaces)
             switch sport {
-            case "football": return text.contains("nfl") ? "NFL" : "College Football"
-            case "basketball": return text.contains("wnba") ? "WNBA" : (text.contains("nba") ? "NBA" : "College Basketball")
+            // Level unknown → the plain sport, which matches pro and college games.
+            case "football", "american football":
+                if text.contains("nfl") { return "NFL" }
+                return RX.test("\\b(ncaa|ncaaf|college|fbs|fcs)\\b", text) ? "College Football" : "Football"
+            case "basketball":
+                if text.contains("wnba") { return "WNBA" }
+                if RX.test("\\bnba\\b", text) { return "NBA" }
+                return RX.test("\\b(ncaa|ncaab|ncaam|ncaaw|college|men's|women's)\\b", text) ? "College Basketball" : "Basketball"
             case "hockey", "ice hockey": return text.contains("nhl") ? "NHL" : "Hockey"
             case "field hockey": return "Field Hockey"
             case "volleyball", "beach volleyball": return "Volleyball"

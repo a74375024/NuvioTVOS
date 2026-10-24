@@ -1958,7 +1958,7 @@ final class LiveTVStore: ObservableObject {
         guard let text = traits[feed.id]?.eventText, !ChannelCatalog.isPlaceholder(text) else {
             return "No event listed"
         }
-        let (title, start) = ChannelCatalog.parseEvent(text, now: Date())
+        let (title, start) = ChannelCatalog.parseEvent(text, now: Date(), market: traits[feed.id]?.market)
         guard let start else { return title }
         return "\(title) · \(ChannelsView.clockFormatter.string(from: start))"
     }
@@ -2802,7 +2802,7 @@ final class LiveTVStore: ObservableObject {
         }
         sportsAbortUntil = nil
         sportsFingerprint = fingerprint
-        let built = result.events
+        let built = markEndedByFeeds(result.events, previous: sportsEvents, rawEvents: rawEvents, now: now)
         CrashRecorder.note("sports rebuild (\(reason)): \(built.count) shown, \(built.filter { !$0.sources.isEmpty }.count) watchable, "
                            + "\(Int(Date().timeIntervalSince(started) * 1000)) ms (main \(mainMS) ms), memory \(memoryBefore)→\(memoryAfter) MB")
         if built != sportsEvents {
@@ -2812,8 +2812,41 @@ final class LiveTVStore: ObservableObject {
         SportsData.shared.noteWatchable(Set(built.filter { !$0.sources.isEmpty && $0.game != nil }.map(\.leagueShort)))
     }
 
+    /// A started game carried only by provider feeds is over once every one
+    /// of those feeds has been renamed or cleared (they still exist, but now
+    /// show something else). Games on guide or network channels keep the
+    /// usual estimate, since those channels may still be running it.
+    private func markEndedByFeeds(_ built: [SportsEvent], previous: [SportsEvent], rawEvents: [LiveEvent], now: Date) -> [SportsEvent] {
+        guard !rawEvents.isEmpty else { return built }
+        var old: [String: SportsEvent] = [:]
+        for event in previous where event.game != nil { old[event.id] = event }
+        guard !old.isEmpty else { return built }
+        var ended = 0
+        let result = built.map { event -> SportsEvent in
+            guard event.game != nil, let before = old[event.id] else { return event }
+            var copy = event
+            if !event.feeds.isEmpty {
+                copy.feedsEndedAt = nil
+                return copy
+            }
+            if let at = before.feedsEndedAt {
+                copy.feedsEndedAt = at
+                return copy
+            }
+            guard let start = event.start, now.timeIntervalSince(start) > 45 * 60,
+                  !before.feeds.isEmpty, event.channels.isEmpty,
+                  before.feeds.allSatisfy({ channel(id: $0.channelID) != nil }) else { return event }
+            copy.feedsEndedAt = now
+            ended += 1
+            return copy
+        }
+        if ended > 0 { CrashRecorder.note("sports: \(ended) games ended (feeds moved on)") }
+        return result
+    }
+
     private func setSportsEvents(_ value: [SportsEvent]) {
         sportsEvents = value
+        MySports.shared.scheduleTeamReminders(value)
         var index: [String: [Int]] = [:]
         for (position, event) in value.enumerated() {
             for source in event.sources where source.kind != .provider {

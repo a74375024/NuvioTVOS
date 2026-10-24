@@ -1,8 +1,8 @@
 import SwiftUI
 
 /// My Sports: pick leagues (the ones found in your channels are suggested),
-/// optionally favorite teams, then review. Back steps back; Back on the
-/// first step closes without changes.
+/// optionally favorite teams, then review. Nothing is saved until Done;
+/// Back steps back, and Back on the first step (or Cancel) closes without changes.
 struct MySportsSetupView: View {
     let onDone: () -> Void
 
@@ -28,10 +28,30 @@ struct MySportsSetupView: View {
             default: summaryStep
             }
         }
-        .onAppear(perform: load)
-        .onExitCommand {
-            if step > 0 { step -= 1 } else { onDone() }
+        .onAppear {
+            load()
+            focusStep()
         }
+        .onChange(of: step) { _, _ in focusStep() }
+        .onExitCommand {
+            if step > 0 { step -= 1 } else { close() }
+        }
+    }
+
+    private func close() {
+        schedule.requestRosters([])
+        onDone()
+    }
+
+    /// Each step starts on its first control (the old one is gone).
+    private func focusStep() {
+        let target: String
+        switch step {
+        case 0: target = "league|\(leagues.first ?? SportsData.leagues.first?.short ?? "")"
+        case 1: target = "tab|\(teamLeague ?? leagues.first ?? "")"
+        default: target = "done"
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { focus = target }
     }
 
     private func load() {
@@ -94,9 +114,14 @@ struct MySportsSetupView: View {
                         let list = SportsData.leagues.filter { $0.sport == sport }
                         VStack(alignment: .leading, spacing: 12) {
                             LiveSectionLabel(text: sport)
-                            LazyVGrid(columns: Array(repeating: GridItem(.fixed(400), spacing: 20), count: 4), alignment: .leading, spacing: 16) {
-                                ForEach(list, id: \.short) { league in
-                                    leagueTile(league)
+                            // A plain grid: at most a dozen tiles, all built up front.
+                            VStack(alignment: .leading, spacing: 16) {
+                                ForEach(Array(stride(from: 0, to: list.count, by: 4)), id: \.self) { row in
+                                    HStack(spacing: 20) {
+                                        ForEach(list[row..<min(row + 4, list.count)], id: \.short) { league in
+                                            leagueTile(league)
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -107,14 +132,20 @@ struct MySportsSetupView: View {
             }
             .focusSection()
             HStack(spacing: 20) {
-                actionButton(L10n.string("my_sports_cancel", fallback: "Cancel"), id: "cancel") { onDone() }
+                actionButton(L10n.string("my_sports_cancel", fallback: "Cancel"), id: "cancel") { close() }
                 Spacer()
-                actionButton(L10n.string("my_sports_next_teams", fallback: "Next: favorite teams"), id: "next1", primary: true) {
-                    // Picked leagues take effect now, so their teams can load.
-                    let picked = leagues
-                    mySports.update { $0.leagues = picked; $0.configured = true }
-                    teamLeague = picked.first
-                    step = 1
+                if leagues.isEmpty {
+                    Text(L10n.string("my_sports_pick_one", fallback: "Pick at least one league"))
+                        .font(.system(size: 22, weight: .semibold))
+                        .foregroundColor(.white.opacity(0.55))
+                } else {
+                    actionButton(L10n.string("my_sports_next_teams", fallback: "Next: favorite teams"), id: "next1", primary: true) {
+                        // Only their teams load now; nothing is saved until Done.
+                        let picked = leagues
+                        schedule.requestRosters(Set(picked))
+                        if teamLeague.map({ !picked.contains($0) }) ?? true { teamLeague = picked.first }
+                        step = 1
+                    }
                 }
             }
             .focusSection()
@@ -196,7 +227,6 @@ struct MySportsSetupView: View {
                         .buttonStyle(PosterCardButtonStyle())
                         .focused($focus, equals: id)
                         .focusEffectDisabledIfAvailable()
-                        .onChange(of: focused) { _, isFocused in if isFocused { teamLeague = league.short } }
                     }
                 }
                 .padding(.vertical, 8)
@@ -218,7 +248,7 @@ struct MySportsSetupView: View {
     @ViewBuilder
     private var teamGrid: some View {
         let league = teamLeague ?? leagues.first
-        let roster = league.flatMap { schedule.rosters[$0] } ?? []
+        let roster = league.flatMap { short in SportsData.leagues.first { $0.short == short } }.map { schedule.teams(for: $0) } ?? []
         if let league, roster.isEmpty {
             HStack(spacing: 16) {
                 if schedule.refreshing { ProgressView() }
@@ -292,7 +322,9 @@ struct MySportsSetupView: View {
         var names: [String] = []
         for key in teams.sorted() {
             let parts = key.split(separator: "|", maxSplits: 1).map(String.init)
-            guard parts.count == 2, let team = schedule.rosters[parts[0]]?.first(where: { $0.id == parts[1] }) else { continue }
+            guard parts.count == 2, leagues.contains(parts[0]),
+                  let league = SportsData.leagues.first(where: { $0.short == parts[0] }),
+                  let team = schedule.teams(for: league).first(where: { $0.id == parts[1] }) else { continue }
             names.append(team.alternates.first ?? team.name)
         }
         return names
@@ -336,7 +368,10 @@ struct MySportsSetupView: View {
                 actionButton(L10n.string("my_sports_back", fallback: "Back"), id: "back3") { step = 1 }
                 Spacer()
                 actionButton(L10n.string("my_sports_done", fallback: "Done"), id: "done", primary: true) {
-                    let picked = leagues, favorites = Array(teams).sorted(), remind = reminders && !teams.isEmpty
+                    // Favorites only for leagues still picked.
+                    let picked = leagues
+                    let favorites = teams.filter { key in picked.contains { key.hasPrefix($0 + "|") } }.sorted()
+                    let remind = reminders && !favorites.isEmpty
                     mySports.update {
                         $0.leagues = picked
                         $0.teams = favorites
@@ -345,7 +380,7 @@ struct MySportsSetupView: View {
                         $0.prompted = true
                     }
                     CrashRecorder.note("my sports: saved \(picked.count) leagues, \(favorites.count) teams")
-                    onDone()
+                    close()
                 }
             }
             .focusSection()

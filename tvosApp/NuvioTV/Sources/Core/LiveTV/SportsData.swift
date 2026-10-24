@@ -93,7 +93,8 @@ final class SportsData: ObservableObject {
                sport: "Basketball", soccer: false, extra: "&groups=50", mode: .days(3), keywords: ["women"]),
         League(path: "baseball/mlb", group: "MLB", short: "MLB", name: "MLB", sport: "Baseball", soccer: false, standard: true),
         League(path: "hockey/nhl", group: "NHL", short: "NHL", name: "NHL", sport: "Hockey", soccer: false, standard: true),
-        League(path: "soccer/usa.1", group: "MLS", short: "MLS", name: "MLS", sport: "Soccer", soccer: true, standard: true),
+        League(path: "soccer/usa.1", group: "MLS", short: "MLS", name: "MLS", sport: "Soccer", soccer: true, standard: true,
+               keywords: ["mls", "major league soccer"]),
         League(path: "soccer/eng.1", group: "Soccer", short: "EPL", name: "Premier League", sport: "Soccer", soccer: true,
                standard: true, keywords: ["premier league", "epl"]),
         League(path: "soccer/uefa.champions", group: "Soccer", short: "UCL", name: "Champions League", sport: "Soccer", soccer: true,
@@ -269,10 +270,21 @@ final class SportsData: ObservableObject {
         refreshing = true
         task = Task { [weak self] in
             await self?.fetch(force: force, only: only)
-            self?.task = nil
-            self?.refreshing = false
+            guard let self else { return }
+            self.task = nil
+            self.refreshing = false
+            // Picks that changed while this ran.
+            if self.recheckPending {
+                self.recheckPending = false
+                self.leaguesChanged()
+            }
         }
     }
+
+    /// Picks changed (or Setup asked for teams) during a fetch.
+    private var recheckPending = false
+    /// Leagues Setup is showing, whose teams are needed before they're saved.
+    private var wantedRosters = Set<String>()
 
     private func publish() {
         if Self.isEnabled {
@@ -297,11 +309,34 @@ final class SportsData: ObservableObject {
             await self?.loading?.value
             guard let self else { return }
             self.publish()
+            guard Self.isEnabled else { return }
             let fetched = Set(self.saved.leagueSet ?? [])
-            let missing = Self.activeLeagues.contains { !fetched.contains($0.short) }
-            let needsSchools = Self.activeLeagues.contains(where: \.college) && (self.saved.schools ?? []).isEmpty
-            if Self.isEnabled, self.task == nil, missing || needsSchools { self.start(force: false, only: missing ? nil : []) }
+            var missing = Set(Self.activeLeagues.map(\.short).filter { !fetched.contains($0) })
+            missing.formUnion(self.wantedRosters.filter { (self.saved.rosters?[$0] ?? []).isEmpty && !fetched.contains($0) })
+            let college = Self.activeLeagues.contains(where: \.college)
+                || Self.leagues.contains { self.wantedRosters.contains($0.short) && $0.college }
+            let needsSchools = college && (self.saved.schools ?? []).isEmpty
+            guard !missing.isEmpty || needsSchools else { return }
+            if self.task != nil {
+                self.recheckPending = true
+                return
+            }
+            self.start(force: false, only: missing)
         }
+    }
+
+    /// Setup: teams for leagues picked there but not saved yet.
+    func requestRosters(_ shorts: Set<String>) {
+        wantedRosters = shorts
+        leaguesChanged()
+    }
+
+    /// Teams to pick from: the schedule's, plus every school for college leagues.
+    func teams(for league: League) -> [SportsTeam] {
+        var byID: [String: SportsTeam] = [:]
+        if league.college { for school in saved.schools ?? [] { byID[school.id] = school } }
+        for team in saved.rosters?[league.short] ?? [] { byID[team.id] = team }
+        return byID.values.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
     }
 
     private func save() {
@@ -325,14 +360,16 @@ final class SportsData: ObservableObject {
         dayFormat.locale = Locale(identifier: "en_US_POSIX")
         dayFormat.dateFormat = "yyyyMMdd"
 
-        let active = Self.activeLeagues
+        // A given list may include leagues Setup is showing but hasn't saved.
+        let active = only.map { set in Self.leagues.filter { set.contains($0.short) } } ?? Self.activeLeagues
+        let needsSchoolsFor = Self.activeLeagues + active
+        var succeeded: [String] = []
         let configured = MySports.current.configured
         var byLeague = Dictionary(grouping: saved.games, by: \.leagueShort)
         var rosters = saved.rosters ?? [:]
         var fetchedAny = false
         var requests = 0
         for league in active {
-            if let only, !only.contains(league.short) { continue }
             // Before setup, leagues you can't watch are checked weekly.
             if !force, !configured, skip(league.short, now: now) { continue }
             if requests > 0 { try? await Task.sleep(nanoseconds: 700_000_000) }
@@ -349,7 +386,8 @@ final class SportsData: ObservableObject {
             var index = 0
             while index < queries.count {
                 if index > 0 { try? await Task.sleep(nanoseconds: 700_000_000) }
-                if let part = await fetchLeague(league, query: queries[index], from: from, to: to) {
+                // Only the first request of a league says which query form works.
+                if let part = await fetchLeague(league, query: queries[index], from: from, to: to, learnForm: index == 0) {
                     list += part.games
                     for team in part.teams { roster[team.id] = team }
                     ok = true
@@ -364,13 +402,16 @@ final class SportsData: ObservableObject {
             var seen = Set<String>()
             byLeague[league.short] = list.filter { seen.insert($0.id).inserted }
             if !roster.isEmpty {
+                // Added to, not replaced: teams on a bye week stay pickable.
+                for team in rosters[league.short] ?? [] where roster[team.id] == nil { roster[team.id] = team }
                 rosters[league.short] = roster.values.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
             }
             saved.leagueFetched[league.short] = now
+            succeeded.append(league.short)
             fetchedAny = true
         }
         // School logos for college events, once a month.
-        if active.contains(where: \.college),
+        if needsSchoolsFor.contains(where: \.college),
            saved.schoolsFetchedAt.map({ now.timeIntervalSince($0) > 30 * 86_400 }) ?? true || (saved.schools ?? []).isEmpty {
             if requests > 0 { try? await Task.sleep(nanoseconds: 700_000_000) }
             if let list = await fetchSchools() {
@@ -393,7 +434,7 @@ final class SportsData: ObservableObject {
         let cutoff = now.addingTimeInterval(-2 * 86_400)
         saved.games = byLeague.values.flatMap { $0 }.filter { $0.start > cutoff }
         saved.rosters = rosters
-        saved.leagueSet = Array(Set((saved.leagueSet ?? []) + active.map(\.short)))
+        saved.leagueSet = Array(Set((saved.leagueSet ?? []) + succeeded))
         if only == nil { saved.fetchedAt = now }
         save()
         publish()
@@ -458,20 +499,20 @@ final class SportsData: ObservableObject {
         var total = 0
     }
 
-    private func fetchLeague(_ league: League, query: String, from: Date, to: Date) async -> LeagueResult? {
+    private func fetchLeague(_ league: League, query: String, from: Date, to: Date, learnForm: Bool = true) async -> LeagueResult? {
         var base = "https://site.api.espn.com/apis/site/v2/sports/\(league.path)/scoreboard?"
         base += [query, String(league.extra.dropFirst())].filter { !$0.isEmpty }.joined(separator: "&")
         // Remember which form works, so a league is asked once, not twice.
         let plainForm = saved.leagueForm?[league.short] == "plain"
         guard var result = await get(plainForm ? base : base + "&limit=1000") else { return nil }
-        if result.status == 200, !plainForm {
+        if result.status == 200, !plainForm, learnForm {
             saved.leagueForm = (saved.leagueForm ?? [:]).merging([league.short: "limit"]) { _, new in new }
         }
         if result.status == 400, !plainForm {
             try? await Task.sleep(nanoseconds: 700_000_000)
             guard let retry = await get(base) else { return nil }
             result = retry
-            if retry.status == 200 {
+            if retry.status == 200, learnForm {
                 saved.leagueForm = (saved.leagueForm ?? [:]).merging([league.short: "plain"]) { _, new in new }
             }
         }
