@@ -18,6 +18,13 @@ struct SportsTeam: Codable, Hashable {
     var badge: String?
     /// "Utah", "Los Angeles": only used to match college teams.
     var location: String? = nil
+    /// Team colors as hex ("00274C"), for the badge when there's no logo.
+    var color: String? = nil
+    var altColor: String? = nil
+    /// Poll rank in this game (college, 1–25), or nil.
+    var rank: Int? = nil
+    /// A fighter's country code ("AUS"), from the schedule's flag.
+    var country: String? = nil
 
     /// "LAR", or initials when there's no abbreviation.
     var abbreviation: String {
@@ -52,6 +59,9 @@ struct SportsGame: Codable, Hashable, Identifiable {
     /// Fight cards: "ufc|333|main" (promotion, event number or empty for a
     /// Fight Night, part of the card or empty when the card isn't split).
     var cardKey: String? = nil
+    /// A short tag for the tile: "World Series · Game 1", "Paris",
+    /// "League Phase", "Sunday Night". Never a score or a result.
+    var note: String? = nil
 
     var title: String {
         if let customTitle { return customTitle }
@@ -188,7 +198,13 @@ final class SportsData: ObservableObject {
         var schoolsFetchedAt: Date?
         /// The leagues the saved schedule was fetched for.
         var leagueSet: [String]?
+        /// Which fields the saved games have (`scheduleSchema`): an older
+        /// schedule is fetched again once, even on the same day.
+        var schema: Int?
     }
+
+    /// 2: team colors, ranks, game tags and fighter countries.
+    private static let scheduleSchema = 2
 
     private static var appBuild: String {
         Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?"
@@ -239,7 +255,8 @@ final class SportsData: ObservableObject {
             await self?.loading?.value
             guard let self, Self.isEnabled, self.task == nil else { return }
             if let fetched = self.saved.fetchedAt, Calendar.current.isDateInToday(fetched),
-               Date().timeIntervalSince(fetched) < 20 * 3600 {
+               Date().timeIntervalSince(fetched) < 20 * 3600,
+               self.saved.schema == Self.scheduleSchema || self.saved.failedAt != nil {
                 // Already fetched today, but a league added since (an update
                 // brought the fight schedule) is looked up now.
                 let known = Set(self.saved.leagueSet ?? [])
@@ -464,7 +481,10 @@ final class SportsData: ObservableObject {
         saved.games = byLeague.values.flatMap { $0 }.filter { $0.start > cutoff }
         saved.rosters = rosters
         saved.leagueSet = Array(Set((saved.leagueSet ?? []) + succeeded))
-        if only == nil { saved.fetchedAt = now }
+        if only == nil {
+            saved.fetchedAt = now
+            saved.schema = Self.scheduleSchema
+        }
         save()
         publish()
     }
@@ -588,7 +608,8 @@ private enum SportsParse {
         var home: SportsTeam?
         var away: SportsTeam?
         for competitor in competitors {
-            guard let team = self.team(competitor["team"] as? [String: Any]) else { continue }
+            guard var team = self.team(competitor["team"] as? [String: Any]) else { continue }
+            team.rank = pollRank((competitor["curatedRank"] as? [String: Any]).flatMap { text($0["current"]) })
             if text(competitor["homeAway"]) == "home" { home = team } else { away = team }
         }
         guard let home, let away else { return nil }
@@ -597,15 +618,82 @@ private enum SportsParse {
         let statusName = text(status?["name"])?.uppercased() ?? ""
         let week = (event["week"] as? [String: Any]).flatMap { text($0["number"]) }.flatMap { Int($0) }
         let showsWeek = league.group == "NFL" || league.group == "College Football"
+        let channels = networks(competition)
+        let headlines = (competition["notes"] as? [[String: Any]] ?? []).compactMap { text($0["headline"]) }
+        let stage = (event["season"] as? [String: Any]).flatMap { text($0["slug"]) }
         return SportsGame(
             id: "\(league.short)|\(id)", league: league.group, leagueShort: league.short, isSoccer: league.soccer,
             weekLabel: showsWeek ? week.map { "Week \($0)" } : nil,
             home: home, away: away, start: start,
-            networks: networks(competition),
+            networks: channels,
             venue: venue(competition["venue"] as? [String: Any]),
             postponed: statusName.contains("POSTPONED") || statusName.contains("CANCELED") || statusName.contains("CANCELLED"),
-            completed: (status?["completed"] as? Bool) == true || statusName.contains("FINAL")
+            completed: (status?["completed"] as? Bool) == true || statusName.contains("FINAL"),
+            note: note(headlines, stage: stage, league: league, start: start)
         )
+    }
+
+    /// A poll rank worth showing (1–25; the schedule says 99 for unranked).
+    static func pollRank(_ value: String?) -> Int? {
+        guard let value, let number = Int(value), (1...25).contains(number) else { return nil }
+        return number
+    }
+
+    /// "00274c" → "00274C"; anything that isn't 6 hex digits → nil.
+    static func hexColor(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let trimmed = value.hasPrefix("#") ? String(value.dropFirst()) : value
+        guard trimmed.count == 6, trimmed.allSatisfy(\.isHexDigit) else { return nil }
+        return trimmed.uppercased()
+    }
+
+    private static let resultWords: Set<String> = [
+        "lead", "leads", "led", "won", "win", "wins", "tied", "ties", "tie", "advance", "advances", "advanced",
+        "eliminated", "eliminates", "clinch", "clinches", "clinched", "beat", "beats", "defeat", "defeats", "final", "score"
+    ]
+    private static let plainStages: Set<String> = ["regular-season", "preseason", "pre-season", "post-season", "postseason",
+                                                   "off-season", "offseason", "regular"]
+
+    private static let eastern: Calendar = {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(identifier: "America/New_York") ?? .current
+        return calendar
+    }()
+
+    /// The tile's tag: the schedule's note ("World Series - Game 1" →
+    /// "World Series · Game 1", "NFL Paris Game" → "Paris"), an NFL night
+    /// game ("Sunday Night"), or the stage ("League Phase"). A note that
+    /// could say how a game or series is going is never used.
+    static func note(_ headlines: [String], stage: String?, league: SportsData.League, start: Date) -> String? {
+        for raw in headlines {
+            let words = Set(raw.lowercased().split { !$0.isLetter }.map(String.init))
+            if !words.isDisjoint(with: resultWords) { continue }
+            if RX.range("\\d\\s*[-–]\\s*\\d", in: raw) != nil { continue }
+            var value = raw.replacingOccurrences(of: " - ", with: " · ")
+            for prefix in [league.short + " ", league.name + " "]
+            where value.count > prefix.count && value.lowercased().hasPrefix(prefix.lowercased()) {
+                value = String(value.dropFirst(prefix.count))
+            }
+            if value.hasSuffix(" Game"), value.count > 5 { value = String(value.dropLast(5)) }
+            value = value.trimmingCharacters(in: .whitespaces)
+            if !value.isEmpty, value.count <= 26 { return value }
+        }
+        if league.short == "NFL", eastern.component(.hour, from: start) >= 19 {
+            switch eastern.component(.weekday, from: start) {
+            case 1: return "Sunday Night"
+            case 2: return "Monday Night"
+            case 5: return "Thursday Night"
+            case 7: return "Saturday Night"
+            default: break
+            }
+        }
+        if let stage, !plainStages.contains(stage.lowercased()) {
+            let value = stage.split(separator: "-").map { word -> String in
+                String(word.prefix(1)).uppercased() + String(word.dropFirst())
+            }.joined(separator: " ")
+            if !value.isEmpty, value.count <= 26 { return value }
+        }
+        return nil
     }
 
     static func team(_ item: [String: Any]?) -> SportsTeam? {
@@ -617,7 +705,8 @@ private enum SportsParse {
         var logo = text(item["logo"])
         if logo == nil, let logos = item["logos"] as? [[String: Any]] { logo = logos.first.flatMap { text($0["href"]) } }
         return SportsTeam(id: id, name: name, short: text(item["abbreviation"]), alternates: alternates, badge: logo,
-                          location: text(item["location"]))
+                          location: text(item["location"]), color: hexColor(text(item["color"])),
+                          altColor: hexColor(text(item["alternateColor"])))
     }
 
     private static func networks(_ competition: [String: Any]) -> [String] {
@@ -718,7 +807,11 @@ private struct ScoreboardEvent: Decodable {
     let week: Lenient<ScoreboardWeek>?
     let competitions: Lenient<[Lenient<ScoreboardCompetition>]>?
     let status: Lenient<ScoreboardStatus>?
+    let season: Lenient<ScoreboardEventSeason>?
 }
+private struct ScoreboardEventSeason: Decodable { let slug: LenientText? }
+private struct ScoreboardNote: Decodable { let headline: LenientText? }
+private struct ScoreboardRank: Decodable { let current: LenientText? }
 private struct ScoreboardWeek: Decodable { let number: LenientText? }
 private struct ScoreboardCompetition: Decodable {
     let competitors: Lenient<[Lenient<ScoreboardCompetitor>]>?
@@ -726,10 +819,12 @@ private struct ScoreboardCompetition: Decodable {
     let broadcasts: Lenient<[Lenient<ScoreboardBroadcast>]>?
     let geoBroadcasts: Lenient<[Lenient<ScoreboardGeo>]>?
     let status: Lenient<ScoreboardStatus>?
+    let notes: Lenient<[Lenient<ScoreboardNote>]>?
 }
 private struct ScoreboardCompetitor: Decodable {
     let homeAway: LenientText?
     let team: Lenient<ScoreboardTeam>?
+    let curatedRank: Lenient<ScoreboardRank>?
 }
 private struct ScoreboardTeam: Decodable {
     let id: LenientText?
@@ -740,6 +835,8 @@ private struct ScoreboardTeam: Decodable {
     let abbreviation: LenientText?
     let logo: LenientText?
     let logos: Lenient<[Lenient<ScoreboardHref>]>?
+    let color: LenientText?
+    let alternateColor: LenientText?
 }
 private struct ScoreboardHref: Decodable { let href: LenientText? }
 private struct ScoreboardVenue: Decodable {
@@ -792,11 +889,17 @@ extension SportsParse {
         let athlete = (competitor["athlete"] as? [String: Any]) ?? (competitor["team"] as? [String: Any])
         guard let athlete, let name = text(athlete["displayName"]) ?? text(athlete["fullName"]) ?? text(athlete["name"]) else { return nil }
         let id = text(athlete["id"]) ?? text(competitor["id"]) ?? name
-        let headshot = (athlete["headshot"] as? [String: Any]).flatMap { text($0["href"]) }
-            ?? (athlete["flag"] as? [String: Any]).flatMap { text($0["href"]) }
+        let flag = (athlete["flag"] as? [String: Any]).flatMap { text($0["href"]) }
+        let headshot = (athlete["headshot"] as? [String: Any]).flatMap { text($0["href"]) } ?? flag
         var alternates: [String] = []
         if let short = text(athlete["shortName"]), short != name { alternates.append(short) }
-        return SportsTeam(id: "f\(id)", name: name, short: nil, alternates: alternates, badge: headshot)
+        // ".../countries/500/aus.png" → "AUS".
+        var country: String?
+        if let flag, let file = flag.split(separator: "/").last?.split(separator: ".").first,
+           (2...3).contains(file.count), file.allSatisfy(\.isLetter) {
+            country = file.uppercased()
+        }
+        return SportsTeam(id: "f\(id)", name: name, short: nil, alternates: alternates, badge: headshot, country: country)
     }
 
     /// One game per part of each card (early prelims, prelims, main card),
@@ -935,7 +1038,9 @@ extension SportsParse {
             }
             let logo = item.logo?.value ?? item.logos?.value?.first?.value?.href?.value
             let team = SportsTeam(id: teamID, name: name, short: item.abbreviation?.value, alternates: alternates, badge: logo,
-                                  location: item.location?.value)
+                                  location: item.location?.value, color: hexColor(item.color?.value),
+                                  altColor: hexColor(item.alternateColor?.value),
+                                  rank: pollRank(competitor.curatedRank?.value?.current?.value))
             if competitor.homeAway?.value == "home" { home = team } else { away = team }
         }
         guard let home, let away else { return nil }
@@ -960,12 +1065,14 @@ extension SportsParse {
         }
         let week = event.week?.value?.number?.value.flatMap { Int($0) }
         let showsWeek = league.group == "NFL" || league.group == "College Football"
+        let headlines = (competition.notes?.value ?? []).compactMap { $0.value?.headline?.value }
         return SportsGame(
             id: "\(league.short)|\(id)", league: league.group, leagueShort: league.short, isSoccer: league.soccer,
             weekLabel: showsWeek ? week.map { "Week \($0)" } : nil,
             home: home, away: away, start: start, networks: networks, venue: venue,
             postponed: statusName.contains("POSTPONED") || statusName.contains("CANCELED") || statusName.contains("CANCELLED"),
-            completed: status?.completed?.value == true || statusName.contains("FINAL")
+            completed: status?.completed?.value == true || statusName.contains("FINAL"),
+            note: note(headlines, stage: event.season?.value?.slug?.value, league: league, start: start)
         )
     }
 }
