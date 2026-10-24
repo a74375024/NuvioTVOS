@@ -34,7 +34,7 @@ struct MySportsSetupView: View {
         }
         .onChange(of: step) { _, _ in focusStep() }
         .onExitCommand {
-            if step > 0 { step -= 1 } else { close() }
+            if step == 2, pickedLeagues.isEmpty { step = 0 } else if step > 0 { step -= 1 } else { close() }
         }
     }
 
@@ -126,6 +126,19 @@ struct MySportsSetupView: View {
                             }
                         }
                     }
+                    // Sports without a schedule: a row of their own from your channels.
+                    VStack(alignment: .leading, spacing: 12) {
+                        LiveSectionLabel(text: L10n.string("my_sports_more_sports", fallback: "More sports"))
+                        VStack(alignment: .leading, spacing: 16) {
+                            ForEach(Array(stride(from: 0, to: MySports.otherSports.count, by: 4)), id: \.self) { row in
+                                HStack(spacing: 20) {
+                                    ForEach(MySports.otherSports[row..<min(row + 4, MySports.otherSports.count)], id: \.id) { sport in
+                                        pickTile(id: sport.id, name: sport.name, count: counts[sport.id] ?? 0)
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
                 .padding(.vertical, 16)
                 .padding(.horizontal, 6)
@@ -143,8 +156,10 @@ struct MySportsSetupView: View {
                         // Only their teams load now; nothing is saved until Done.
                         let picked = leagues
                         schedule.requestRosters(Set(picked))
-                        if teamLeague.map({ !picked.contains($0) }) ?? true { teamLeague = picked.first }
-                        step = 1
+                        let teamLeagues = pickedLeagues.map(\.short)
+                        if teamLeague.map({ !teamLeagues.contains($0) }) ?? true { teamLeague = teamLeagues.first }
+                        // Only sports without teams picked: straight to the review.
+                        step = teamLeagues.isEmpty ? 2 : 1
                     }
                 }
             }
@@ -155,16 +170,19 @@ struct MySportsSetupView: View {
     }
 
     private func leagueTile(_ league: SportsData.League) -> some View {
-        let id = "league|\(league.short)"
+        pickTile(id: league.short, name: league.name, count: counts[league.short] ?? 0)
+    }
+
+    private func pickTile(id pick: String, name: String, count: Int) -> some View {
+        let id = "league|\(pick)"
         let focused = focus == id
-        let on = leagues.contains(league.short)
-        let count = counts[league.short] ?? 0
+        let on = leagues.contains(pick)
         return Button {
-            if let index = leagues.firstIndex(of: league.short) { leagues.remove(at: index) } else { leagues.append(league.short) }
+            if let index = leagues.firstIndex(of: pick) { leagues.remove(at: index) } else { leagues.append(pick) }
         } label: {
             HStack(alignment: .top) {
                 VStack(alignment: .leading, spacing: 6) {
-                    Text(league.name)
+                    Text(name)
                         .font(.system(size: 25, weight: .bold))
                         .lineLimit(1)
                         .minimumScaleFactor(0.8)
@@ -347,7 +365,8 @@ struct MySportsSetupView: View {
                    L10n.string("my_sports_review_detail", fallback: "Live Events leads with your teams, then a row for each league you picked."))
             VStack(alignment: .leading, spacing: 18) {
                 summaryLine(L10n.string("my_sports_leagues", fallback: "Leagues"),
-                            pickedLeagues.isEmpty ? L10n.string("my_sports_none", fallback: "None") : pickedLeagues.map(\.name).joined(separator: ", "))
+                            leagues.isEmpty ? L10n.string("my_sports_none", fallback: "None")
+                                : leagues.compactMap { MySports.name(of: $0) }.joined(separator: ", "))
                 summaryLine(L10n.string("my_sports_teams", fallback: "Favorite teams"),
                             teamNames.isEmpty ? L10n.string("my_sports_none", fallback: "None") : teamNames.joined(separator: ", "))
                 summaryLine(L10n.string("my_sports_everything_else", fallback: "Everything else"),
@@ -365,7 +384,7 @@ struct MySportsSetupView: View {
             .opacity(teams.isEmpty ? 0.5 : 1)
             Spacer(minLength: 0)
             HStack(spacing: 20) {
-                actionButton(L10n.string("my_sports_back", fallback: "Back"), id: "back3") { step = 1 }
+                actionButton(L10n.string("my_sports_back", fallback: "Back"), id: "back3") { step = pickedLeagues.isEmpty ? 0 : 1 }
                 Spacer()
                 actionButton(L10n.string("my_sports_done", fallback: "Done"), id: "done", primary: true) {
                     // Favorites only for leagues still picked.

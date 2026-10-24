@@ -42,7 +42,7 @@ struct LiveTVOptionsPanel: View {
     private var mySportsSummary: String {
         let prefs = mySports.prefs
         guard prefs.configured else { return L10n.string("my_sports_not_set", fallback: "Set up") }
-        let names = prefs.leagues.prefix(4).joined(separator: ", ")
+        let names = prefs.leagues.prefix(4).map { $0.hasPrefix("S:") ? String($0.dropFirst(2)) : $0 }.joined(separator: ", ")
         return prefs.leagues.count > 4 ? names + " +\(prefs.leagues.count - 4)" : (names.isEmpty ? L10n.string("my_sports_none", fallback: "None") : names)
     }
 

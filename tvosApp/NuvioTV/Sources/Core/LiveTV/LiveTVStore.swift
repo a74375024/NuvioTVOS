@@ -1536,6 +1536,8 @@ final class LiveTVStore: ObservableObject {
         let scope: String
         let serverTagged: Int
         let nowGenres: String
+        let nowSubtitle: String
+        let nowDescription: String
     }
 
     /// One row per channel: what it is, what the server's guide has, and
@@ -1605,7 +1607,9 @@ final class LiveTVStore: ObservableObject {
                 nowGenres: current.map { program in
                     [program.isSports ? "sports" : nil, program.isNews ? "news" : nil,
                      program.isMovie ? "movie" : nil, program.isKids ? "kids" : nil].compactMap { $0 }.joined(separator: " ")
-                } ?? ""
+                } ?? "",
+                nowSubtitle: current?.episodeTitle ?? "",
+                nowDescription: current?.overview.map { String($0.prefix(160)) } ?? ""
             ))
         }
         let low = Int(start.timeIntervalSince1970 / 60)
@@ -1634,7 +1638,8 @@ final class LiveTVStore: ObservableObject {
                 "now_title", "now_source", "entry", "category", "in_my_lineup", "event_family", "event_text",
                 "provider", "country", "guide_id", "provider_guide", "provider_guide_programs_next_3h",
                 "kind", "market", "core_network", "scope",
-                "server_genre_tagged_next_3h", "outside_genre_tagged_next_3h", "provider_guide_genre_tagged_next_3h", "now_genres"
+                "server_genre_tagged_next_3h", "outside_genre_tagged_next_3h", "provider_guide_genre_tagged_next_3h", "now_genres",
+                "now_subtitle", "now_description"
             ].joined(separator: ",")]
             lines.reserveCapacity(total + 1)
             for (index, row) in rows.enumerated() {
@@ -1655,7 +1660,9 @@ final class LiveTVStore: ObservableObject {
                     cell(channel.epgID ?? ""), cell(row.providerGuide), cell(isXtream ? String(count(row.providerRaw)) : ""),
                     cell(row.kind), cell(row.market), cell(row.core), cell(row.scope),
                     cell(String(row.serverTagged)), cell(String(tagged(row.outsideRaw))),
-                    cell(isXtream ? String(tagged(row.providerRaw)) : ""), cell(row.nowGenres)
+                    cell(isXtream ? String(tagged(row.providerRaw)) : ""), cell(row.nowGenres),
+                    cell(row.nowSubtitle), cell(row.nowDescription.isEmpty ? "" : row.nowDescription.rxReplace("https?://\\S+", with: "")
+                        .replacingOccurrences(of: "\n", with: " "))
                 ].joined(separator: ","))
                 if index % 2000 == 1999 {
                     let done = index + 1
@@ -2586,6 +2593,7 @@ final class LiveTVStore: ObservableObject {
     private var sportsListingsReady = false
     private var listingsProgramsRevision = -1
     private var sportsAbortUntil: Date?
+    private var sportsChannelIndex: (key: String, index: SportsNetworkMap.ChannelIndex)?
 
     private static var sportsCacheFile: URL {
         let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
@@ -2716,9 +2724,17 @@ final class LiveTVStore: ObservableObject {
                     guard let info = meta[id] else { return }
                     for program in list where program.end > low && program.start < high {
                         let title = program.episodeTitle.map { "\(program.title) \($0)" } ?? program.title
-                        guard SportsMatcher.looksLikeGame(title) else { continue }
-                        listings.append(SportsMatcher.GuideListing(entryID: id, inLineup: info.inLineup, spanish: info.spanish,
-                                                                   title: title, start: program.start, end: program.end))
+                        if SportsMatcher.looksLikeGame(title) {
+                            listings.append(SportsMatcher.GuideListing(entryID: id, inLineup: info.inLineup, spanish: info.spanish,
+                                                                       title: title, start: program.start, end: program.end))
+                        } else if let overview = program.overview, overview.count > 12,
+                                  program.isSports || SportsMatcher.isGenericSportsTitle(program.title),
+                                  SportsMatcher.isGenericSportsTitle(title) {
+                            // "NBA Basketball": the description may name the teams.
+                            listings.append(SportsMatcher.GuideListing(entryID: id, inLineup: info.inLineup, spanish: info.spanish,
+                                                                       title: title, start: program.start, end: program.end,
+                                                                       detail: String(overview.prefix(160))))
+                        }
                     }
                 }
             }
@@ -2766,7 +2782,31 @@ final class LiveTVStore: ObservableObject {
         var previousMap: [String: String] = [:]
         for event in sportsEvents { if let game = event.game { previousMap[game.id] = event.id } }
         let previousIDs = previousMap
+        // Teams of the leagues being looked up (logos by name, team channels).
+        let allRosters = SportsData.shared.rosters
+        let rosters: [SportsMatcher.RosterLeague] = SportsData.activeLeagues.compactMap { league in
+            guard let teams = allRosters[league.short], !teams.isEmpty else { return nil }
+            return SportsMatcher.RosterLeague(short: league.short, group: league.group, college: league.college, teams: teams)
+        }
+        // Which of your channels carry which network or team: worked out once
+        // per channel list, lineup or team change, not on every rebuild.
+        var lineupHasher = Hasher()
+        for id in lineup.sorted() { lineupHasher.combine(id) }
+        let indexKey = "\(entriesRevision)|\(lineupHasher.finalize())|\(hidden.sorted().joined(separator: ","))|"
+            + rosters.map { "\($0.short):\($0.teams.count)" }.joined(separator: ",")
         let mainMS = Int(Date().timeIntervalSince(started) * 1000)
+        let channelIndex: SportsNetworkMap.ChannelIndex
+        if let cached = sportsChannelIndex, cached.key == indexKey {
+            channelIndex = cached.index
+        } else {
+            let indexStarted = Date()
+            channelIndex = await Task.detached(priority: .utility) {
+                SportsNetworkMap.channelIndex(lineup: lineup, lineupEntries: lineupEntries, browse: browse,
+                                              entryInfo: entryInfo, hidden: hidden, rosters: rosters)
+            }.value
+            sportsChannelIndex = (indexKey, channelIndex)
+            CrashRecorder.note("sports channel index: \(channelIndex.summary), \(Int(Date().timeIntervalSince(indexStarted) * 1000)) ms")
+        }
         let result = await Task.detached(priority: .utility) { () -> (events: [SportsEvent], stats: SportsMatcher.Stats)? in
             let spanishWords = "\\b(spanish|espanol|español|deportes|telemundo|univision|tudn|unimas)\\b"
             var providerEvents: [SportsMatcher.ProviderEvent] = []
@@ -2775,15 +2815,15 @@ final class LiveTVStore: ObservableObject {
                 autoreleasepool {
                     providerEvents.append(SportsMatcher.ProviderEvent(
                         id: event.id, title: event.title, league: event.league, start: event.start, feeds: event.feeds,
-                        family: event.family, spanish: event.market == "US-ES" || RX.test(spanishWords, event.title, caseInsensitive: true)
+                        family: event.family, spanish: event.market == "US-ES" || RX.test(spanishWords, event.title, caseInsensitive: true),
+                        guessed: event.startGuessed == true
                     ))
                 }
             }
-            let channelSources = SportsNetworkMap.networkSources(for: games, lineup: lineup, lineupEntries: lineupEntries,
-                                                            browse: browse, entryInfo: entryInfo, hidden: hidden)
+            let channelSources = SportsNetworkMap.networkSources(for: games, index: channelIndex)
             return SportsMatcher.build(
                 games: games, channelSources: channelSources, events: providerEvents, listings: listings,
-                preferSpanish: preferSpanish, now: now, previousIDs: previousIDs, schools: schools,
+                preferSpanish: preferSpanish, now: now, previousIDs: previousIDs, schools: schools, rosters: rosters,
                 shouldStop: {
                     let free = os_proc_available_memory()
                     if free != 0, free < 150 * 1_048_576 { return "only \(free / 1_048_576) MB free" }
@@ -2834,7 +2874,7 @@ final class LiveTVStore: ObservableObject {
                 return copy
             }
             guard let start = event.start, now.timeIntervalSince(start) > 45 * 60,
-                  !before.feeds.isEmpty, event.channels.isEmpty,
+                  !before.feeds.isEmpty, !event.channels.contains(where: { $0.kind != .team }),
                   before.feeds.allSatisfy({ channel(id: $0.channelID) != nil }) else { return event }
             copy.feedsEndedAt = now
             ended += 1
@@ -2975,10 +3015,14 @@ final class LiveTVStore: ObservableObject {
         if let sourceID, let source = event.sources.first(where: { $0.channelID == sourceID }), let channel = sourceChannel(source) {
             add(source.kind == .provider ? [channel] : baseVersions(of: channel))
         }
-        for source in event.channels {
+        for source in event.channels where source.kind != .team {
             if let channel = sourceChannel(source) { add(baseVersions(of: channel)) }
         }
         add(bestFeeds(event.feeds.compactMap { channel(id: $0.channelID) }))
+        // A team's own channel last: likely, not certain, to carry the game.
+        for source in event.channels where source.kind == .team {
+            if let channel = sourceChannel(source) { add(baseVersions(of: channel)) }
+        }
         return list
     }
 
@@ -3563,40 +3607,91 @@ enum SportsNetworkMap {
     ]
     private static let broadcastNetworks: Set<String> = ["ABC", "CBS", "NBC", "FOX", "CW", "TELEMUNDO", "UNIVISION", "UNIMAS"]
 
-    /// "core:FS1" / "net:FOX" for a network name, or nil (streaming
-    /// services, regional networks).
+    /// Your channels by what they carry: "core:FS1", "net:FOX", "rsn:fd-sun",
+    /// "call:KJZZ", "team:NBA|14". Built once per channel list (off the
+    /// main thread) and reused by every rebuild.
+    struct ChannelIndex {
+        struct Item {
+            let id: String
+            let inLineup: Bool
+            let spanish: Bool
+        }
+        var byKey: [String: [Item]] = [:]
+        var regional = 0
+        var callsigns = 0
+        var teamChannels = 0
+
+        var summary: String {
+            "\(byKey.count) keys, \(regional) regional, \(callsigns) stations by call sign, \(teamChannels) team channels"
+        }
+    }
+
+    /// "core:FS1" / "net:FOX" / "rsn:…" / "call:…" for a network name in the
+    /// schedule, or nil (streaming services).
     private static func networkKey(_ name: String) -> String? {
         let key = ChannelCatalog.coreKey(name).key
         if let alias = networkAliases[key] { return "core:\(alias)" }
         if let core = ChannelCatalog.coreMatch(name) { return "core:\(core.name)" }
         let word = key.replacingOccurrences(of: " ", with: "").uppercased()
         if broadcastNetworks.contains(word) { return "net:\(word)" }
+        if let regional = RegionalNetworks.key(name) { return "rsn:\(regional)" }
+        if let sign = RegionalNetworks.callsign(name) { return "call:\(sign)" }
         return nil
     }
 
-    /// For each game, the channels you have airing its network: My Lineup
-    /// first, then the rest of your channels (two at most of each). Pure, so
-    /// it runs off the main thread.
-    static func networkSources(for games: [SportsGame], lineup: Set<String>, lineupEntries: [LiveTVChannel],
-                                           browse: [LiveTVChannel], entryInfo: [String: LiveTVEntryInfo],
-                                           hidden: Set<String>) -> [String: [EventSource]] {
-        guard !games.isEmpty else { return [:] }
-        var index: [String: [(id: String, inLineup: Bool, spanish: Bool)]] = [:]
+    static func channelIndex(lineup: Set<String>, lineupEntries: [LiveTVChannel], browse: [LiveTVChannel],
+                             entryInfo: [String: LiveTVEntryInfo], hidden: Set<String>,
+                             rosters: [SportsMatcher.RosterLeague]) -> ChannelIndex {
+        var index = ChannelIndex()
+        // Team channels ("NBA Miami Heat", "Atlanta Falcons", "Spectrum
+        // SportsNet Lakers"): pro and soccer teams, one team named.
+        var teamLists: [(short: String, index: SportsMatcher.TeamIndex)] = []
+        for roster in rosters where !roster.college {
+            teamLists.append((roster.short, SportsMatcher.TeamIndex(teams: roster.teams, college: false)))
+        }
         var seen = Set<String>()
         for entry in lineupEntries + browse {
-            guard seen.insert(entry.id).inserted, let info = entryInfo[entry.id],
-                  !hidden.contains(entry.group ?? "Other") else { continue }
-            let key: String
-            if let core = info.core {
-                key = "core:\(core)"
-            } else if info.category == .local, let word = ChannelCatalog.networkWord(info.name) {
-                key = "net:\(word)"
-            } else {
-                continue
+            autoreleasepool {
+                guard seen.insert(entry.id).inserted, let info = entryInfo[entry.id],
+                      !hidden.contains(entry.group ?? "Other"), info.kind == .channel else { return }
+                let spanish = info.category == .spanish || info.market == "US-ES"
+                let item = ChannelIndex.Item(id: entry.id, inLineup: lineup.contains(entry.id), spanish: spanish)
+                func add(_ key: String) { index.byKey[key, default: []].append(item) }
+                if let core = info.core {
+                    add("core:\(core)")
+                    return
+                }
+                guard info.category == .sports || info.category == .local || info.category == .spanish else { return }
+                if info.category == .local, let word = ChannelCatalog.networkWord(info.name) { add("net:\(word)") }
+                if let regional = RegionalNetworks.key(info.name) {
+                    add("rsn:\(regional)")
+                    index.regional += 1
+                }
+                if info.category == .local, let sign = info.callsign.flatMap({ RegionalNetworks.callsign($0) }) {
+                    add("call:\(sign)")
+                    index.callsigns += 1
+                }
+                if info.category == .sports {
+                    var named: [String] = []
+                    for list in teamLists {
+                        if let team = list.index.single(info.name, leagueWord: list.short) { named.append("team:\(list.short)|\(team.id)") }
+                    }
+                    if named.count == 1, let key = named.first {
+                        add(key)
+                        index.teamChannels += 1
+                    }
+                }
             }
-            let spanish = info.category == .spanish || info.market == "US-ES"
-            index[key, default: []].append((entry.id, lineup.contains(entry.id), spanish))
         }
+        return index
+    }
+
+    /// For each game, the channels you have airing its networks (national,
+    /// regional, local station) and its teams' own channels: My Lineup
+    /// first, then the rest of your channels (two at most of each). Pure, so
+    /// it runs off the main thread.
+    static func networkSources(for games: [SportsGame], index: ChannelIndex) -> [String: [EventSource]] {
+        guard !games.isEmpty, !index.byKey.isEmpty else { return [:] }
         var keys: [String: String?] = [:]
         func cachedKey(_ network: String) -> String? {
             if let cached = keys[network] { return cached }
@@ -3616,19 +3711,100 @@ enum SportsNetworkMap {
         var result: [String: [EventSource]] = [:]
         for game in games where !game.completed {
             var sources: [EventSource] = []
-            for network in game.networks {
-                guard let key = cachedKey(network), let entries = index[key] else { continue }
-                if key.hasPrefix("net:"),
-                   (byNetwork[key] ?? []).filter({ abs($0.timeIntervalSince(game.start)) < 90 * 60 }).count > 1 { continue }
+            func take(_ entries: [ChannelIndex.Item], kind: (Bool) -> EventSource.Kind, detail: (Bool) -> String) {
                 let mine = Array(entries.filter { $0.inLineup }.prefix(2))
                 let others = mine.isEmpty ? Array(entries.filter { !$0.inLineup }.prefix(2)) : []
                 for item in mine + others where !sources.contains(where: { $0.channelID == item.id }) {
-                    sources.append(EventSource(channelID: item.id, kind: item.inLineup ? .lineup : .guide, spanish: item.spanish,
-                                               detail: item.inLineup ? "In My Lineup" : "In your channels"))
+                    sources.append(EventSource(channelID: item.id, kind: kind(item.inLineup), spanish: item.spanish,
+                                               detail: detail(item.inLineup)))
                 }
+            }
+            for network in game.networks {
+                guard let key = cachedKey(network), let entries = index.byKey[key] else { continue }
+                if key.hasPrefix("net:"),
+                   (byNetwork[key] ?? []).filter({ abs($0.timeIntervalSince(game.start)) < 90 * 60 }).count > 1 { continue }
+                take(entries, kind: { $0 ? .lineup : .guide }, detail: { $0 ? "In My Lineup" : "In your channels" })
+            }
+            for team in [game.home, game.away] {
+                guard let entries = index.byKey["team:\(game.leagueShort)|\(team.id)"] else { continue }
+                take(entries, kind: { _ in .team }, detail: { $0 ? "Team channel · In My Lineup" : "Team channel" })
             }
             if !sources.isEmpty { result[game.id] = sources }
         }
         return result
+    }
+}
+
+/// Regional sports networks under their many names: the schedule writes
+/// "FDSN Sun" or "NBCS-BA"; channel lists write "FanDuel Sports Sun",
+/// "BALLY SPORTS SUN (MIAMI) HD" or the older "FOX SPORTS SUN HD". All map
+/// to one key.
+enum RegionalNetworks {
+    /// Regions of the FanDuel (formerly Bally, formerly FOX Sports) networks,
+    /// longest first so "southeast" wins over "south".
+    private static let fanDuelRegions: [(words: [String], key: String)] = [
+        (["southeast", "se"], "southeast"), (["southwest", "sw"], "southwest"), (["sun"], "sun"),
+        (["carolinas", "carolina"], "carolinas"),
+        (["prime ticket"], "primeticket"), (["socal", "west"], "socal"), (["san diego"], "sandiego"),
+        (["new orleans"], "neworleans"), (["kansas city", "kc"], "kansascity"), (["great lakes"], "greatlakes"),
+        (["florida", "fl"], "florida"), (["detroit"], "detroit"), (["north"], "north"), (["ohio"], "ohio"),
+        (["midwest"], "midwest"), (["oklahoma"], "oklahoma"), (["wisconsin"], "wisconsin"), (["indiana"], "indiana"),
+        (["arizona"], "arizona"), (["cincinnati"], "cincinnati"),
+        (["tennessee"], "south"), (["south"], "south"),
+    ]
+
+    /// Other regional networks: any of the phrases → key.
+    private static let others: [(phrases: [String], key: String)] = [
+        (["nbcs ba", "nbcsba", "nbc sports bay area", "nbcs bay area"], "nbcs-ba"),
+        (["nbcs ca", "nbcsca", "nbc sports california", "nbcs california"], "nbcs-ca"),
+        (["nbcs ph", "nbcsp", "nbc sports philadelphia", "nbcs philadelphia", "nbcs philly"], "nbcs-ph"),
+        (["nbcs bos", "nbc sports boston", "nbcs boston"], "nbcs-bos"),
+        (["msg2", "msg 2", "msg plus", "msg+"], "msg2"),
+        (["msg sportsnet", "msg sn", "msg network", "msg"], "msg"),
+        (["yes network", "yes hd"], "yes"),
+        (["nesn"], "nesn"), (["sny"], "sny"), (["marquee sports"], "marquee"),
+        (["altitude"], "altitude"),
+        (["monumental", "mnmt"], "monumental"),
+        (["space city", "schn"], "spacecity"),
+        (["sportsnet la", "spectrum sportsnet la", "snla"], "snla"),
+        (["spectrum sportsnet", "spectrum sn"], "spectrum"),
+        (["root sports", "root sports northwest"], "root"),
+        (["sportsnet pittsburgh", "sportsnet pit", "att sportsnet pittsburgh", "at t sportsnet pittsburgh"], "snp"),
+        (["att sportsnet rocky mountain", "at t sportsnet rocky mountain", "root sports rocky mountain"], "rockymountain"),
+        (["chsn", "chicago sports network"], "chsn"),
+        (["gulf coast sports", "gcsen"], "gcsen"),
+        (["mlb tv"], ""),
+    ]
+
+    static func key(_ name: String) -> String? {
+        let text = " " + name.lowercased().replacingOccurrences(of: "&", with: "")
+            .map { $0.isLetter || $0.isNumber || $0 == "+" ? String($0) : " " }.joined()
+            .split(separator: " ").joined(separator: " ") + " "
+        // Bare names as the schedule writes them.
+        if text == " yes " { return "yes" }
+        if text == " marquee " { return "marquee" }
+        // Provider names mix the two LA networks up: the team decides.
+        if text.contains(" sportsnet ") || text.contains(" spectrum ") {
+            if text.contains(" dodgers ") { return "snla" }
+            if text.contains(" lakers ") { return "spectrum" }
+        }
+        if text.contains(" fdsn ") || text.contains(" fanduel ") || text.contains(" bally ")
+            || text.contains(" fox sports ") || text.contains(" fsn ") || text.contains(" fanduel sn ") {
+            for region in fanDuelRegions where region.words.contains(where: { text.contains(" \($0) ") }) {
+                return "fd-\(region.key)"
+            }
+            return nil
+        }
+        for item in others where item.phrases.contains(where: { text.contains(" \($0) ") }) {
+            return item.key.isEmpty ? nil : item.key
+        }
+        return nil
+    }
+
+    /// "KJZZ" from "KJZZ", "KJZZ-TV" or "kjzz-dt": a station call sign.
+    static func callsign(_ name: String) -> String? {
+        let upper = name.uppercased().trimmingCharacters(in: .whitespaces)
+        guard let range = RX.range("^[KW][A-Z]{2,3}(?=$|[- ](?:TV|DT|LD|CD|CA)$)", in: upper) else { return nil }
+        return String(upper[range])
     }
 }

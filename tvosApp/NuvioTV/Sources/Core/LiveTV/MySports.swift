@@ -60,12 +60,37 @@ final class MySports: ObservableObject {
             || prefs.teams.contains(Self.teamKey(league: game.leagueShort, teamID: game.away.id))
     }
 
-    /// Row groups of the picked leagues, in the order picked.
+    /// A sport with no schedule behind it: picking it gives it a row of its
+    /// own, built from your channels. No requests.
+    struct OtherSport {
+        let id: String       // "S:Golf"
+        let group: String    // the row ("Golf")
+        let name: String
+    }
+
+    static let otherSports: [OtherSport] = [
+        OtherSport(id: "S:Fighting", group: "Fighting", name: L10n.string("my_sports_fighting", fallback: "UFC, boxing & wrestling")),
+        OtherSport(id: "S:Motorsport", group: "Motorsport", name: L10n.string("my_sports_motorsport", fallback: "Racing")),
+        OtherSport(id: "S:Tennis", group: "Tennis", name: L10n.string("my_sports_tennis", fallback: "Tennis")),
+        OtherSport(id: "S:Golf", group: "Golf", name: L10n.string("my_sports_golf", fallback: "Golf")),
+        OtherSport(id: "S:Rugby", group: "Rugby", name: L10n.string("my_sports_rugby", fallback: "Rugby")),
+        OtherSport(id: "S:Cricket", group: "Cricket", name: L10n.string("my_sports_cricket", fallback: "Cricket")),
+        OtherSport(id: "S:Darts", group: "Darts", name: L10n.string("my_sports_darts", fallback: "Darts")),
+    ]
+
+    /// Display name of a picked id (league or other sport).
+    static func name(of id: String) -> String? {
+        SportsData.leagues.first(where: { $0.short == id })?.name ?? otherSports.first(where: { $0.id == id })?.name
+    }
+
+    /// Row groups of the picked leagues and sports, in the order picked.
     var pickedGroups: [String] {
         var groups: [String] = []
         for id in prefs.leagues {
-            guard let league = SportsData.leagues.first(where: { $0.short == id }), !groups.contains(league.group) else { continue }
-            groups.append(league.group)
+            let group = SportsData.leagues.first(where: { $0.short == id })?.group
+                ?? Self.otherSports.first(where: { $0.id == id })?.group
+            guard let group, !groups.contains(group) else { continue }
+            groups.append(group)
         }
         return groups
     }
@@ -88,6 +113,7 @@ final class MySports: ObservableObject {
                 }
                 counts[league.short, default: 0] += 1
             }
+            for sport in otherSports where sport.group == event.league { counts[sport.id, default: 0] += 1 }
         }
         return counts
     }

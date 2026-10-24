@@ -175,6 +175,9 @@ struct LiveEvent: Identifiable, Hashable, Codable {
     var feeds: [String]         // raw channel ids, best first
     let family: String
     var market: String? = nil
+    /// The title gave only a clock time ("8:20pm"), so the day is a guess
+    /// (today). Matching against the schedule decides the real day.
+    var startGuessed: Bool? = nil
 
     static func == (lhs: LiveEvent, rhs: LiveEvent) -> Bool { lhs.id == rhs.id }
     func hash(into hasher: inout Hasher) { hasher.combine(id) }
@@ -337,7 +340,8 @@ enum ChannelCatalog {
                       traits[channel.id]?.kind != .placeholder,
                       !RX.test("^\\W*(ended|end)\\b", text, caseInsensitive: true) else { continue }
                 named += 1
-                let (title, start) = parseEvent(text, now: now, market: market)
+                let parsed = parseEventDetailed(text, now: now, market: market)
+                let title = parsed.title, start = parsed.start
                 guard !title.isEmpty else { continue }
                 if let start, now.timeIntervalSince(start) > 8 * 3600 { continue }       // long over
                 if let start, start.timeIntervalSince(now) > 6 * 24 * 3600 { continue }  // stale or far off
@@ -347,10 +351,12 @@ enum ChannelCatalog {
                     existing.feeds.append(channel.id)
                     eventsByKey[key] = existing
                 } else {
-                    eventsByKey[key] = LiveEvent(
+                    var event = LiveEvent(
                         id: "ev|\(key)", title: title, league: eventLeague, start: start,
                         feeds: [channel.id], family: family, market: market
                     )
+                    if parsed.guessed { event.startGuessed = true }
+                    eventsByKey[key] = event
                 }
             }
             families.append(EventFamily(
@@ -869,8 +875,15 @@ enum ChannelCatalog {
     }
 
     static func parseEvent(_ text: String, now: Date, market: String? = nil) -> (String, Date?) {
+        let parsed = parseEventDetailed(text, now: now, market: market)
+        return (parsed.title, parsed.start)
+    }
+
+    /// As `parseEvent`, plus whether the day was guessed (a clock time only).
+    static func parseEventDetailed(_ text: String, now: Date, market: String? = nil) -> (title: String, start: Date?, guessed: Bool) {
         var title = text
         var start: Date?
+        var guessed = false
         let usEastern = TimeZone(identifier: "America/New_York") ?? .current
         // Unmarked times follow the provider's country when it has one;
         // otherwise US formats are Eastern and European formats UK time.
@@ -895,10 +908,10 @@ enum ChannelCatalog {
             let pm = ampm.lowercased() == "pm"
             return h % 12 + (pm ? 12 : 0)
         }
-        /// US Eastern when the match says "ET", else the provider's zone.
-        func zoneOf(_ r: Range<String.Index>) -> TimeZone {
-            RX.test("\\bET\\b", String(title[r])) ? usEastern : eastern
-        }
+        /// AM/PM times are a US habit (a UK provider writes "Oct 22 08:15 PM"
+        /// for an 8:15 PM ET kickoff), so they're US Eastern. Providers that
+        /// differ are corrected by the offset learned from scheduled games.
+        func zoneOf(_ r: Range<String.Index>) -> TimeZone { usEastern }
         func groups(_ pattern: String) -> ([String], Range<String.Index>)? {
             guard let regex = RX.get(pattern, caseInsensitive: true),
                   let m = regex.firstMatch(in: title, range: NSRange(title.startIndex..<title.endIndex, in: title)),
@@ -1014,6 +1027,7 @@ enum ChannelCatalog {
                 let today = cal.dateComponents([.year, .month, .day], from: now)
                 if let y = today.year, let mo = today.month, let d = today.day {
                     start = date(y, mo, d, hour24(h, p[2]), mi, zone)
+                    guessed = start != nil
                 }
             }
             title.removeSubrange(r)
@@ -1035,7 +1049,7 @@ enum ChannelCatalog {
         title = title.rxReplace("\\s*\\|\\s*", with: " · ")
         title = title.rxReplace("^[A-Za-z]{3}, \\d{1,2}/\\d{1,2}\\s+", with: "")
         title = title.trimmingCharacters(in: CharacterSet.whitespaces.union(CharacterSet(charactersIn: "|-–:,")))
-        return (title, start)
+        return (title, start, guessed)
     }
 
     private static func eventKey(title: String, start: Date?) -> String {

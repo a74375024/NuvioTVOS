@@ -327,7 +327,8 @@ final class SportsData: ObservableObject {
 
     /// Setup: teams for leagues picked there but not saved yet.
     func requestRosters(_ shorts: Set<String>) {
-        wantedRosters = shorts
+        // Only leagues with a schedule have teams ("S:Golf" has none).
+        wantedRosters = shorts.filter { short in Self.leagues.contains { $0.short == short } }
         leaguesChanged()
     }
 
