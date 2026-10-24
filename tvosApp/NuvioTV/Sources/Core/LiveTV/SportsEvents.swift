@@ -130,6 +130,8 @@ enum SportsMatcher {
         RX.test("\\b(nfl|nba|wnba|nhl|mlb|mls|nwsl|ncaa|college|basketball|football|hockey|baseball|soccer|f[uú]tbol|b[eé]isbol|baloncesto)\\b",
                 title, caseInsensitive: true)
     }
+
+    struct ProviderEvent {
         let id: String
         let title: String
         let league: String
