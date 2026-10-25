@@ -1378,15 +1378,17 @@ extension SportsParse {
         for phrase in ["Grand Prix", "Gran Premio", "Grande Prêmio", "Grande Premio", "Grand Prize"] {
             cleaned = cleaned.replacingOccurrences(of: phrase, with: "GP", options: .caseInsensitive)
         }
-        let words = cleaned.split(separator: " ").filter { !($0.count == 4 && $0.allSatisfy(\.isNumber)) }
+        let words: [String] = cleaned.components(separatedBy: " ").filter { word in
+            !word.isEmpty && !(word.count == 4 && word.allSatisfy { $0.isNumber })
+        }
         guard let gp = words.firstIndex(where: { $0.uppercased() == "GP" }) else { return words.joined(separator: " ") }
         // The place is the word before "GP" ("Australian GP"), else the last
         // one after it ("Formula 1 GP de Monaco" → "Monaco GP").
         if gp > 0 {
             let before = words[gp - 1]
-            if before.count >= 3, before.contains(where: \.isLetter), before.uppercased() != "F1" { return String(before) + " GP" }
+            if before.count >= 3, before.contains(where: { $0.isLetter }), before.uppercased() != "F1" { return before + " GP" }
         }
-        if gp + 1 < words.count, let last = words.last { return String(last) + " GP" }
+        if gp + 1 < words.count, let last = words.last { return last + " GP" }
         return cleaned
     }
 

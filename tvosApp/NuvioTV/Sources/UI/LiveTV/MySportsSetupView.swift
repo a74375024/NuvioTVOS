@@ -355,6 +355,7 @@ struct MySportsSetupView: View {
             case .month: return total + 1
             case .week: return total + 2
             case .days(let count): return total + count
+            case .current: return total + 1
             }
         } + (pickedLeagues.contains(where: \.college) ? 1 : 0)
     }
