@@ -2976,6 +2976,7 @@ final class LiveTVStore: ObservableObject {
         let lineupEntries = lineupIDs.compactMap { entry(id: $0) }
         let browse = browseEntries
         let allEntries = entries
+        let f1Sources = f1ChannelSources(lineup: lineup)
         let entryInfo = self.entryInfo
         let hidden = hiddenGroups
         var previousMap: [String: String] = [:]
@@ -3039,8 +3040,17 @@ final class LiveTVStore: ObservableObject {
                 }
             }
             let network = SportsNetworkMap.networkSources(for: games, index: channelIndex)
+            // F1 sessions are also on the F1 channels (Sky Sports F1, DAZN F1, Canal+ F1…).
+            var channelSources = network.sources
+            if !f1Sources.isEmpty {
+                for game in games where game.leagueShort == "F1" && !game.completed {
+                    var list = channelSources[game.id] ?? []
+                    for source in f1Sources where !list.contains(where: { $0.channelID == source.channelID }) { list.append(source) }
+                    channelSources[game.id] = list
+                }
+            }
             guard let built = SportsMatcher.build(
-                games: games, channelSources: network.sources, events: providerEvents, listings: listings,
+                games: games, channelSources: channelSources, events: providerEvents, listings: listings,
                 preferSpanish: preferSpanish, now: now, previousIDs: previousIDs, schools: schools, rosters: rosters,
                 shouldStop: {
                     let free = os_proc_available_memory()
@@ -3410,6 +3420,41 @@ final class LiveTVStore: ObservableObject {
         if !cameras(for: event).isEmpty {
             flash(L10n.string("live_cameras_hint", fallback: "Press ▼ for onboard cameras"))
         }
+    }
+
+    // MARK: F1 channels
+
+    /// Channels that carry every F1 session: Sky Sports F1 (UK, Germany,
+    /// Italy), DAZN F1, Canal+ F1, Viaplay F1, F1 TV's main feeds. English
+    /// ones first. Worked out once per channel list.
+    private var f1ChannelCache: (key: String, sources: [EventSource])?
+
+    private func f1ChannelSources(lineup: Set<String>) -> [EventSource] {
+        let key = "\(entriesRevision)|\(entries.count)|\(lineup.count)"
+        if let f1ChannelCache, f1ChannelCache.key == key { return f1ChannelCache.sources }
+        var english: [EventSource] = []
+        var others: [EventSource] = []
+        for entry in entries {
+            let name = entry.name
+            guard name.range(of: "F1", options: .caseInsensitive) != nil || name.range(of: "formula", options: .caseInsensitive) != nil else { continue }
+            let lower = name.lowercased()
+            let dedicated = lower.contains("sky sport f1") || lower.contains("sky sports f1") || lower.contains("dazn f1")
+                || lower.contains("canal+ f1") || lower.contains("canal+ formula") || lower.contains("viaplay") && lower.contains("f1")
+                || lower.contains("f1 tv main") || lower.contains("ziggo") && lower.contains("f1")
+            guard dedicated, !SpecialFeeds.isCameraName(name), !lower.contains("tracker"), !lower.contains("data"),
+                  !lower.contains("pit lane") else { continue }
+            let inLineup = lineup.contains(entry.id)
+            let isEnglish = lower.contains("sky sports f1") || lower.contains("english")
+                || (lower.contains("sky sport f1") && (lower.hasPrefix("uk") || lower.hasPrefix("vip") || lower.hasPrefix("now") || lower.hasPrefix("4k")))
+            let spanish = lower.contains("dazn f1") || lower.contains("spanish") || lower.hasPrefix("(es)") || lower.hasPrefix("es:")
+            let source = EventSource(channelID: entry.id, kind: inLineup ? .lineup : .guide, spanish: spanish,
+                                     detail: L10n.string("live_event_f1_channel", fallback: "F1 channel"),
+                                     rank: isEnglish ? 3 : 4)
+            if isEnglish { english.append(source) } else { others.append(source) }
+        }
+        let sources = english + others
+        f1ChannelCache = (key, sources)
+        return sources
     }
 
     // MARK: Race cameras and whip-arounds

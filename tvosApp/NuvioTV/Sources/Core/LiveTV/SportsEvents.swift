@@ -122,7 +122,10 @@ struct SportsEvent: Identifiable, Hashable, Codable {
             case .postponed: return .postponed
             case .live, .delayed: if !stale { return .live }
             case .final: return .finished
-            case .pre: if start != nil, !stale { return .upcoming }
+            case .pre:
+                // Racing statuses can lag behind the green flag: past its
+                // start, the clock decides.
+                if let start, !stale, !(game?.racing == true && now >= start) { return .upcoming }
             }
         }
         guard let start else { return .unknownTime }

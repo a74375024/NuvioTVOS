@@ -216,7 +216,8 @@ enum SpecialFeeds {
         for channel in candidates where seen.insert(channel.id).inserted {
             let title = channel.name.components(separatedBy: "|").last ?? channel.name
             let lower = title.lowercased()
-            guard !words(title).isDisjoint(with: key) else { continue }
+            // Its own name, or a NASCAR feed that names no race ("NASCAR: No 5 Kyle Larson").
+            guard !words(title).isDisjoint(with: key) || lower.contains("nascar") else { continue }
             if let car = carCamera(title) {
                 // "YellaWood 500: No. 5 Kyle Larson" (HBO's in-car feeds).
                 result.append(CameraFeed(channel: channel, title: car.driver, detail: "No. \(car.number)", kind: .driver,

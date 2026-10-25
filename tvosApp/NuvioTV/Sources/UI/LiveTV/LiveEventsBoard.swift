@@ -572,7 +572,9 @@ final class LiveEventsModel: ObservableObject {
         for event in events where !event.sources.isEmpty && !isCameraFeed(event)
             && (event.league == "Motorsport" || event.league == "Other" || event.league.isEmpty) {
             let title = event.title.lowercased()
-            for (race, list) in keys where !found.contains(race) && list.contains(where: { title.contains($0) }) { found.insert(race) }
+            let nascarRace = event.game?.leagueShort == "NASCAR"
+            for (race, list) in keys where !found.contains(race)
+                && (list.contains(where: { title.contains($0) }) || (nascarRace && race.contains("nascar"))) { found.insert(race) }
             if found.count == byRace.count { break }
         }
         for race in found { hidden.formUnion(byRace[race] ?? []) }
