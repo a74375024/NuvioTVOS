@@ -3447,10 +3447,12 @@ final class LiveTVStore: ObservableObject {
             let dedicated = lower.contains("sky sport f1") || lower.contains("sky sports f1") || lower.contains("dazn f1")
                 || lower.contains("canal+ f1") || lower.contains("canal+ formula") || lower.contains("viaplay") && lower.contains("f1")
                 || lower.contains("f1 tv main") || lower.contains("ziggo") && lower.contains("f1")
+                || lower == "f1 tv" || lower == "f1: f1-tv"
             guard dedicated, !SpecialFeeds.isCameraName(name), !lower.contains("tracker"), !lower.contains("data"),
                   !lower.contains("pit lane") else { continue }
             let inLineup = lineup.contains(entry.id)
             let isEnglish = lower.contains("sky sports f1") || lower.contains("english") || lower.contains("f1 tv main")
+                || lower == "f1 tv" || lower == "f1: f1-tv"
                 || (lower.contains("sky sport f1") && (lower.hasPrefix("uk") || lower.hasPrefix("vip") || lower.hasPrefix("now") || lower.hasPrefix("4k")))
             let spanish = lower.contains("dazn f1") || lower.contains("spanish") || lower.hasPrefix("(es)") || lower.hasPrefix("es:")
             // "Likely, not certain" (like a team's own channel): tried after

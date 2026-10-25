@@ -69,7 +69,7 @@ enum SpecialFeeds {
         let lower = name.lowercased()
         return lower.contains("f1 cam") || lower.contains("f1 tv cam") || lower.contains("driver cam")
             || (lower.contains("multiview") && (lower.contains("nascar") || lower.contains("driver")))
-            || carCamera(lower) != nil
+            || carCamera(lower) != nil || isF1CameraName(name)
     }
 
     /// An in-car camera named by car: "YellaWood 500: No. 5 Kyle Larson
@@ -180,37 +180,76 @@ enum SpecialFeeds {
     }
 
     private static func f1Cameras(eventFeeds: [LiveTVChannel], candidates: [LiveTVChannel]) -> [CameraFeed] {
-        // One source of cams: the same provider family as the race feed when
-        // there's a choice ("(Apple) (F1) …" → "(Apple F1 CAM) …").
+        // The provider family of the race feed first ("(Apple) (F1) …" →
+        // "(Apple F1 CAM) …"); every other set of the same cameras (F1 TV
+        // cams, "Driver | Team | CODE" channels) joins as automatic backups.
         let apple = candidates.filter { $0.name.lowercased().contains("apple f1 cam") }
         let f1tv = candidates.filter { $0.name.lowercased().contains("f1 tv cam") }
-        let prefersApple = eventFeeds.contains { $0.name.lowercased().contains("apple") }
-        let preferred = prefersApple ? apple : f1tv
-        let pool = preferred.isEmpty ? (prefersApple ? f1tv : apple) : preferred
-        var result = ownFeeds(eventFeeds)
-        var seen = Set<String>()
-        for channel in pool {
-            guard let close = channel.name.firstIndex(of: ")") else { continue }
-            let label = channel.name[channel.name.index(after: close)...].trimmingCharacters(in: .whitespaces)
-            guard !label.isEmpty, seen.insert(label.lowercased()).inserted else { continue }
-            let lower = label.lowercased()
-            if lower.contains("mixed") {
-                result.append(CameraFeed(channel: channel, title: "Mixed onboard", detail: "Switches cars", kind: .mixed, team: nil))
-            } else if lower.contains("tracker") {
-                result.append(CameraFeed(channel: channel, title: "Driver Tracker", detail: "Bird's-eye map", kind: .tracker, team: nil))
-            } else if lower.contains("data") {
-                result.append(CameraFeed(channel: channel, title: "Driver Data", detail: "Live telemetry", kind: .data, team: nil))
-            } else if let podium = lower.range(of: "^p[1-3]\\b", options: .regularExpression) {
-                let place = lower[podium].uppercased()
-                result.append(CameraFeed(channel: channel, title: "\(place) driver", detail: "Follows \(place)", kind: .podium, team: nil))
-            } else {
-                let team = f1Teams.first { lower.hasPrefix($0.name.lowercased() + " ") }
-                let driver = team.map { String(label.dropFirst($0.name.count)).trimmingCharacters(in: .whitespaces) } ?? label
-                result.append(CameraFeed(channel: channel, title: driver, detail: team?.name ?? "Onboard",
-                                         kind: .driver, team: team?.name))
-            }
+        let others = candidates.filter { channel in
+            let lower = channel.name.lowercased()
+            return !lower.contains("apple f1 cam") && !lower.contains("f1 tv cam") && isF1CameraName(channel.name)
         }
-        return sorted(result)
+        let prefersApple = eventFeeds.contains { $0.name.lowercased().contains("apple") }
+        var result = ownFeeds(eventFeeds)
+        for channel in (prefersApple ? apple + f1tv : f1tv + apple) + others {
+            if let feed = f1Camera(channel) { result.append(feed) }
+        }
+        return sorted(result, f1: true)
+    }
+
+    /// The other F1 camera sets: "Lewis Hamilton | Ferrari | HAM",
+    /// "F1: LEWIS HAMILTON | FERRARI | HAM", "F1 DATA", "F1: F1-TRACKER".
+    static func isF1CameraName(_ name: String) -> Bool {
+        let lower = name.lowercased().trimmingCharacters(in: .whitespaces)
+        if ["f1 data", "f1 tracker", "f1: f1-data", "f1: f1-tracker"].contains(lower) { return true }
+        return pipeDriver(name) != nil
+    }
+
+    /// "F1: LEWIS HAMILTON | FERRARI | HAM" → ("Lewis Hamilton", "Ferrari").
+    private static func pipeDriver(_ name: String) -> (driver: String, team: String?)? {
+        guard name.contains(" | ") else { return nil }
+        var text = name.trimmingCharacters(in: .whitespaces)
+        if text.uppercased().hasPrefix("F1: ") { text = String(text.dropFirst(4)) }
+        let parts = text.components(separatedBy: " | ").map { $0.trimmingCharacters(in: .whitespaces) }
+        guard parts.count == 3, parts[2].count == 3, parts[2].allSatisfy({ $0.isLetter }), parts[2] == parts[2].uppercased(),
+              parts[0].contains(" ") else { return nil }
+        let driver = parts[0] == parts[0].uppercased() ? parts[0].capitalized : parts[0]
+        // Only an F1 team ("BBC One | UK | ENG" isn't a driver).
+        guard let team = f1Teams.first(where: { $0.name.caseInsensitiveCompare(parts[1]) == .orderedSame })?.name else { return nil }
+        return (driver, team)
+    }
+
+    /// One F1 camera channel as a camera, in any of the naming sets.
+    private static func f1Camera(_ channel: LiveTVChannel) -> CameraFeed? {
+        if let pipe = pipeDriver(channel.name) {
+            return CameraFeed(channel: channel, title: pipe.driver, detail: pipe.team ?? "Onboard", kind: .driver, team: pipe.team)
+        }
+        let label: String
+        if let close = channel.name.firstIndex(of: ")") {
+            label = channel.name[channel.name.index(after: close)...].trimmingCharacters(in: .whitespaces)
+        } else {
+            // "F1 DATA", "F1: F1-TRACKER".
+            label = channel.name.replacingOccurrences(of: "F1:", with: "").replacingOccurrences(of: "F1-", with: "")
+                .replacingOccurrences(of: "F1 ", with: "").trimmingCharacters(in: .whitespaces)
+        }
+        guard !label.isEmpty else { return nil }
+        let lower = label.lowercased()
+        if lower.contains("mixed") {
+            return CameraFeed(channel: channel, title: "Mixed onboard", detail: "Switches cars", kind: .mixed, team: nil)
+        }
+        if lower.contains("tracker") {
+            return CameraFeed(channel: channel, title: "Driver Tracker", detail: "Bird's-eye map", kind: .tracker, team: nil)
+        }
+        if lower.contains("data") {
+            return CameraFeed(channel: channel, title: "Driver Data", detail: "Live telemetry", kind: .data, team: nil)
+        }
+        if let podium = lower.range(of: "^p[1-3]\\b", options: .regularExpression) {
+            let place = lower[podium].uppercased()
+            return CameraFeed(channel: channel, title: "\(place) driver", detail: "Follows \(place)", kind: .podium, team: nil)
+        }
+        let team = f1Teams.first { lower.hasPrefix($0.name.lowercased() + " ") }
+        let driver = team.map { String(label.dropFirst($0.name.count)).trimmingCharacters(in: .whitespaces) } ?? label
+        return CameraFeed(channel: channel, title: driver, detail: team?.name ?? "Onboard", kind: .driver, team: team?.name)
     }
 
     private static func nascarCameras(event: SportsEvent, eventFeeds: [LiveTVChannel], candidates: [LiveTVChannel]) -> [CameraFeed] {
@@ -251,11 +290,19 @@ enum SpecialFeeds {
 
     /// One entry per camera (the same driver on several feeds keeps the
     /// others as backups), in kind order.
-    private static func sorted(_ feeds: [CameraFeed]) -> [CameraFeed] {
+    private static func sorted(_ feeds: [CameraFeed], f1: Bool = false) -> [CameraFeed] {
         var merged: [CameraFeed] = []
         var index: [String: Int] = [:]
         for feed in feeds {
-            let key = "\(feed.kind.rawValue)|\(feed.title.lowercased())"
+            // F1 drivers by surname (one per surname on the grid): "Carlos
+            // Sainz Jr." and "Carlos Sainz", "Kimi Antonelli" and "Andrea Kimi
+            // Antonelli" are one camera.
+            var name = feed.title.folding(options: [.diacriticInsensitive, .caseInsensitive], locale: nil).lowercased()
+            if f1, feed.kind == .driver {
+                name = name.replacingOccurrences(of: " jr.", with: "").replacingOccurrences(of: " jr", with: "")
+                name = name.split(separator: " ").last.map(String.init) ?? name
+            }
+            let key = "\(feed.kind.rawValue)|\(name)"
             if let at = index[key] {
                 merged[at].alternates.append(feed.channel)
             } else {
