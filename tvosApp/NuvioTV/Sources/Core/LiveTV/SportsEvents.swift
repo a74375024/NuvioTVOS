@@ -105,12 +105,16 @@ struct SportsEvent: Identifiable, Hashable, Codable {
     /// if later), then "may have ended" for half an hour, then gone.
     func state(at now: Date) -> State {
         if let game, game.postponed { return .postponed }
+        // The scoreboard's word, while it's believable: a game still "live"
+        // half a day after its start (a status that never flipped, a fight
+        // card with a scrapped bout) falls back to the usual timing.
         if let live {
+            let stale = start.map { now.timeIntervalSince($0) > max(12 * 3600, expectedLength * 2) } ?? false
             switch live {
             case .postponed: return .postponed
-            case .live, .delayed: return .live
+            case .live, .delayed: if !stale { return .live }
             case .final: return .finished
-            case .pre: if start != nil { return .upcoming }
+            case .pre: if start != nil, !stale { return .upcoming }
             }
         }
         guard let start else { return .unknownTime }

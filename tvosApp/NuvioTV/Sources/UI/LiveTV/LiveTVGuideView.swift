@@ -1791,6 +1791,11 @@ struct LiveTVOverlay: View {
                         .transition(.move(edge: .leading).combined(with: .opacity))
                 }
             }
+            if overlayState.camerasOpen, store.isWatching, store.overlay == nil {
+                LiveCameraPanel()
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                    .zIndex(4)
+            }
             if let overlay = store.overlay {
                 card(overlay)
                     .transition(.opacity)
@@ -1840,6 +1845,7 @@ struct LiveTVOverlay: View {
         }
         .animation(.easeInOut(duration: 0.3), value: store.overlay)
         .animation(.easeOut(duration: 0.25), value: overlayState.miniGuideOpen)
+        .animation(.easeOut(duration: 0.25), value: overlayState.camerasOpen)
         .animation(.easeOut(duration: 0.25), value: reminders.due)
         .onAppear { reminders.startChecking() }
         .animation(.easeInOut(duration: 0.25), value: store.playbackNote)

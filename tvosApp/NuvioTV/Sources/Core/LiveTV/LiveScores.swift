@@ -154,7 +154,8 @@ final class LiveScores: ObservableObject {
             let phase = statuses[game.id]?.phase
             if phase == .final || phase == .postponed { continue }
             if phase == nil, (missing[game.id] ?? 0) >= 3 { continue }
-            let inProgress = phase == .live || phase == .delayed
+            // A game "live" for half a day is a status that never flipped: stop asking.
+            let inProgress = (phase == .live || phase == .delayed) && now <= game.start.addingTimeInterval(12 * 3600)
             let inWindow = !game.completed && now >= game.start.addingTimeInterval(-5 * 60)
                 && now <= game.start.addingTimeInterval(6 * 3600)
             guard inProgress || inWindow else { continue }

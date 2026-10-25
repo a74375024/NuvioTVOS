@@ -13,10 +13,12 @@ import os
 final class LiveOverlayState: ObservableObject {
     static let shared = LiveOverlayState()
     @Published var miniGuideOpen = false
+    /// The race cameras panel (Down while watching a race with cameras).
+    @Published var camerasOpen = false
     /// A "starting now" reminder card is up and wants the remote.
     @Published var reminderShowing = false
 
-    var blocksPlayerInput: Bool { miniGuideOpen || reminderShowing }
+    var blocksPlayerInput: Bool { miniGuideOpen || camerasOpen || reminderShowing }
 }
 
 @MainActor
@@ -227,10 +229,14 @@ final class LiveTVStore: ObservableObject {
     /// the mini guide then lists games, and Up / Down flip between them.
     @Published private(set) var watchingEventID: String?
     /// That game, for Try Again.
-    private var watchingEvent: SportsEvent?
+    private(set) var watchingEvent: SportsEvent?
     // Failover state for what's playing.
     private var candidates: [LiveTVChannel] = []
     private var candidateIndex = 0
+    /// The feed actually playing (a race's stand-in channel aside).
+    var playingFeedID: String? { candidateIndex < candidates.count ? candidates[candidateIndex].id : nil }
+    /// The race camera on screen, for Try Again.
+    private var watchingCamera: CameraFeed?
     private var playingMetaID: String?
     private var sawFirstFrame = false
     private var surfStep = 0
@@ -3385,12 +3391,97 @@ final class LiveTVStore: ObservableObject {
         surfStep = 0
         watchingEventID = event.id
         watchingEvent = event
+        watchingCamera = nil
         tune(display, candidates: candidates, from: 0, followFeed: false)
+        if !cameras(for: event).isEmpty {
+            flash(L10n.string("live_cameras_hint", fallback: "Press ▼ for onboard cameras"))
+        }
+    }
+
+    // MARK: Race cameras and whip-arounds
+
+    /// Channels that could be a race camera (indexed once per channel list).
+    private var cameraIndex: [LiveTVChannel] = []
+    private var cameraIndexKey = -1
+    private var cameraCache: (eventID: String, key: Int, feeds: [CameraFeed])?
+
+    private func cameraCandidates() -> [LiveTVChannel] {
+        let key = (channels.count &* 31 &+ entriesRevision) &* 31 &+ (channels.last?.id.hashValue ?? 0)
+        if key != cameraIndexKey {
+            cameraIndexKey = key
+            cameraIndex = channels.filter { SpecialFeeds.isCameraName($0.name) }
+        }
+        return cameraIndex
+    }
+
+    /// An event's cameras and other views (F1 onboards, NASCAR driver cams),
+    /// best first; empty for events without any.
+    func cameras(for event: SportsEvent) -> [CameraFeed] {
+        guard SpecialFeeds.isF1(event) || SpecialFeeds.isNASCAR(event) else { return [] }
+        let candidates = cameraCandidates()
+        if let cache = cameraCache, cache.eventID == event.id, cache.key == cameraIndexKey { return cache.feeds }
+        let feeds = SpecialFeeds.cameras(for: event, eventFeeds: event.feeds.compactMap { channel(id: $0.channelID) },
+                                         candidates: candidates)
+        cameraCache = (event.id, cameraIndexKey, feeds)
+        return feeds
+    }
+
+    /// The cameras of the game on screen.
+    func currentCameras() -> [CameraFeed] {
+        guard let event = watchingEvent, event.id == watchingEventID else { return [] }
+        return cameras(for: event)
+    }
+
+    func openCameras() {
+        guard isWatching, overlay == nil, !currentCameras().isEmpty else { return }
+        LiveOverlayState.shared.miniGuideOpen = false
+        LiveOverlayState.shared.camerasOpen = true
+    }
+
+    func closeCameras() {
+        LiveOverlayState.shared.camerasOpen = false
+    }
+
+    /// Switches to a camera; the race stays the game on screen (the guide,
+    /// Up / Down and the cameras panel keep working).
+    func watchCamera(_ feed: CameraFeed) {
+        closeCameras()
+        let playing = playingFeedID
+        guard isWatching, feed.channel.id != playing, !feed.alternates.contains(where: { $0.id == playing }) else { return }
+        watchingCamera = feed
+        playerOnScreen = false
+        playerMetaID = nil
+        leavePlayer?()
+        surfStep = 0
+        var list: [LiveTVChannel] = entry(id: feed.channel.id) != nil ? versions(of: feed.channel) : [feed.channel]
+        for alternate in feed.alternates where !list.contains(alternate) { list.append(alternate) }
+        tune(feed.channel, candidates: list, from: 0, followFeed: false)
+    }
+
+    /// Whip-around channels in the guide (RedZone, Strike Zone, conference
+    /// feeds), My Lineup first; worked out once per channel list.
+    private var whipCache: (key: Int, list: [(whip: SpecialFeeds.Whip, channel: LiveTVChannel, inLineup: Bool)])?
+
+    func whipChannels() -> [(whip: SpecialFeeds.Whip, channel: LiveTVChannel, inLineup: Bool)] {
+        let key = (entries.count &* 31 &+ entriesRevision) &* 31 &+ lineupIDs.count
+        if let whipCache, whipCache.key == key { return whipCache.list }
+        var list: [(whip: SpecialFeeds.Whip, channel: LiveTVChannel, inLineup: Bool)] = []
+        for entry in entries {
+            guard let whip = SpecialFeeds.whip(named: entry.name) else { continue }
+            list.append((whip, entry, lineupIDs.contains(entry.id)))
+        }
+        list.sort { a, b in a.inLineup != b.inLineup ? a.inLineup : false }
+        whipCache = (key, list)
+        return list
     }
 
     /// Try Again on a failed tune: the game again (with all its sources), or the channel.
     func retry(_ channel: LiveTVChannel) {
-        if let event = watchingEvent, event.id == watchingEventID {
+        if let camera = watchingCamera, camera.channel.id == channel.id, watchingEventID != nil {
+            var list: [LiveTVChannel] = entry(id: camera.channel.id) != nil ? versions(of: camera.channel) : [camera.channel]
+            for alternate in camera.alternates where !list.contains(alternate) { list.append(alternate) }
+            tune(camera.channel, candidates: list, from: 0, followFeed: false)
+        } else if let event = watchingEvent, event.id == watchingEventID {
             watchSportsEvent(event)
         } else {
             watch(channel)
@@ -3483,6 +3574,7 @@ final class LiveTVStore: ObservableObject {
     /// Leaving the player or the tuning card.
     func stopWatching() {
         LiveOverlayState.shared.miniGuideOpen = false
+        LiveOverlayState.shared.camerasOpen = false
         watchingEventID = nil
         watchingEvent = nil
         // The provider may take a moment to let go of the stream: the guide

@@ -150,6 +150,8 @@ struct EventWhere: Equatable {
     var favorite = false
     /// "World Series · Game 1", "Sunday Night", "League Phase".
     var tag: String?
+    /// The tag is an alert ("RED ZONE"): shown in red.
+    var tagAlert = false
     /// The footer pill when no channel has it: the event channel family,
     /// "Event feed", or the network (outlined) for games you don't have.
     var pill: String?
@@ -443,6 +445,69 @@ final class LiveEventsModel: ObservableObject {
         return (result, cards)
     }
 
+    struct WhipInfo {
+        let live: Int
+        let redZone: [String]
+        let subtitle: String
+    }
+
+    /// A provider feed that's one driver's camera (it lives in its race's cameras panel).
+    private static func isCameraFeed(_ event: SportsEvent) -> Bool {
+        let lower = event.title.lowercased()
+        return lower.contains("driver cam") || lower.contains("f1 cam") || lower.contains("f1 tv cam")
+    }
+
+    private static let eastern: Calendar = {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(identifier: "America/New_York") ?? .current
+        return calendar
+    }()
+
+    /// Whip-around tiles (NFL RedZone, MLB Strike Zone, soccer conference
+    /// feeds) for sports with enough games live; first in their row.
+    private func addWhipArounds(to all: inout [SportsEvent], states: inout [String: SportsEvent.State],
+                                statuses: [String: LiveStatus], store: LiveTVStore, now: Date) -> [String: WhipInfo] {
+        let channels = store.whipChannels()
+        guard !channels.isEmpty else { return [:] }
+        var info: [String: WhipInfo] = [:]
+        let groups = Dictionary(grouping: channels, by: { $0.whip.group })
+        for (group, members) in groups {
+            guard let whip = members.first?.whip else { continue }
+            if whip.sundayAfternoon {
+                let weekday = Self.eastern.component(.weekday, from: now)
+                let hour = Self.eastern.component(.hour, from: now)
+                // RedZone airs from the 1 PM ET kickoffs to the end of the late window.
+                guard weekday == 1, (13..<20).contains(hour) else { continue }
+            }
+            let liveGames = all.filter { event in
+                event.game != nil && states[event.id] == .live
+                    && (event.league == group || (group == "Soccer" && event.league == "MLS"))
+            }
+            guard liveGames.count >= whip.minimumLive else { continue }
+            let id = "whip|" + group
+            let sources = members.map { member in
+                EventSource(channelID: member.channel.id, kind: member.inLineup ? .lineup : .guide, spanish: false,
+                            detail: member.inLineup ? L10n.string("live_event_in_lineup", fallback: "In your lineup")
+                                                    : L10n.string("live_event_in_guide_short", fallback: "In your guide"))
+            }
+            let title = group == "Soccer" ? (members.first?.channel.displayName ?? whip.title) : whip.title
+            var tile = SportsEvent(id: id, title: title, league: group, leagueShort: whip.short,
+                                   start: liveGames.compactMap(\.start).min() ?? now, game: nil, sources: sources, family: nil)
+            tile.live = .live
+            all.insert(tile, at: 0)
+            states[id] = .live
+            // Games in the red zone now (the team with the ball).
+            var redZone: [String] = []
+            for event in liveGames {
+                guard let game = event.game, let status = statuses[game.id], status.phase == .live, status.redZone else { continue }
+                let team = status.possession == game.home.id ? game.home : (status.possession == game.away.id ? game.away : nil)
+                redZone.append(team.map { SportsNames.short($0, soccer: false) } ?? SportsNames.title(game))
+            }
+            info[id] = WhipInfo(live: liveGames.count, redZone: redZone, subtitle: whip.subtitle)
+        }
+        return info
+    }
+
     private struct Bucket {
         let order: Int
         let label: String
@@ -452,7 +517,8 @@ final class LiveEventsModel: ObservableObject {
         let started = Date()
         let store = LiveTVStore.shared
         let now = self.now
-        let raw = store.sportsEvents.isEmpty ? store.plainSportsEvents : store.sportsEvents
+        // Driver-cam feeds belong to their race (its cameras panel), not the rows.
+        let raw = (store.sportsEvents.isEmpty ? store.plainSportsEvents : store.sportsEvents).filter { !Self.isCameraFeed($0) }
         // Where each game stands, from the live scoreboard.
         let scores = LiveScores.shared
         let statuses = scores.statuses
@@ -463,11 +529,12 @@ final class LiveEventsModel: ObservableObject {
             return copy
         }
         let merged = Self.mergingCards(withLive, now: now, statuses: statuses)
-        let all = merged.events
+        var all = merged.events
         let newCards = merged.cards
         var states: [String: SportsEvent.State] = [:]
         states.reserveCapacity(all.count)
         for event in all { states[event.id] = event.state(at: now) }
+        let whipInfo = addWhipArounds(to: &all, states: &states, statuses: statuses, store: store, now: now)
         // Live now is only what's surely on; "likely over" stays in its sport's row.
         func isLive(_ event: SportsEvent) -> Bool { states[event.id] == .live }
         var result: [Row] = []
@@ -496,6 +563,7 @@ final class LiveEventsModel: ObservableObject {
         let labels = (
             live: L10n.string("live_events_group_live", fallback: "Live"),
             earlier: L10n.string("live_events_group_earlier", fallback: "Earlier"),
+            whip: L10n.string("live_events_group_whip", fallback: "Whip-around"),
             final: L10n.string("live_events_group_final", fallback: "Final"),
             soon: L10n.string("live_events_group_soon", fallback: "Starting Soon"),
             today: L10n.string("live_events_group_today", fallback: "Later Today"),
@@ -505,6 +573,7 @@ final class LiveEventsModel: ObservableObject {
         )
         var dayLabels: [Int: String] = [:]
         func bucket(_ event: SportsEvent) -> Bucket {
+            if event.id.hasPrefix("whip|") { return Bucket(order: -1, label: labels.whip) }
             if event.sources.isEmpty { return Bucket(order: 90, label: labels.notYours) }
             switch states[event.id] {
             case .live?: return Bucket(order: 0, label: labels.live)
@@ -556,7 +625,11 @@ final class LiveEventsModel: ObservableObject {
             }
         }
         let live = all.filter { isLive($0) && !$0.sources.isEmpty && (picked?.contains($0.league) ?? true) }
-            .sorted { ($0.start ?? .distantFuture, $0.id) < ($1.start ?? .distantFuture, $1.id) }
+            .sorted { a, b in
+                let wa = a.id.hasPrefix("whip|"), wb = b.id.hasPrefix("whip|")
+                if wa != wb { return wa }
+                return (a.start ?? .distantFuture, a.id) < (b.start ?? .distantFuture, b.id)
+            }
         if !live.isEmpty {
             result.append(Row(id: "live", title: L10n.string("live_events_now", fallback: "Live now"), events: live,
                               live: live.count, mixed: mixed(live)))
@@ -609,12 +682,13 @@ final class LiveEventsModel: ObservableObject {
         for row in result {
             for event in row.events where newPlaces[event.id] == nil {
                 newPlaces[event.id] = describe(event, parts: newCards[event.id], now: now, store: store,
-                                               statuses: statuses, endedAt: endedAt(event),
+                                               statuses: statuses, endedAt: endedAt(event), whip: whipInfo[event.id],
                                                familyNames: familyNames, mySports: mySports)
             }
         }
         mySports.scheduleTeamReminders(raw)
-        let watchable = all.filter { !$0.sources.isEmpty }
+        // The top of the screen shows a game, not a whip-around.
+        let watchable = all.filter { !$0.sources.isEmpty && !$0.id.hasPrefix("whip|") }
         let newHero = watchable.first(where: isLive) ?? watchable.first { states[$0.id] == .upcoming }
         builds += 1
         buildMS += Int(Date().timeIntervalSince(started) * 1000)
@@ -736,7 +810,7 @@ final class LiveEventsModel: ObservableObject {
     }
 
     private func describe(_ event: SportsEvent, parts: [SportsEvent]?, now: Date, store: LiveTVStore,
-                          statuses: [String: LiveStatus], endedAt: Date?,
+                          statuses: [String: LiveStatus], endedAt: Date?, whip: WhipInfo? = nil,
                           familyNames: [String: String], mySports: MySports) -> EventWhere {
         var place = EventWhere()
         let current = parts.flatMap { Self.currentPart($0, now: now, statuses: statuses) }
@@ -826,6 +900,10 @@ final class LiveEventsModel: ObservableObject {
             if status.phase == .live || status.phase == .delayed {
                 place.liveProgress = Self.clockProgress(status, league: game.league, isSoccer: game.isSoccer)
             }
+            if LiveScores.showsScores, status.phase == .live, status.redZone {
+                place.tag = L10n.string("live_event_red_zone", fallback: "RED ZONE")
+                place.tagAlert = true
+            }
             if LiveScores.showsScores, status.phase != .pre {
                 let topIsHome = game.isSoccer
                 place.topScore = topIsHome ? status.homeScore : status.awayScore
@@ -884,6 +962,19 @@ final class LiveEventsModel: ObservableObject {
                 : L10n.string("live_event_not_in_channels", fallback: "Not in your channels")
         } else {
             place.footer = L10n.string("live_event_not_in_channels", fallback: "Not in your channels")
+        }
+        // A whip-around: what it's showing across the sport.
+        if let whip {
+            place.tag = L10n.string("live_event_whip_tag", fallback: "WHIP-AROUND")
+            place.title = event.title
+            if LiveScores.showsScores, !whip.redZone.isEmpty {
+                place.subtitle = L10n.format("live_event_red_zone_now", fallback: "Red zone: %@", whip.redZone.joined(separator: ", "))
+            } else {
+                place.subtitle = whip.subtitle
+            }
+            place.footer = whip.live == 1
+                ? L10n.string("live_event_one_game_live", fallback: "1 game live")
+                : L10n.format("live_event_n_games_live", fallback: "%d games live", whip.live)
         }
         return place
     }
@@ -1038,10 +1129,11 @@ struct LiveEventTile: View {
                 Text(tag)
                     .font(.system(size: 15, weight: .heavy))
                     .lineLimit(1)
-                    .foregroundColor(focused ? .white : .black)
+                    .foregroundColor(place.tagAlert || focused ? .white : .black)
                     .padding(.horizontal, 7)
                     .padding(.vertical, 2)
-                    .background(RoundedRectangle(cornerRadius: 6).fill(focused ? Color(white: 0.1) : Color.white.opacity(0.9)))
+                    .background(RoundedRectangle(cornerRadius: 6).fill(place.tagAlert ? Color(red: 0.78, green: 0.16, blue: 0.16)
+                                                                       : (focused ? Color(white: 0.1) : Color.white.opacity(0.9))))
                     .layoutPriority(-1)
             } else if showLeague {
                 Text(event.leagueShort)

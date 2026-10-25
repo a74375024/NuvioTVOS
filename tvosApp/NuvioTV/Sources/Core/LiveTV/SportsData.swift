@@ -1236,6 +1236,10 @@ extension SportsParse {
         for event in events {
             guard let id = text(event["id"]) else { continue }
             let bouts = event["competitions"] as? [[String: Any]] ?? []
+            // The card itself over: every part is final, whatever its bouts say
+            // (a scrapped bout can stay "scheduled" forever).
+            let eventType = (event["status"] as? [String: Any])?["type"] as? [String: Any]
+            let cardOver = (eventType?["completed"] as? Bool) == true || text(eventType?["state"])?.lowercased() == "post"
             let anyPart = bouts.contains { cardPart($0) != nil }
             var byTime: [Int: String] = [:]
             if !anyPart {
@@ -1274,9 +1278,18 @@ extension SportsParse {
                 }
                 parts[key] = part
             }
+            // A part with fights left but none on, once a later part has begun,
+            // is over too (its remaining bouts were scrapped).
+            let order = ["early": 0, "prelims": 1, "main": 2, "": 2]
+            func laterStarted(_ key: String) -> Bool {
+                parts.contains { other in
+                    (order[other.key] ?? 2) > (order[key] ?? 2) && (other.value.done > 0 || other.value.live != nil)
+                }
+            }
             for (key, part) in parts where part.total > 0 {
-                let finished = part.done + part.postponed >= part.total
-                let phase: LivePhase = finished ? (part.done == 0 ? .postponed : .final)
+                let finished = cardOver || part.done + part.postponed >= part.total
+                    || (part.live == nil && part.done > 0 && laterStarted(key))
+                let phase: LivePhase = finished ? (part.done == 0 && !cardOver ? .postponed : .final)
                     : (part.live != nil || part.done > 0 ? .live : .pre)
                 let total = part.total - part.postponed
                 var live = LiveStatus(phase: phase, detail: phase == .final ? "Final" : "")

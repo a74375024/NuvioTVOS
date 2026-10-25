@@ -458,6 +458,11 @@ extension PlayerView {
                     ChannelSessionStore.shared.flip(by: direction == .up ? 1 : -1)
                     return
                 }
+                // A race with cameras: Down opens them (Up still changes game).
+                if LiveTVStore.shared.isWatching, direction == .down, !LiveTVStore.shared.currentCameras().isEmpty {
+                    LiveTVStore.shared.openCameras()
+                    return
+                }
                 // Live TV: Up / Down change channel too.
                 if LiveTVStore.shared.isWatching, viewModel.isLiveStream, direction == .up || direction == .down {
                     LiveTVStore.shared.flip(by: direction == .up ? 1 : -1)

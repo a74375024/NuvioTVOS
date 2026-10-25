@@ -784,6 +784,11 @@ enum ChannelCatalog {
             return .free
         }
         if callsign != nil { return .local }
+        // Racing feeds and onboard cameras ("(Apple F1 CAM) Ferrari …", "… Driver Cam").
+        if group.contains("formula") || has(lower, ["formula ?1", "formula one", "f1", "f1 cam", "f1 tv cam", "motogp", "nascar", "indycar",
+                                                    "driver cam", "driver tracker", "driver data", "mixed on board"]) {
+            return .sports
+        }
         if has(lower, ["univision", "unimas", "telemundo", "galavision", "estrella", "azteca", "telehit", "cine latino", "deportes", "tudn", "vix", "discovery familia", "cinelatino", "pasiones", "de pelicula", "de película", "canal 22", "sorpresa"]) { return .spanish }
         if has(lower, ["cnn", "msnbc", "fox news", "cnbc", "bloomberg", "newsmax", "news", "weather", "c-span", "cspan", "hln", "newsnation", "fox business", "cheddar", "yahoo finance", "scripps", "euronews", "al jazeera", "local now"]) { return .news }
         if group.contains("sport") || has(lower, ["espn", "espn2", "espnu", "fox sports", "fs1", "fs2", "nfl", "nba", "mlb", "nhl", "golf", "tennis", "bein", "sportsnet", "sec network", "acc network", "big ten", "cbs sports", "tnt sports", "yes network", "nesn", "msg", "fanduel", "bally", "marquee", "root sports", "altitude", "nbc sports", "olympic", "outdoor", "racing", "fight", "ufc", "wwe", "dazn", "pac 12", "pac-12", "redbull", "red bull", "stadium", "draftkings", "fubo sports"]) {
