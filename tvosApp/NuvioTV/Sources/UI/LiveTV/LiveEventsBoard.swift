@@ -136,6 +136,8 @@ struct CardPart: Equatable {
     /// How far into this part we are (0 before it starts, 1 once the next began).
     let fill: Double
     let current: Bool
+    /// Show its start time under it (race sessions: only the current one).
+    var timed = true
 }
 
 /// Where a tile's game is on and what the tile says, worked out once per
@@ -190,6 +192,11 @@ struct EventWhere: Equatable {
     var lastPlay: String?
     /// Progress from the game clock, when known (0…1).
     var liveProgress: Double?
+    /// A studio show (pregame, countdown): no live status of its own.
+    var studio = false
+    /// A race weekend: the latest finished session's top 3 (scores on), and its name.
+    var podium: [RaceDriver] = []
+    var podiumLabel: String?
 }
 
 // MARK: - Model
@@ -229,8 +236,13 @@ final class LiveEventsModel: ObservableObject {
         let hero: SportsEvent?
         let places: [String: EventWhere]
         let cards: [String: [SportsEvent]]
+        let studio: Set<String>
     }
     private var pending: Built?
+    /// Tiles that are studio shows (kept out of Live now and the flip list).
+    private(set) var studioIDs = Set<String>()
+    /// Event id → studio show or not (titles don't change, so worked out once).
+    private var studioCache: [String: Bool] = [:]
     /// The focused tile's key: row id + "|" + event id.
     private var focusedKey: String?
     private var lastInput = Date()
@@ -259,7 +271,8 @@ final class LiveEventsModel: ObservableObject {
             store.$events.dropFirst().sink { [weak self] _ in self?.scheduleRecompute() },
             store.$families.dropFirst().sink { [weak self] _ in self?.scheduleRecompute() },
             store.$logosRevision.dropFirst().sink { [weak self] _ in self?.scheduleRecompute() },
-            LiveScores.shared.$revision.dropFirst().sink { [weak self] _ in self?.scheduleRecompute() }
+            LiveScores.shared.$revision.dropFirst().sink { [weak self] _ in self?.scheduleRecompute() },
+            RaceData.shared.$revision.dropFirst().sink { [weak self] _ in self?.scheduleRecompute() }
         ]
         LiveScores.shared.start()
         ticker = Timer.publish(every: 30, on: .main, in: .common).autoconnect().sink { [weak self] date in
@@ -297,6 +310,7 @@ final class LiveEventsModel: ObservableObject {
     /// The part on now by its fights' status; without it, by start times.
     private static func currentPart(_ parts: [SportsEvent], now: Date, statuses: [String: LiveStatus]) -> SportsEvent? {
         guard let first = parts.first else { return nil }
+        if first.game?.racing == true { return raceCurrent(parts, now: now, statuses: statuses) }
         let phases = parts.map { part in part.game.flatMap { statuses[$0.id]?.phase } }
         if phases.contains(where: { $0 != nil }) {
             if let index = phases.firstIndex(where: { $0 == .live || $0 == .delayed }) { return parts[index] }
@@ -308,6 +322,53 @@ final class LiveEventsModel: ObservableObject {
             return parts.last
         }
         return parts.last { ($0.start ?? .distantFuture) <= now } ?? first
+    }
+
+    /// A race weekend: the session on now, else the next one not over (by
+    /// its status, else its usual length), else the last.
+    private static func raceCurrent(_ parts: [SportsEvent], now: Date, statuses: [String: LiveStatus]) -> SportsEvent? {
+        func phase(_ part: SportsEvent) -> LivePhase? { part.game.flatMap { statuses[$0.id]?.phase } }
+        // Past its usual end (plus half an hour): a status nobody refreshed
+        // while it ran (not polled while watching) doesn't hold it.
+        func over(_ part: SportsEvent) -> Bool {
+            guard let start = part.start else { return false }
+            return now > start.addingTimeInterval(part.expectedLength + 30 * 60)
+        }
+        func stale(_ part: SportsEvent) -> Bool {
+            guard let start = part.start else { return false }
+            return now > start.addingTimeInterval(12 * 3600)
+        }
+        if let live = parts.first(where: { ($0.live == .live || phase($0) == .live || phase($0) == .delayed) && !stale($0) }) {
+            return live
+        }
+        for part in parts {
+            let value = phase(part)
+            if value == .final || value == .postponed || part.game?.completed == true { continue }
+            if (value == nil || value == .pre) && over(part) { continue }
+            if (value == .live || value == .delayed) && stale(part) { continue }
+            return part
+        }
+        return parts.last
+    }
+
+    /// A race weekend's tile: the session on now (or next) decides its time,
+    /// status and where to watch; the weekend is over once its last one is.
+    private static func raceWeekendTile(id: String, parts: [SportsEvent], current: SportsEvent) -> SportsEvent {
+        var tile = SportsEvent(id: id, title: current.game?.home.name ?? current.title, league: current.league,
+                               leagueShort: current.leagueShort, start: current.start, game: current.game,
+                               sources: current.sources, family: current.family)
+        tile.listingEnd = current.listingEnd
+        tile.feedsEndedAt = current.feedsEndedAt
+        tile.moreStations = current.moreStations
+        tile.teams = current.teams
+        switch current.live {
+        case .live?, .delayed?: tile.live = .live
+        case .final?: tile.live = current.id == parts.last?.id ? .final : .pre
+        case .postponed?: tile.live = .postponed
+        case .pre?: tile.live = .pre
+        case nil: break
+        }
+        return tile
     }
 
     /// From the board: which tile is focused (its key; nil when none).
@@ -370,7 +431,8 @@ final class LiveEventsModel: ObservableObject {
         guard let rowID = guideRowID(for: eventID) else { return [] }
         let date = Date()
         return guideEvents(rowID: rowID).filter { event in
-            matches(event, eventID: eventID) || event.state(at: date) == .live || event.state(at: date) == .mayHaveEnded
+            matches(event, eventID: eventID)
+                || (!studioIDs.contains(event.id) && (event.state(at: date) == .live || event.state(at: date) == .mayHaveEnded))
         }
     }
 
@@ -403,6 +465,14 @@ final class LiveEventsModel: ObservableObject {
             let parts = indices.map { events[$0] }.sorted { ($0.start ?? .distantFuture) < ($1.start ?? .distantFuture) }
             guard let first = parts.first, let main = parts.last, let start = first.start, var game = main.game,
                   let current = currentPart(parts, now: now, statuses: statuses) else { continue }
+            if game.racing == true {
+                let id = "card|" + card
+                cards[id] = parts
+                let sortedIndices = indices.sorted()
+                replaced[sortedIndices[0]] = raceWeekendTile(id: id, parts: parts, current: current)
+                dropped.formUnion(sortedIndices.dropFirst())
+                continue
+            }
             var seen = Set<String>()
             var sources: [EventSource] = []
             for source in current.sources + parts.flatMap(\.sources) where seen.insert(source.channelID).inserted {
@@ -535,8 +605,22 @@ final class LiveEventsModel: ObservableObject {
         states.reserveCapacity(all.count)
         for event in all { states[event.id] = event.state(at: now) }
         let whipInfo = addWhipArounds(to: &all, states: &states, statuses: statuses, store: store, now: now)
+        // Studio shows (pregame, countdown, weigh-ins) aren't games: never
+        // Live now, at the end of their sport's row.
+        if studioCache.count > 4000 { studioCache.removeAll() }
+        var studio = Set<String>()
+        for event in all where event.game == nil && !event.id.hasPrefix("whip|") {
+            let value: Bool
+            if let cached = studioCache[event.id] {
+                value = cached
+            } else {
+                value = SportsMatcher.isStudioShow(event.title)
+                studioCache[event.id] = value
+            }
+            if value { studio.insert(event.id) }
+        }
         // Live now is only what's surely on; "likely over" stays in its sport's row.
-        func isLive(_ event: SportsEvent) -> Bool { states[event.id] == .live }
+        func isLive(_ event: SportsEvent) -> Bool { states[event.id] == .live && !studio.contains(event.id) }
         var result: [Row] = []
         let horizon = now.addingTimeInterval(8 * 24 * 3600)
         let showUnwatchable = SportsData.showsUnwatchable
@@ -569,12 +653,14 @@ final class LiveEventsModel: ObservableObject {
             today: L10n.string("live_events_group_today", fallback: "Later Today"),
             tomorrow: L10n.string("live_time_tomorrow", fallback: "Tomorrow"),
             postponed: L10n.string("live_events_group_postponed", fallback: "Postponed"),
-            notYours: L10n.string("live_event_not_in_channels", fallback: "Not in your channels")
+            notYours: L10n.string("live_event_not_in_channels", fallback: "Not in your channels"),
+            studio: L10n.string("live_events_group_studio", fallback: "Shows")
         )
         var dayLabels: [Int: String] = [:]
         func bucket(_ event: SportsEvent) -> Bucket {
             if event.id.hasPrefix("whip|") { return Bucket(order: -1, label: labels.whip) }
             if event.sources.isEmpty { return Bucket(order: 90, label: labels.notYours) }
+            if studio.contains(event.id) { return Bucket(order: 70, label: labels.studio) }
             switch states[event.id] {
             case .live?: return Bucket(order: 0, label: labels.live)
             case .finished?: return Bucket(order: 1, label: labels.final)
@@ -681,19 +767,33 @@ final class LiveEventsModel: ObservableObject {
         var newPlaces: [String: EventWhere] = [:]
         for row in result {
             for event in row.events where newPlaces[event.id] == nil {
-                newPlaces[event.id] = describe(event, parts: newCards[event.id], now: now, store: store,
-                                               statuses: statuses, endedAt: endedAt(event), whip: whipInfo[event.id],
-                                               familyNames: familyNames, mySports: mySports)
+                var place = describe(event, parts: newCards[event.id], now: now, store: store,
+                                     statuses: statuses, endedAt: endedAt(event), whip: whipInfo[event.id],
+                                     familyNames: familyNames, mySports: mySports)
+                if studio.contains(event.id) {
+                    place.studio = true
+                    place.tag = L10n.string("live_event_studio_tag", fallback: "STUDIO")
+                }
+                newPlaces[event.id] = place
             }
+        }
+        // Race weekends you can watch: their drivers and results (a few
+        // requests a weekend; nothing for weekends not in your channels).
+        for (id, parts) in newCards where parts.first?.game?.racing == true
+            && newPlaces[id] != nil && all.contains(where: { $0.id == id && !$0.sources.isEmpty }) {
+            RaceData.shared.refreshIfNeeded(sessions: parts.compactMap { part -> (kind: String, start: Date)? in
+                guard let start = part.start, let key = part.game?.cardKey, let cut = key.lastIndex(of: "|") else { return nil }
+                return (kind: String(key[key.index(after: cut)...]), start: start)
+            }, results: LiveScores.showsScores)
         }
         mySports.scheduleTeamReminders(raw)
         // The top of the screen shows a game, not a whip-around.
-        let watchable = all.filter { !$0.sources.isEmpty && !$0.id.hasPrefix("whip|") }
+        let watchable = all.filter { !$0.sources.isEmpty && !$0.id.hasPrefix("whip|") && !studio.contains($0.id) }
         let newHero = watchable.first(where: isLive) ?? watchable.first { states[$0.id] == .upcoming }
         builds += 1
         buildMS += Int(Date().timeIntervalSince(started) * 1000)
 
-        let built = Built(rows: result, hero: newHero, places: newPlaces, cards: newCards)
+        let built = Built(rows: result, hero: newHero, places: newPlaces, cards: newCards, studio: studio)
         // Keep the focused tile until you move (or 5 s pass).
         if let focusedKey, contains(rows, focusedKey), !contains(result, focusedKey), Date().timeIntervalSince(lastInput) < 5 {
             pending = built
@@ -710,6 +810,7 @@ final class LiveEventsModel: ObservableObject {
     private func apply(_ built: Built) {
         places = built.places
         cards = built.cards
+        studioIDs = built.studio
         rows = built.rows
         hero = built.hero
     }
@@ -734,6 +835,10 @@ final class LiveEventsModel: ObservableObject {
 
     private static func partNames(_ part: SportsEvent) -> (short: String, long: String) {
         let key = part.game?.cardKey ?? ""
+        if part.game?.racing == true, let cut = key.lastIndex(of: "|") {
+            let kind = String(key[key.index(after: cut)...])
+            return (RaceSession.short(kind), RaceSession.name(kind))
+        }
         if key.hasSuffix("|early") {
             return (L10n.string("live_card_early_short", fallback: "Early"), L10n.string("live_card_early", fallback: "Early Prelims"))
         }
@@ -820,7 +925,11 @@ final class LiveEventsModel: ObservableObject {
         place.tag = event.game?.note
 
         // Sides, or a title.
-        if let game = event.game {
+        if let game = event.game, game.racing == true {
+            // A race weekend: the Grand Prix and its circuit.
+            place.title = game.home.name
+            place.subtitle = game.venue
+        } else if let game = event.game {
             let first = game.isSoccer ? game.home : game.away
             let second = game.isSoccer ? game.away : game.home
             place.top = first
@@ -887,6 +996,38 @@ final class LiveEventsModel: ObservableObject {
                         place.top = SportsTeam(id: "b|" + a, name: a, country: status.boutACountry)
                         place.bottom = SportsTeam(id: "b|" + b, name: b, country: status.boutBCountry)
                         place.boutNow = status.phase == .live || status.phase == .delayed
+                    }
+                }
+            }
+        }
+
+        // A race weekend: each session's own fill (they're days apart), the
+        // time under the current one only, and the latest finished
+        // session's top 3 with scores on.
+        if let parts, parts.first?.game?.racing == true {
+            place.parts = parts.map { part -> CardPart in
+                let start = part.start ?? now
+                let fill: Double
+                switch part.game.flatMap({ statuses[$0.id]?.phase }) {
+                case .final?, .postponed?: fill = 1
+                case .live?, .delayed?: fill = max(0.05, min(0.95, now.timeIntervalSince(start) / part.expectedLength))
+                case .pre?: fill = 0
+                case nil: fill = part.game?.completed == true ? 1 : min(1, max(0, now.timeIntervalSince(start) / part.expectedLength))
+                }
+                let isCurrent = part.id == current?.id
+                return CardPart(label: Self.partNames(part).short, start: start, fill: fill, current: isCurrent, timed: isCurrent)
+            }
+            place.top = nil
+            place.bottom = nil
+            if LiveScores.showsScores {
+                for part in parts.reversed() {
+                    guard let start = part.start, start < now, let key = part.game?.cardKey,
+                          let cut = key.lastIndex(of: "|") else { continue }
+                    let kind = String(key[key.index(after: cut)...])
+                    if let top = RaceData.shared.top3(kind: kind, start: start) {
+                        place.podium = top
+                        place.podiumLabel = RaceSession.name(kind)
+                        break
                     }
                 }
             }
@@ -1102,7 +1243,7 @@ struct LiveEventTile: View {
         let fill: Color = focused ? .white : Color.white.opacity(watchable && state != .finished ? 0.09 : 0.06)
         return ZStack(alignment: .bottomLeading) {
             fill
-            if state == .live, place.parts.isEmpty {
+            if state == .live, place.parts.isEmpty, !place.studio {
                 Rectangle().fill((focused ? Color.black : Color.white).opacity(focused ? 0.12 : 0.15)).frame(height: 6)
                 Rectangle().fill(focused ? Color.black : Color.white.opacity(0.75))
                     .frame(width: LiveTileSize.width * CGFloat(place.liveProgress ?? event.progress(at: now)), height: 6)
@@ -1162,7 +1303,10 @@ struct LiveEventTile: View {
         let outline = ink.opacity(0.6)
         switch state {
         case .live:
-            if event.live == .delayed {
+            if place.studio {
+                // A show, not a game: on now, without the live badge.
+                pill(L10n.string("live_event_on_now", fallback: "ON NOW"), fill: .clear, foreground: ink, outline: outline)
+            } else if event.live == .delayed {
                 pill(L10n.string("live_event_delayed", fallback: "DELAYED"), fill: Color(red: 0.88, green: 0.63, blue: 0), foreground: .black)
             } else if watchable {
                 pill(L10n.string("live_badge_live", fallback: "LIVE"), fill: LiveStyle.watching, foreground: .white)
@@ -1342,6 +1486,14 @@ struct LiveEventTile: View {
                 }
                 .font(.system(size: 18))
                 .minimumScaleFactor(0.8)
+            } else if !place.podium.isEmpty {
+                podiumLine
+            } else if let subtitle = place.subtitle {
+                Text(subtitle)
+                    .font(.system(size: 18))
+                    .opacity(0.7)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
             }
             HStack(alignment: .top, spacing: 8) {
                 ForEach(Array(place.parts.enumerated()), id: \.offset) { _, part in
@@ -1352,7 +1504,7 @@ struct LiveEventTile: View {
                                 .frame(width: part.fill > 0 ? max(6, partWidth * CGFloat(part.fill)) : 0)
                         }
                         .frame(width: partWidth, height: 6)
-                        Text("\(part.label) \(shortClock.string(from: part.start))")
+                        Text(part.timed ? "\(part.label) \(shortClock.string(from: part.start))" : part.label)
                             .font(.system(size: 16, weight: part.current ? .heavy : .regular))
                             .opacity(part.current ? 1 : 0.65)
                             .lineLimit(1)
@@ -1363,6 +1515,29 @@ struct LiveEventTile: View {
             }
             .padding(.top, 3)
         }
+    }
+
+    /// A race weekend's latest finished session: "Qualifying 1 ANT 2 VER 3 HAD"
+    /// in team colors.
+    private var podiumLine: some View {
+        HStack(spacing: 8) {
+            if let label = place.podiumLabel {
+                Text(label).opacity(0.6).lineLimit(1)
+            }
+            ForEach(Array(place.podium.prefix(3).enumerated()), id: \.offset) { index, driver in
+                HStack(spacing: 4) {
+                    RoundedRectangle(cornerRadius: 2)
+                        .fill(teamColor(driver.color) ?? ink.opacity(0.4))
+                        .frame(width: 4, height: 18)
+                    Text("\(index + 1)").opacity(0.55)
+                    Text(driver.code).fontWeight(.heavy)
+                }
+                .fixedSize()
+            }
+        }
+        .font(.system(size: 17))
+        .lineLimit(1)
+        .minimumScaleFactor(0.7)
     }
 
     /// Each part's share of the timeline (the tile's inner width).

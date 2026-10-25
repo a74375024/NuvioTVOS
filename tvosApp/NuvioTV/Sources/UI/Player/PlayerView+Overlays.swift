@@ -90,7 +90,9 @@ extension PlayerView {
             case .buffering, .idle:
                 if viewModel.isSwitchingSource || viewModel.isReloadingStream || viewModel.didDetectReplacementStream || viewModel.isAdvancingEpisode || !didReportPlaybackStarted || (!viewModel.hasRenderedFirstFrame && !viewModel.isLiveStream) {
                     PlayerLoadingOverlay(
-                        backdropUrl: meta.backgroundUrl ?? meta.posterUrl,
+                        // Live TV / Live Events: the logo only (their art is a small
+                        // thumbnail that blurs when stretched to fill the screen).
+                        backdropUrl: meta.id.hasPrefix("live:") ? nil : (meta.backgroundUrl ?? meta.posterUrl),
                         logoUrl: meta.logoUrl,
                         title: meta.name,
                         message: viewModel.loadingStepMessage,
@@ -112,7 +114,9 @@ extension PlayerView {
             case .playing, .paused:
                 if viewModel.isSwitchingSource || viewModel.isReloadingStream || viewModel.didDetectReplacementStream || viewModel.isAdvancingEpisode || !didReportPlaybackStarted || (!viewModel.hasRenderedFirstFrame && !viewModel.isLiveStream) {
                     PlayerLoadingOverlay(
-                        backdropUrl: meta.backgroundUrl ?? meta.posterUrl,
+                        // Live TV / Live Events: the logo only (their art is a small
+                        // thumbnail that blurs when stretched to fill the screen).
+                        backdropUrl: meta.id.hasPrefix("live:") ? nil : (meta.backgroundUrl ?? meta.posterUrl),
                         logoUrl: meta.logoUrl,
                         title: meta.name,
                         message: viewModel.loadingStepMessage,

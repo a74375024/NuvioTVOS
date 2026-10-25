@@ -92,7 +92,13 @@ struct SportsEvent: Identifiable, Hashable, Codable {
                 if card.hasSuffix("|main") { return 4 * 3600 }
             }
             return 5 * 3600
-        case "Motorsport", "Golf": return 4 * 3600
+        case "Motorsport":
+            // A race weekend session: its own usual length.
+            if game?.racing == true, let key = game?.cardKey, let cut = key.lastIndex(of: "|") {
+                return RaceSession.length(String(key[key.index(after: cut)...]))
+            }
+            return 4 * 3600
+        case "Golf": return 4 * 3600
         default: return 2.5 * 3600
         }
     }
@@ -298,9 +304,30 @@ enum SportsMatcher {
             guard parts.count == 3 else { continue }
             cards["\(parts[0])|\(parts[1])", default: []].append(gameIndex)
         }
+        // Race weekend sessions, for feeds named after a session.
+        let raceSessions = games.indices.filter { games[$0].racing == true }
         for event in events {
             autoreleasepool {
                 let inWindow = event.start.map { $0 > low && $0 < high } ?? true
+                if inWindow, !raceSessions.isEmpty, let target = raceTarget(event, sessions: raceSessions, games: games) {
+                    stats.filtered += 1
+                    var value = entry(target)
+                    // The main broadcast first, then Sky and other feeds.
+                    let main = event.title.lowercased().contains("main broadcast")
+                    for feed in event.feeds where !value.sources.contains(where: { $0.channelID == feed }) {
+                        let source = EventSource(channelID: feed, kind: .provider, spanish: event.spanish, detail: "Provider event channel")
+                        if main, let at = value.sources.firstIndex(where: { $0.kind == .provider }) {
+                            value.sources.insert(source, at: at)
+                        } else {
+                            value.sources.append(source)
+                        }
+                    }
+                    if value.family == nil { value.family = event.family }
+                    byGame[target] = value
+                    if firstProviderID[target] == nil { firstProviderID[target] = event.id }
+                    stats.matchedEvents += 1
+                    return
+                }
                 // A card named by its number goes by the card and its times; one
                 // named only by its fighters ("UFC: Pereira vs Hill") by the fighters.
                 if inWindow, !cards.isEmpty, event.league == "Fighting", let key = fightKey(event.title),
@@ -1019,6 +1046,56 @@ enum SportsMatcher {
         if league.isEmpty || league == "Other" || league == game.league { return true }
         return sportFamilies[league]?.contains(game.league) == true
     }
+
+    /// The race session a provider feed is: an F1 feed naming the session
+    /// ("Formula 1: United States: Race [Main Broadcast]", "2617 GP F1
+    /// Qualifying") at about its time, or the session on at the feed's time.
+    private static func raceTarget(_ event: ProviderEvent, sessions: [Int], games: [SportsGame]) -> Int? {
+        // Cheap test first: most feeds aren't racing.
+        let raw = event.title + " " + event.family
+        guard raw.range(of: "f1", options: .caseInsensitive) != nil || raw.range(of: "formula", options: .caseInsensitive) != nil else {
+            return nil
+        }
+        let text = normalized(raw)
+        guard text.contains(" f1 ") || text.contains(" formula 1 ") || text.contains(" formula one ") || text.contains(" f1tv ") else {
+            return nil
+        }
+        // Cameras go to the race's cameras panel; shows around it aren't it.
+        if SpecialFeeds.isCameraName(event.title) || isStudioShow(event.title) { return nil }
+        let kind = RaceSession.kind(inTitle: normalized(event.title))
+        // A guessed day isn't a time to go by.
+        let start = event.guessed ? nil : event.start
+        guard kind != nil || start != nil else { return nil }
+        var best: (index: Int, gap: TimeInterval)?
+        for index in sessions {
+            let game = games[index]
+            if let kind, game.cardKey?.hasSuffix("|" + kind) != true { continue }
+            let gap = start.map { abs($0.timeIntervalSince(game.start)) } ?? 0
+            // A named session: the nearest of its kind (they're a week apart;
+            // a feed's clock may be hours off). Otherwise the one on then.
+            guard gap <= (kind == nil ? 90 * 60 : 14 * 3600) else { continue }
+            if best.map({ gap < $0.gap }) ?? true { best = (index, gap) }
+        }
+        return best?.index
+    }
+
+    /// A studio show (pregame, countdown, kickoff show, weigh-ins…) rather
+    /// than a game: kept out of Live now, at the end of its sport's row.
+    static func isStudioShow(_ title: String) -> Bool {
+        guard !looksLikeGame(title) else { return false }
+        let text = normalized(title)
+        return studioWords.contains { text.contains($0) }
+    }
+
+    /// Not `excluded`'s list: "Classic" is also a tournament's name.
+    private static let studioWords = [
+        " pregame ", " pre game ", " postgame ", " post game ", " countdown ", " preview ", " highlights ", " replay ",
+        " encore ", " rewind ", " recap ", " press conference ", " kickoff ", " kick off ", " gameday ",
+        " game day ", " sportscenter ", " nfl today ", " inside the nfl ", " good morning football ", " first take ",
+        " get up ", " nfl live ", " warm up ", " warmup ", " weigh in ", " weigh ins ", " media day ", " embedded ",
+        " studio ", " fantasy ", " the herd ", " pti ", " pre race ", " post race ", " build up ", " buildup ",
+        " notebook ", " paddock ", " race show ", " pre show ", " post show "
+    ]
 
     /// Studio and highlight shows around a game, not the game itself.
     private static func excluded(_ text: String) -> Bool {

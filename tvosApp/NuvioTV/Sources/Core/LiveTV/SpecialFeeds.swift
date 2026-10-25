@@ -82,6 +82,7 @@ enum SpecialFeeds {
     }
 
     static func isF1(_ event: SportsEvent) -> Bool {
+        if event.leagueShort == "F1" { return true }
         let text = (event.title + " " + event.league + " " + (event.family ?? "")).lowercased()
         return RX.test("\\b(formula ?1|formula one|f1)\\b", text)
     }

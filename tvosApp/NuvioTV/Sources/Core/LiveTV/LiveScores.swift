@@ -180,7 +180,8 @@ final class LiveScores: ObservableObject {
                 }
                 return 1800
             }
-            let days = Set(games.map { Self.etDay.string(from: $0.start) }).sorted()
+            // A race weekend's listing has every session: one request, no day.
+            let days = league.racing ? [""] : Set(games.map { Self.etDay.string(from: $0.start) }).sorted()
             var merged: [String: LiveStatus] = [:]
             var ok = false
             var bytes = 0
@@ -210,6 +211,8 @@ final class LiveScores: ObservableObject {
                 apply(merged, now: Date())
                 var interval: TimeInterval = anyLive ? (Self.showsScores ? 60 : 120) : 120
                 if bytes > 700_000 { interval = max(interval, 120) }
+                // Racing only needs the session's status.
+                if league.racing { interval = max(interval, 120) }
                 interval *= spread
                 if recent.count >= Self.hourlyPace { interval = max(interval, 300) }
                 nextDue[short] = Date().addingTimeInterval(interval)
@@ -232,7 +235,9 @@ final class LiveScores: ObservableObject {
     }
 
     private func fetch(_ league: SportsData.League, day: String) async -> Data? {
-        let address = "https://site.api.espn.com/apis/site/v2/sports/\(league.path)/scoreboard?dates=\(day)" + league.extra
+        let address = day.isEmpty
+            ? "https://site.api.espn.com/apis/site/v2/sports/\(league.path)/scoreboard"
+            : "https://site.api.espn.com/apis/site/v2/sports/\(league.path)/scoreboard?dates=\(day)" + league.extra
         guard let url = URL(string: address) else { return nil }
         var request = URLRequest(url: url)
         request.timeoutInterval = 15

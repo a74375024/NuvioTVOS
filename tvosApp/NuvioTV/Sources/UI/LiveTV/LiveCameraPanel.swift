@@ -6,6 +6,8 @@ import SwiftUI
 /// drivers first. Select switches, Play/Pause follows a driver, Back closes.
 struct LiveCameraPanel: View {
     @ObservedObject private var store = LiveTVStore.shared
+    /// Driver photos, numbers and official team colors (F1).
+    @ObservedObject private var race = RaceData.shared
     @FocusState private var focus: String?
     @State private var followed = SpecialFeeds.followedDrivers
 
@@ -77,6 +79,8 @@ struct LiveCameraPanel: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
         .ignoresSafeArea()
         .onAppear {
+            // Drivers, once a weekend (nothing when they're already saved).
+            if isF1 { race.refreshIfNeeded(sessions: [], results: false) }
             let current = store.playingFeedID
             let target = feeds.first { $0.channel.id == current || $0.alternates.contains { $0.id == current } }?.id
                 ?? quickList.first?.id ?? driverList.first?.id
@@ -84,6 +88,8 @@ struct LiveCameraPanel: View {
         }
         .onExitCommand { store.closeCameras() }
     }
+
+    private var isF1: Bool { store.watchingEvent.map(SpecialFeeds.isF1) ?? false }
 
     private func isOnScreen(_ feed: CameraFeed) -> Bool {
         guard let current = store.playingFeedID else { return false }
@@ -115,19 +121,25 @@ struct LiveCameraPanel: View {
 
     private func driverButton(_ feed: CameraFeed) -> some View {
         let focused = focus == feed.id
-        let color = Self.color(SpecialFeeds.teamColor(feed.team)) ?? Color.white.opacity(0.4)
+        let info = isF1 ? race.driver(named: feed.title) : nil
+        let color = Self.color(info?.color ?? SpecialFeeds.teamColor(feed.team)) ?? Color.white.opacity(0.4)
         let isFollowed = followed.contains(feed.title)
+        let detail = info.map { "\(feed.detail) · #\($0.number)" } ?? feed.detail
         return Button {
             store.watchCamera(feed)
         } label: {
             HStack(spacing: 10) {
-                RoundedRectangle(cornerRadius: 2).fill(color).frame(width: 5, height: 40)
+                if let info {
+                    headshot(info, color: color)
+                } else {
+                    RoundedRectangle(cornerRadius: 2).fill(color).frame(width: 5, height: 40)
+                }
                 VStack(alignment: .leading, spacing: 2) {
                     Text(feed.title)
                         .font(.system(size: 19, weight: .bold))
                         .lineLimit(1)
                         .minimumScaleFactor(0.8)
-                    Text(feed.detail + (isOnScreen(feed) ? "  ·  " + L10n.string("live_cameras_now", fallback: "now") : ""))
+                    Text(detail + (isOnScreen(feed) ? "  ·  " + L10n.string("live_cameras_now", fallback: "now") : ""))
                         .font(.system(size: 14))
                         .opacity(0.6)
                         .lineLimit(1)
@@ -151,6 +163,30 @@ struct LiveCameraPanel: View {
             followed = set
             SpecialFeeds.followedDrivers = set
         }
+    }
+
+    /// The driver's photo in a circle of the team color (initials until it loads).
+    private func headshot(_ driver: RaceDriver, color: Color) -> some View {
+        let initials = Text(driver.code)
+            .font(.system(size: 13, weight: .heavy))
+            .foregroundColor(.white.opacity(0.9))
+        return ZStack {
+            Circle().fill(color.opacity(0.75))
+            if let address = driver.headshot, let url = URL(string: address) {
+                AsyncImage(url: url) { phase in
+                    if let image = phase.image {
+                        image.resizable().scaledToFill()
+                    } else {
+                        initials
+                    }
+                }
+            } else {
+                initials
+            }
+        }
+        .frame(width: 44, height: 44)
+        .clipShape(Circle())
+        .overlay(Circle().strokeBorder(color, lineWidth: 2))
     }
 
     /// "DC0000" → the color.
