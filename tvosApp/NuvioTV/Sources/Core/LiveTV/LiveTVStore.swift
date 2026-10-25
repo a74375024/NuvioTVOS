@@ -223,6 +223,11 @@ final class LiveTVStore: ObservableObject {
     private var activeGuideFetches = 0
     /// What Up / Down flips through: the list the channel was picked from.
     private var flipList: [LiveTVChannel] = []
+    /// The Live Events game on screen (set when watching from Live Events):
+    /// the mini guide then lists games, and Up / Down flip between them.
+    @Published private(set) var watchingEventID: String?
+    /// That game, for Try Again.
+    private var watchingEvent: SportsEvent?
     // Failover state for what's playing.
     private var candidates: [LiveTVChannel] = []
     private var candidateIndex = 0
@@ -1944,6 +1949,7 @@ final class LiveTVStore: ObservableObject {
     /// version won't open, or fails before showing a picture, the next version
     /// of the same channel is tried automatically.
     func watch(_ channel: LiveTVChannel, lineup: [LiveTVChannel]? = nil) {
+        watchingEventID = nil
         if let lineup, lineup.contains(channel) { flipList = lineup }
         else if !flipList.contains(channel) { flipList = visibleEntries().contains(channel) ? visibleEntries() : [channel] }
         surfStep = 0
@@ -1954,6 +1960,7 @@ final class LiveTVStore: ObservableObject {
     /// Opens a numbered event feed for surfing: Up / Down move through the
     /// family, skipping feeds that aren't live.
     func surf(_ feed: LiveTVChannel, in family: EventFamily) {
+        watchingEventID = nil
         flipList = family.feeds.compactMap { channel(id: $0) }
         surfStep = 1
         tune(feed, candidates: surfCandidates(from: feed, step: 1), from: 0, followFeed: true)
@@ -1970,6 +1977,7 @@ final class LiveTVStore: ObservableObject {
         var list = versions(of: channel)
         list.removeAll { $0 == feed }
         list.insert(feed, at: 0)
+        watchingEventID = nil
         if !flipList.contains(channel) { flipList = visibleEntries().contains(channel) ? visibleEntries() : [channel] }
         surfStep = 0
         remember(channel)
@@ -2438,8 +2446,24 @@ final class LiveTVStore: ObservableObject {
         )
     }
 
-    /// Channel up / down from the player.
+    /// Channel up / down from the player. Watching from Live Events, it
+    /// moves between the live games of the same sport instead.
     func flip(by step: Int) {
+        if let eventID = watchingEventID {
+            // Rows (and their state) as of now, not as of when Live Events closed.
+            LiveEventsModel.shared.refreshNow()
+            let games = LiveEventsModel.shared.flipEvents(around: eventID)
+            guard games.count > 1,
+                  let index = games.firstIndex(where: { LiveEventsModel.shared.matches($0, eventID: eventID) }) else {
+                flash(L10n.string("live_event_no_other_games", fallback: "No other games on right now"))
+                return
+            }
+            let next = (index + step + games.count) % games.count
+            let target = games[next]
+            flash("\(next + 1) / \(games.count)  ·  " + (target.game.map(SportsNames.title) ?? target.title))
+            switchToEvent(LiveEventsModel.shared.cardCurrent(target).flatMap { $0.sources.isEmpty ? nil : $0 } ?? target)
+            return
+        }
         let list = flipList.isEmpty ? visibleEntries() : flipList
         guard let current = watching, let index = list.firstIndex(of: current), list.count > 1 else { return }
         let target = list[(index + step + list.count) % list.count]
@@ -3352,12 +3376,40 @@ final class LiveTVStore: ObservableObject {
         if let sourceID, let source = event.sources.first(where: { $0.channelID == sourceID }), source.kind != .provider,
            let entry = entry(id: source.channelID) {
             watch(entry)
+            watchingEventID = event.id
+            watchingEvent = event
             return
         }
         let display = displayChannel(for: event)
         flipList = [display]
         surfStep = 0
+        watchingEventID = event.id
+        watchingEvent = event
         tune(display, candidates: candidates, from: 0, followFeed: false)
+    }
+
+    /// Try Again on a failed tune: the game again (with all its sources), or the channel.
+    func retry(_ channel: LiveTVChannel) {
+        if let event = watchingEvent, event.id == watchingEventID {
+            watchSportsEvent(event)
+        } else {
+            watch(channel)
+        }
+    }
+
+    /// Another game picked in the player (event guide or Up / Down).
+    func switchToEvent(_ event: SportsEvent, preferring sourceID: String? = nil) {
+        closeMiniGuide()
+        guard isWatching else { return }
+        // Nothing to play: say so and keep the game on screen.
+        guard !eventCandidates(event, preferring: sourceID).isEmpty else {
+            flash(L10n.string("live_event_no_source", fallback: "Nothing in your channels is showing this yet"))
+            return
+        }
+        playerOnScreen = false
+        playerMetaID = nil
+        leavePlayer?()
+        watchSportsEvent(event, preferring: sourceID)
     }
 
     /// Feeds of a game airing now on an entry, as extra backups for it.
@@ -3419,6 +3471,7 @@ final class LiveTVStore: ObservableObject {
     }
 
     private func switchInPlayer(to target: LiveTVChannel) {
+        watchingEventID = nil
         playerOnScreen = false
         playerMetaID = nil
         leavePlayer?()
@@ -3430,6 +3483,8 @@ final class LiveTVStore: ObservableObject {
     /// Leaving the player or the tuning card.
     func stopWatching() {
         LiveOverlayState.shared.miniGuideOpen = false
+        watchingEventID = nil
+        watchingEvent = nil
         // The provider may take a moment to let go of the stream: the guide
         // preview waits at least `previewMinGap` before opening another.
         lastPreviewOpen = Date()

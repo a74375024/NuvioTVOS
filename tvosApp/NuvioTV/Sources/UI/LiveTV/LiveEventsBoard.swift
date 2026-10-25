@@ -326,6 +326,52 @@ final class LiveEventsModel: ObservableObject {
     /// Settings changed (e.g. games not in my channels).
     func refresh() { scheduleRecompute() }
 
+    // MARK: In-player event guide
+
+    /// Rebuilds now (the in-player guide, when Live Events isn't ticking).
+    func refreshNow() {
+        now = Date()
+        recompute()
+    }
+
+    /// A tile is the game on screen: the same event, or a fight card whose
+    /// part is playing.
+    func matches(_ event: SportsEvent, eventID: String) -> Bool {
+        event.id == eventID || cards[event.id]?.contains { $0.id == eventID } == true
+    }
+
+    /// Rows the in-player guide offers (not event channels or untimed feeds).
+    var guideRows: [Row] {
+        rows.filter { $0.id != "families" && $0.id != "untimed" && !$0.events.isEmpty }
+    }
+
+    /// The row the guide opens on: the game's sport, else any row with it.
+    func guideRowID(for eventID: String?) -> String? {
+        let candidates = guideRows
+        if let eventID {
+            if let row = candidates.first(where: { $0.id.hasPrefix("sport|") && $0.events.contains { matches($0, eventID: eventID) } }) {
+                return row.id
+            }
+            if let row = candidates.first(where: { $0.events.contains { matches($0, eventID: eventID) } }) { return row.id }
+        }
+        return candidates.first?.id
+    }
+
+    /// The games of a row you can switch to (in a channel or feed you have).
+    func guideEvents(rowID: String) -> [SportsEvent] {
+        guideRows.first { $0.id == rowID }?.events.filter { !$0.sources.isEmpty } ?? []
+    }
+
+    /// Up / Down while watching: the live games of the game's sport, in row
+    /// order (the game on screen is kept even if it just ended).
+    func flipEvents(around eventID: String) -> [SportsEvent] {
+        guard let rowID = guideRowID(for: eventID) else { return [] }
+        let date = Date()
+        return guideEvents(rowID: rowID).filter { event in
+            matches(event, eventID: eventID) || event.state(at: date) == .live || event.state(at: date) == .mayHaveEnded
+        }
+    }
+
     private func scheduleRecompute() {
         guard !scheduled else { return }
         scheduled = true

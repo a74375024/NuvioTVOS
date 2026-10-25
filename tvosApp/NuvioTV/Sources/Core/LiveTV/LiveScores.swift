@@ -100,9 +100,21 @@ final class LiveScores: ObservableObject {
         return formatter
     }()
 
-    /// Live Events opened: start looking (right away for anything due).
-    func start() {
-        guard loop == nil, SportsData.isEnabled else { return }
+    /// Who's looking: "board" (Live Events on screen) and "guide" (the
+    /// in-player event guide). Polling runs while anyone is.
+    private var holders = Set<String>()
+
+    /// Live Events opened (or the in-player guide): start looking, right
+    /// away for anything due. The guide also polls while a channel plays.
+    func start(_ holder: String = "board") {
+        holders.insert(holder)
+        guard SportsData.isEnabled else { return }
+        if holder == "guide", loop != nil {
+            // Look now instead of after the current wait (due times still apply).
+            loop?.cancel()
+            loop = nil
+        }
+        guard loop == nil else { return }
         loop = Task { [weak self] in
             while !Task.isCancelled {
                 guard let self else { return }
@@ -112,8 +124,10 @@ final class LiveScores: ObservableObject {
         }
     }
 
-    /// Live Events closed: stop asking.
-    func stop() {
+    /// Live Events (or the guide) closed: stop asking once nobody's looking.
+    func stop(_ holder: String = "board") {
+        holders.remove(holder)
+        guard holders.isEmpty else { return }
         loop?.cancel()
         loop = nil
     }
@@ -132,8 +146,9 @@ final class LiveScores: ObservableObject {
     /// the next league is due (5 minutes when nothing is on).
     private func pollDue() async -> TimeInterval {
         let now = Date()
-        // Nothing while a channel is playing (Live Events may sit under the player).
-        if LiveTVStore.shared.isWatching { return 60 }
+        // Nothing while a channel is playing (Live Events may sit under the
+        // player), unless the in-player guide is open.
+        if LiveTVStore.shared.isWatching, !holders.contains("guide") { return 60 }
         var windows: [String: [SportsGame]] = [:]
         for game in SportsData.shared.games {
             let phase = statuses[game.id]?.phase

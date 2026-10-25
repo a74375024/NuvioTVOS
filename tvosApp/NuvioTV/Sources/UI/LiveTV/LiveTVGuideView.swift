@@ -1782,8 +1782,14 @@ struct LiveTVOverlay: View {
                     .zIndex(5)
             }
             if overlayState.miniGuideOpen, store.isWatching, store.overlay == nil {
-                LiveMiniGuide()
-                    .transition(.move(edge: .leading).combined(with: .opacity))
+                // Watching from Live Events: the other games, not channels.
+                if store.watchingEventID != nil {
+                    LiveEventGuide()
+                        .transition(.move(edge: .leading).combined(with: .opacity))
+                } else {
+                    LiveMiniGuide()
+                        .transition(.move(edge: .leading).combined(with: .opacity))
+                }
             }
             if let overlay = store.overlay {
                 card(overlay)
@@ -1965,7 +1971,7 @@ struct LiveTVOverlay: View {
                 HStack(spacing: 20) {
                     if message != nil {
                         Button {
-                            store.watch(channel)
+                            store.retry(channel)
                         } label: {
                             Text(L10n.string("live_retry", fallback: "Try Again"))
                                 .font(.system(size: 26, weight: .semibold))
