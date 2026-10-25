@@ -1031,8 +1031,11 @@ enum ChannelCatalog {
                 let mi = Int(p[1]) ?? 0
                 let zone = zoneOf(r)
                 if let (dp, dr) = groups("\\(?\\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|sep(?:t|tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\\.?\\s+(\\d{1,2})\\b\\)?"),
-                   let mo = months[String(dp[0].lowercased().prefix(3))], let d = Int(dp[1]), d >= 1, d <= 31 {
-                    start = nearestYear(mo, d, hour24(h, p[2]), mi, zone)
+                   let mo = months[String(dp[0].lowercased().prefix(3))], let d = Int(dp[1]), d >= 1, d <= 31,
+                   let named = nearestYear(mo, d, hour24(h, p[2]), mi, zone),
+                   named > now.addingTimeInterval(-3 * 86_400), named < now.addingTimeInterval(7 * 86_400) {
+                    // Only a day near today ("MAR 28" may be Spanish for Tuesday the 28th).
+                    start = named
                     title.removeSubrange(dr)
                 } else {
                     var cal = Calendar(identifier: .gregorian)

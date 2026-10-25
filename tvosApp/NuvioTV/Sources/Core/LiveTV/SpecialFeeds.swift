@@ -81,8 +81,32 @@ enum SpecialFeeds {
         let number = Int(title[range].filter(\.isNumber)) ?? 0
         let rest = title[range.upperBound...]
         let name = (rest.components(separatedBy: "(").first ?? String(rest)).trimmingCharacters(in: .whitespaces)
-        guard number > 0, name.count >= 3, name.contains(" ") else { return nil }
+        // A person's name: two to four words, no digits or dashes, not
+        // another ranking ("No. 5 Oregon - No. 8 Ohio State").
+        let words = name.split(separator: " ")
+        guard number > 0, (2...4).contains(words.count), !name.contains(where: { $0.isNumber }), !name.contains(" - "),
+              name.range(of: "no.", options: .caseInsensitive) == nil else { return nil }
+        // Not a team sport's show ("College GameDay: No. 3 Texas A&M Aggies").
+        let head = title[..<range.lowerBound].lowercased()
+        let teamWords = ["football", "basketball", "volleyball", "soccer", "tennis", "golf", "court", "gameday", "network",
+                         "baseball", "hockey", "softball", "wimbledon"]
+        guard !teamWords.contains(where: { head.contains($0) }) else { return nil }
         return (number, name)
+    }
+
+    /// The race an in-car feed or multiview belongs to: "YellaWood 500:
+    /// No. 5 Kyle Larson" → "yellawood 500"; nil for other cameras.
+    static func cameraRace(_ title: String) -> String? {
+        let lower = title.lowercased()
+        if carCamera(title) != nil, let cut = lower.range(of: ": no") {
+            let race = lower[..<cut.lowerBound].trimmingCharacters(in: .whitespaces)
+            return race.count >= 4 ? race : nil
+        }
+        if lower.contains("multiview"), let cut = lower.range(of: ":", options: .backwards) {
+            let race = lower[..<cut.lowerBound].trimmingCharacters(in: .whitespaces)
+            return race.count >= 4 ? race : nil
+        }
+        return nil
     }
 
     /// 2026 teams, longest names first (so "Red Bull Racing" wins over "Red Bull").
@@ -106,9 +130,9 @@ enum SpecialFeeds {
     static func isNASCAR(_ event: SportsEvent) -> Bool {
         let text = (event.title + " " + event.league).lowercased()
         if text.contains("nascar") || text.contains("cup series") || text.contains("xfinity") || text.contains("truck series") { return true }
-        // A race named only by its sponsor ("YellaWood 500"): its cameras
-        // still have to share its name to be found.
-        return event.league == "Motorsport" && !isF1(event)
+        // A race named only by its sponsor ("YellaWood 500", league
+        // Motorsport or unknown): its cameras still have to share its name.
+        return (event.league == "Motorsport" || event.league == "Other" || event.league.isEmpty) && event.game == nil && !isF1(event)
     }
 
     private static let stopWords: Set<String> = [

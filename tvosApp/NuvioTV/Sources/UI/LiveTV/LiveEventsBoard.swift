@@ -527,6 +527,30 @@ final class LiveEventsModel: ObservableObject {
         event.game == nil && SpecialFeeds.isCameraName(event.title)
     }
 
+    /// Camera feeds that move to their race's cameras panel. An in-car feed
+    /// or multiview only goes when a tile for its race is on the board (its
+    /// name in another tile's title); otherwise it stays a tile of its own.
+    private static func hiddenCameras(_ events: [SportsEvent]) -> Set<String> {
+        var hidden = Set<String>()
+        var byRace: [String: [String]] = [:]
+        for event in events where isCameraFeed(event) {
+            if let race = SpecialFeeds.cameraRace(event.title) {
+                byRace[race, default: []].append(event.id)
+            } else {
+                hidden.insert(event.id)
+            }
+        }
+        guard !byRace.isEmpty else { return hidden }
+        var found = Set<String>()
+        for event in events where !isCameraFeed(event) {
+            let title = event.title.lowercased()
+            for race in byRace.keys where !found.contains(race) && title.contains(race) { found.insert(race) }
+            if found.count == byRace.count { break }
+        }
+        for race in found { hidden.formUnion(byRace[race] ?? []) }
+        return hidden
+    }
+
     private static let eastern: Calendar = {
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = TimeZone(identifier: "America/New_York") ?? .current
@@ -588,7 +612,9 @@ final class LiveEventsModel: ObservableObject {
         let store = LiveTVStore.shared
         let now = self.now
         // Driver-cam feeds belong to their race (its cameras panel), not the rows.
-        let raw = (store.sportsEvents.isEmpty ? store.plainSportsEvents : store.sportsEvents).filter { !Self.isCameraFeed($0) }
+        let source = store.sportsEvents.isEmpty ? store.plainSportsEvents : store.sportsEvents
+        let cameras = Self.hiddenCameras(source)
+        let raw = cameras.isEmpty ? source : source.filter { !cameras.contains($0.id) }
         // Where each game stands, from the live scoreboard.
         let scores = LiveScores.shared
         let statuses = scores.statuses

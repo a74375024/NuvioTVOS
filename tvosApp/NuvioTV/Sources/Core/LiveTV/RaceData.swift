@@ -110,9 +110,11 @@ final class RaceData: ObservableObject {
         guard task == nil, now >= nextAllowed else { return }
         let plan = due(sessions: sessions, results: results, now: now)
         guard plan.sessions || plan.drivers || !plan.results.isEmpty else { return }
-        CrashRecorder.note("race data: asking for " + [plan.sessions ? "sessions" : nil, plan.drivers ? "drivers" : nil,
-                                                      plan.results.isEmpty ? nil : "\(plan.results.count) results"]
-            .compactMap { $0 }.joined(separator: ", "))
+        var asked: [String] = []
+        if plan.sessions { asked.append("sessions") }
+        if plan.drivers { asked.append("drivers") }
+        if !plan.results.isEmpty { asked.append("\(plan.results.count) results") }
+        CrashRecorder.note("race data: asking for " + asked.joined(separator: ", "))
         task = Task { [weak self] in
             await self?.run(plan)
             self?.task = nil
@@ -355,15 +357,19 @@ final class RaceData: ObservableObject {
 
     private func rebuildNascarNames() {
         var names: [String: RaceDriver] = [:]
-        for driver in nascarSaved?.drivers ?? [] where names[Self.fold(driver.name)] == nil {
-            names[Self.fold(driver.name)] = driver
+        for driver in nascarSaved?.drivers ?? [] {
+            let key = Self.fold(Self.bareName(driver.name))
+            if names[key] == nil { names[key] = driver }
         }
         nascarByName = names
     }
 
     /// "Sammy Smith (C)" → "Sammy Smith".
     nonisolated private static func bareName(_ name: String) -> String {
-        (name.components(separatedBy: "(").first ?? name).trimmingCharacters(in: .whitespaces)
+        var value = (name.components(separatedBy: "(").first ?? name).replacingOccurrences(of: ".", with: "")
+        value = value.trimmingCharacters(in: .whitespaces)
+        for suffix in [" Jr", " Sr", " II", " III"] where value.hasSuffix(suffix) { value = String(value.dropLast(suffix.count)) }
+        return value.trimmingCharacters(in: .whitespaces)
     }
 
     /// Drivers with a real photo, Cup Series first (the same name can be in

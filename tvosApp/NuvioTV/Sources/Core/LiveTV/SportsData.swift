@@ -183,10 +183,14 @@ final class SportsData: ObservableObject {
     /// most every 6 hours). Newly found: the F1 schedule is fetched.
     func noteRacingFeeds(_ events: [LiveEvent]) {
         let now = Date()
+        guard !events.isEmpty else { return }
         if let checked = Self.racingChecked, now.timeIntervalSince(checked) < 6 * 3600 { return }
         Self.racingChecked = now
         let found = events.contains { event in
             let title = event.title
+            // Cheap test first; the pattern only for titles that might be F1.
+            guard title.range(of: "f1", options: .caseInsensitive) != nil
+                    || title.range(of: "formula", options: .caseInsensitive) != nil else { return false }
             return title.range(of: "formula 1", options: .caseInsensitive) != nil
                 || title.range(of: "\\bF1(TV)?\\b", options: [.regularExpression, .caseInsensitive]) != nil
         }
@@ -512,7 +516,13 @@ final class SportsData: ObservableObject {
             }
             guard ok else { continue }
             var seen = Set<String>()
-            byLeague[league.short] = list.filter { seen.insert($0.id).inserted }
+            var kept = list.filter { seen.insert($0.id).inserted }
+            // Games of the last day and a half that this listing no longer
+            // has (day-by-day leagues start at today): kept, so leftover
+            // feeds still find them.
+            let recent = now.addingTimeInterval(-36 * 3600)
+            kept += (byLeague[league.short] ?? []).filter { $0.start > recent && $0.start < now && !seen.contains($0.id) }
+            byLeague[league.short] = kept
             if !roster.isEmpty {
                 // Added to, not replaced: teams on a bye week stay pickable.
                 for team in rosters[league.short] ?? [] where roster[team.id] == nil { roster[team.id] = team }

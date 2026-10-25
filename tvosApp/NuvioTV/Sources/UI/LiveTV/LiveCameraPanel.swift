@@ -79,7 +79,6 @@ struct LiveCameraPanel: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
         .ignoresSafeArea()
         .onAppear {
-            // Drivers, once a weekend (nothing when they're already saved).
             // Drivers, once a weekend (F1) or week (NASCAR); nothing when saved.
             let f1 = isF1
             if f1 { race.refreshIfNeeded(sessions: [], results: false) } else { race.refreshNascarIfNeeded() }
@@ -137,7 +136,8 @@ struct LiveCameraPanel: View {
         let color = Self.color(info?.color ?? SpecialFeeds.teamColor(feed.team)) ?? Color.white.opacity(0.4)
         let isFollowed = followed.contains(feed.title)
         // NASCAR feeds already say "No. 5"; F1 adds the number to the team.
-        let detail = feed.number == nil ? (info.map { "\(feed.detail) · #\($0.number)" } ?? feed.detail) : feed.detail
+        let detail = feed.number == nil
+            ? (info.flatMap { $0.number > 0 ? "\(feed.detail) · #\($0.number)" : nil } ?? feed.detail) : feed.detail
         return Button {
             store.watchCamera(feed)
         } label: {
