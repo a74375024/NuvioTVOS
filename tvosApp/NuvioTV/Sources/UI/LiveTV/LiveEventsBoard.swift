@@ -546,7 +546,7 @@ final class LiveEventsModel: ObservableObject {
     /// Camera feeds that move to their race's cameras panel. An in-car feed
     /// or multiview only goes when a tile for its race is on the board (its
     /// name in another tile's title); otherwise it stays a tile of its own.
-    private static func hiddenCameras(_ events: [SportsEvent]) -> Set<String> {
+    private static func hiddenCameras(_ events: [SportsEvent], now: Date) -> Set<String> {
         var hidden = Set<String>()
         var byRace: [String: [String]] = [:]
         for event in events where isCameraFeed(event) {
@@ -572,9 +572,13 @@ final class LiveEventsModel: ObservableObject {
         for event in events where !event.sources.isEmpty && !isCameraFeed(event)
             && (event.league == "Motorsport" || event.league == "Other" || event.league.isEmpty) {
             let title = event.title.lowercased()
+            // A NASCAR race on now (or about to start): the cameras that name no race are its.
             let nascarRace = event.game?.leagueShort == "NASCAR"
+                && (event.start.map { $0 < now.addingTimeInterval(3 * 3600) && $0 > now.addingTimeInterval(-6 * 3600) } ?? false)
             for (race, list) in keys where !found.contains(race)
-                && (list.contains(where: { title.contains($0) }) || (nascarRace && race.contains("nascar"))) { found.insert(race) }
+                && (list.contains(where: { title.contains($0) }) || (nascarRace && SpecialFeeds.genericNascarRaces.contains(race))) {
+                found.insert(race)
+            }
             if found.count == byRace.count { break }
         }
         for race in found { hidden.formUnion(byRace[race] ?? []) }
@@ -643,7 +647,7 @@ final class LiveEventsModel: ObservableObject {
         let now = self.now
         // Driver-cam feeds belong to their race (its cameras panel), not the rows.
         let source = store.sportsEvents.isEmpty ? store.plainSportsEvents : store.sportsEvents
-        let cameras = Self.hiddenCameras(source)
+        let cameras = Self.hiddenCameras(source, now: now)
         // Placeholder slots ("No Match Scheduled") aren't events.
         let raw = source.filter { !cameras.contains($0.id) && !Self.isPlaceholder($0) }
         // Where each game stands, from the live scoreboard.
@@ -1141,7 +1145,10 @@ final class LiveEventsModel: ObservableObject {
         // Where to watch.
         let spanishToo = basis.sources.contains { $0.spanish } && basis.sources.contains { !$0.spanish }
         let streaming = event.game?.networks.first(where: Self.isStreaming)
-        if let source = basis.channels.first, let channel = store.sourceChannel(source) {
+        // The tile names what plays first: a team or F1 channel ("likely")
+        // only when there's no feed for the game itself.
+        let named = basis.channels.first(where: { $0.kind != .team }) ?? (basis.feeds.isEmpty ? basis.channels.first : nil)
+        if let source = named, let channel = store.sourceChannel(source) {
             place.channelName = channel.name
             place.channelDisplay = channel.displayName
             place.logoURLs = store.logoSpec(for: channel).urls

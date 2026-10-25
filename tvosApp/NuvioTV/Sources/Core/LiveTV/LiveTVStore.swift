@@ -2976,7 +2976,8 @@ final class LiveTVStore: ObservableObject {
         let lineupEntries = lineupIDs.compactMap { entry(id: $0) }
         let browse = browseEntries
         let allEntries = entries
-        let f1Sources = f1ChannelSources(lineup: lineup)
+        let f1Sources = SportsData.shared.games.contains(where: { $0.leagueShort == "F1" && !$0.completed })
+            ? f1ChannelSources(lineup: lineup) : []
         let entryInfo = self.entryInfo
         let hidden = hiddenGroups
         var previousMap: [String: String] = [:]
@@ -3430,12 +3431,17 @@ final class LiveTVStore: ObservableObject {
     private var f1ChannelCache: (key: String, sources: [EventSource])?
 
     private func f1ChannelSources(lineup: Set<String>) -> [EventSource] {
-        let key = "\(entriesRevision)|\(entries.count)|\(lineup.count)"
+        var hasher = Hasher()
+        for id in lineup.sorted() { hasher.combine(id) }
+        for group in hiddenGroups.sorted() { hasher.combine(group) }
+        let key = "\(entriesRevision)|\(entries.count)|\(hasher.finalize())"
         if let f1ChannelCache, f1ChannelCache.key == key { return f1ChannelCache.sources }
+        var mine: [EventSource] = []
         var english: [EventSource] = []
         var others: [EventSource] = []
         for entry in entries {
             let name = entry.name
+            guard !hiddenGroups.contains(entry.group ?? Self.otherGroup), entryInfo[entry.id]?.kind == .channel else { continue }
             guard name.range(of: "F1", options: .caseInsensitive) != nil || name.range(of: "formula", options: .caseInsensitive) != nil else { continue }
             let lower = name.lowercased()
             let dedicated = lower.contains("sky sport f1") || lower.contains("sky sports f1") || lower.contains("dazn f1")
@@ -3444,15 +3450,18 @@ final class LiveTVStore: ObservableObject {
             guard dedicated, !SpecialFeeds.isCameraName(name), !lower.contains("tracker"), !lower.contains("data"),
                   !lower.contains("pit lane") else { continue }
             let inLineup = lineup.contains(entry.id)
-            let isEnglish = lower.contains("sky sports f1") || lower.contains("english")
+            let isEnglish = lower.contains("sky sports f1") || lower.contains("english") || lower.contains("f1 tv main")
                 || (lower.contains("sky sport f1") && (lower.hasPrefix("uk") || lower.hasPrefix("vip") || lower.hasPrefix("now") || lower.hasPrefix("4k")))
             let spanish = lower.contains("dazn f1") || lower.contains("spanish") || lower.hasPrefix("(es)") || lower.hasPrefix("es:")
-            let source = EventSource(channelID: entry.id, kind: inLineup ? .lineup : .guide, spanish: spanish,
-                                     detail: L10n.string("live_event_f1_channel", fallback: "F1 channel"),
-                                     rank: isEnglish ? 3 : 4)
-            if isEnglish { english.append(source) } else { others.append(source) }
+            // "Likely, not certain" (like a team's own channel): tried after
+            // the session's own feeds, never folded away, and it doesn't stop
+            // the feeds' "moved on" signal from ending the session.
+            let source = EventSource(channelID: entry.id, kind: .team, spanish: spanish,
+                                     detail: L10n.string("live_event_f1_channel", fallback: "F1 channel"))
+            if inLineup { mine.append(source) } else if isEnglish { english.append(source) } else { others.append(source) }
         }
-        let sources = english + others
+        // Yours first, then a few English and a few others (one per language is plenty).
+        let sources = mine + english.prefix(3) + others.prefix(4)
         f1ChannelCache = (key, sources)
         return sources
     }

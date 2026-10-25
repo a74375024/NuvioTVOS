@@ -94,6 +94,9 @@ enum SpecialFeeds {
         return (number, name)
     }
 
+    /// Race parts of in-car and multiview titles that name no particular race.
+    static let genericNascarRaces: Set<String> = ["nascar", "nascar cup", "nascar cup series"]
+
     /// The race an in-car feed or multiview belongs to: "YellaWood 500:
     /// No. 5 Kyle Larson" → "yellawood 500"; nil for other cameras.
     static func cameraRace(_ title: String) -> String? {
@@ -102,8 +105,10 @@ enum SpecialFeeds {
             let race = lower[..<cut.lowerBound].trimmingCharacters(in: .whitespaces)
             return race.count >= 4 ? race : nil
         }
-        if lower.contains("multiview"), let cut = lower.range(of: ":", options: .backwards) {
-            let race = lower[..<cut.lowerBound].trimmingCharacters(in: .whitespaces)
+        // The time in brackets ("(10.25 1:40PM ET)") isn't part of the name.
+        let base = lower.components(separatedBy: "(").first ?? lower
+        if base.contains("multiview"), let cut = base.range(of: ":", options: .backwards) {
+            let race = base[..<cut.lowerBound].trimmingCharacters(in: .whitespaces)
             return race.count >= 4 ? race : nil
         }
         return nil
@@ -217,7 +222,7 @@ enum SpecialFeeds {
             let title = channel.name.components(separatedBy: "|").last ?? channel.name
             let lower = title.lowercased()
             // Its own name, or a NASCAR feed that names no race ("NASCAR: No 5 Kyle Larson").
-            guard !words(title).isDisjoint(with: key) || lower.contains("nascar") else { continue }
+            guard !words(title).isDisjoint(with: key) || genericNascarRaces.contains(cameraRace(title) ?? "") else { continue }
             if let car = carCamera(title) {
                 // "YellaWood 500: No. 5 Kyle Larson" (HBO's in-car feeds).
                 result.append(CameraFeed(channel: channel, title: car.driver, detail: "No. \(car.number)", kind: .driver,
