@@ -859,13 +859,19 @@ private func isLight(_ hex: String?) -> Bool {
 }
 
 /// A team's logo, or a circle in its colors with its abbreviation.
+/// Live Events tile size (points on a 1920-wide TV screen).
+enum LiveTileSize {
+    static let width: CGFloat = 360
+    static let height: CGFloat = 210
+}
+
 private struct SideBadge: View {
     let team: SportsTeam
     let focused: Bool
 
     var body: some View {
         if let url = team.badge.flatMap(URL.init(string:)) {
-            ChannelLogoView(urls: [url], width: 40, height: 40, focused: focused) { colors }
+            ChannelLogoView(urls: [url], width: 32, height: 32, focused: focused) { colors }
         } else {
             colors
         }
@@ -876,24 +882,24 @@ private struct SideBadge: View {
         let ring = teamColor(team.altColor) ?? Color.white.opacity(0.3)
         return ZStack {
             Circle().fill(fill)
-            Circle().strokeBorder(ring, lineWidth: 3)
+            Circle().strokeBorder(ring, lineWidth: 2.5)
             Text(team.abbreviation)
-                .font(.system(size: 12, weight: .heavy))
+                .font(.system(size: 10, weight: .heavy))
                 .foregroundColor(isLight(team.color) ? .black : .white)
                 .minimumScaleFactor(0.6)
                 .lineLimit(1)
-                .padding(5)
+                .padding(4)
         }
-        .frame(width: 40, height: 40)
+        .frame(width: 32, height: 32)
     }
 }
 
 /// A country code chip ("AUS") standing in for a fighter's flag.
-private func countryChip(_ code: String, focused: Bool, size: CGFloat = 15) -> some View {
+private func countryChip(_ code: String, focused: Bool, size: CGFloat = 13) -> some View {
     Text(code)
         .font(.system(size: size, weight: .heavy))
-        .padding(.horizontal, 6)
-        .padding(.vertical, 2)
+        .padding(.horizontal, 5)
+        .padding(.vertical, 1)
         .overlay(RoundedRectangle(cornerRadius: 5).strokeBorder((focused ? Color.black : Color.white).opacity(0.6), lineWidth: 2))
 }
 
@@ -904,18 +910,18 @@ private struct BasesView: View {
 
     var body: some View {
         ZStack {
-            base(on: bases.count > 1 && bases[1]).offset(x: 0, y: -6)
-            base(on: bases.count > 2 && bases[2]).offset(x: -9, y: 3)
-            base(on: !bases.isEmpty && bases[0]).offset(x: 9, y: 3)
+            base(on: bases.count > 1 && bases[1]).offset(x: 0, y: -5)
+            base(on: bases.count > 2 && bases[2]).offset(x: -7.5, y: 2.5)
+            base(on: !bases.isEmpty && bases[0]).offset(x: 7.5, y: 2.5)
         }
-        .frame(width: 30, height: 24)
+        .frame(width: 26, height: 20)
     }
 
     private func base(on: Bool) -> some View {
         Rectangle()
             .fill(on ? ink.opacity(0.9) : Color.clear)
             .overlay(Rectangle().strokeBorder(ink.opacity(0.8), lineWidth: 1.5))
-            .frame(width: 9, height: 9)
+            .frame(width: 7.5, height: 7.5)
             .rotationEffect(.degrees(45))
     }
 }
@@ -935,19 +941,19 @@ struct LiveEventTile: View {
         let state = event.state(at: now)
         VStack(alignment: .leading, spacing: 0) {
             statusRow(state)
-                .frame(height: 32)
-            Spacer(minLength: 4)
+                .frame(height: 28)
+            Spacer(minLength: 3)
             middle
-            Spacer(minLength: 4)
+            Spacer(minLength: 3)
             footer
-                .frame(height: 32)
+                .frame(height: 28)
         }
         .opacity(watchable || focused ? 1 : 0.6)
         .foregroundColor(ink)
-        .padding(.top, 18)
-        .padding(.horizontal, 20)
-        .padding(.bottom, 18)
-        .frame(width: 400, height: 240, alignment: .topLeading)
+        .padding(.top, 14)
+        .padding(.horizontal, 16)
+        .padding(.bottom, 15)
+        .frame(width: LiveTileSize.width, height: LiveTileSize.height, alignment: .topLeading)
         .background(cardBackground(state))
         .scaleEffect(focused ? 1.04 : 1)
         .animation(.easeOut(duration: 0.12), value: focused)
@@ -955,45 +961,45 @@ struct LiveEventTile: View {
 
     /// The card, with the progress edge along the bottom while live.
     private func cardBackground(_ state: SportsEvent.State) -> some View {
-        let shape = RoundedRectangle(cornerRadius: 18, style: .continuous)
+        let shape = RoundedRectangle(cornerRadius: 16, style: .continuous)
         let fill: Color = focused ? .white : Color.white.opacity(watchable && state != .finished ? 0.09 : 0.06)
         return ZStack(alignment: .bottomLeading) {
             fill
             if state == .live, place.parts.isEmpty {
-                Rectangle().fill((focused ? Color.black : Color.white).opacity(focused ? 0.12 : 0.15)).frame(height: 8)
+                Rectangle().fill((focused ? Color.black : Color.white).opacity(focused ? 0.12 : 0.15)).frame(height: 6)
                 Rectangle().fill(focused ? Color.black : Color.white.opacity(0.75))
-                    .frame(width: 400 * CGFloat(place.liveProgress ?? event.progress(at: now)), height: 8)
+                    .frame(width: LiveTileSize.width * CGFloat(place.liveProgress ?? event.progress(at: now)), height: 6)
             }
         }
         .clipShape(shape)
-        .shadow(color: .black.opacity(focused ? 0.55 : 0), radius: focused ? 20 : 0, y: focused ? 10 : 0)
+        .shadow(color: .black.opacity(focused ? 0.5 : 0), radius: focused ? 16 : 0, y: focused ? 8 : 0)
     }
 
     // MARK: Status row
 
     @ViewBuilder
     private func statusRow(_ state: SportsEvent.State) -> some View {
-        HStack(spacing: 12) {
+        HStack(spacing: 10) {
             statusPill(state)
             statusText(state)
             Spacer(minLength: 8)
             if place.favorite {
                 Image(systemName: "star.fill")
-                    .font(.system(size: 24))
+                    .font(.system(size: 19))
                     .foregroundColor(Color(red: 0.88, green: 0.63, blue: 0))
             }
             if let tag = place.tag {
                 Text(tag)
-                    .font(.system(size: 18, weight: .heavy))
+                    .font(.system(size: 15, weight: .heavy))
                     .lineLimit(1)
                     .foregroundColor(focused ? .white : .black)
-                    .padding(.horizontal, 9)
-                    .padding(.vertical, 3)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 2)
                     .background(RoundedRectangle(cornerRadius: 6).fill(focused ? Color(white: 0.1) : Color.white.opacity(0.9)))
                     .layoutPriority(-1)
             } else if showLeague {
                 Text(event.leagueShort)
-                    .font(.system(size: 22, weight: .bold))
+                    .font(.system(size: 18, weight: .bold))
                     .opacity(0.55)
                     .lineLimit(1)
             }
@@ -1002,15 +1008,15 @@ struct LiveEventTile: View {
 
     private func pill(_ text: String, fill: Color, foreground: Color, outline: Color? = nil) -> some View {
         Text(text)
-            .font(.system(size: 20, weight: .heavy))
-            .tracking(0.6)
+            .font(.system(size: 16, weight: .heavy))
+            .tracking(0.5)
             .foregroundColor(foreground)
             .lineLimit(1)
             .fixedSize()
-            .padding(.horizontal, 10)
-            .padding(.vertical, 3)
-            .background(RoundedRectangle(cornerRadius: 6).fill(fill))
-            .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(outline ?? .clear, lineWidth: 2))
+            .padding(.horizontal, 8)
+            .padding(.vertical, 2)
+            .background(RoundedRectangle(cornerRadius: 5).fill(fill))
+            .overlay(RoundedRectangle(cornerRadius: 5).strokeBorder(outline ?? .clear, lineWidth: 2))
     }
 
     @ViewBuilder
@@ -1046,40 +1052,40 @@ struct LiveEventTile: View {
         switch state {
         case .live:
             if let part = place.partLabel {
-                Text(part).font(.system(size: 24, weight: .semibold)).opacity(0.8).lineLimit(1).minimumScaleFactor(0.75)
+                Text(part).font(.system(size: 19, weight: .semibold)).opacity(0.8).lineLimit(1).minimumScaleFactor(0.75)
             } else if let liveClock = place.clock {
-                Text(liveClock).font(.system(size: 24, weight: .semibold)).opacity(0.85).lineLimit(1).minimumScaleFactor(0.8)
+                Text(liveClock).font(.system(size: 19, weight: .semibold)).opacity(0.85).lineLimit(1).minimumScaleFactor(0.8)
                 if let bases = place.bases { BasesView(bases: bases, ink: ink) }
             } else if let end = endTime {
                 Text(L10n.format("live_event_ends_about", fallback: "ends ~%@", shortClock.string(from: end)))
-                    .font(.system(size: 24, weight: .semibold)).opacity(0.8).lineLimit(1)
+                    .font(.system(size: 19, weight: .semibold)).opacity(0.8).lineLimit(1)
             }
         case .mayHaveEnded:
             if let start = event.start {
                 Text(L10n.format("live_event_started_at", fallback: "started %@", shortClock.string(from: start)))
-                    .font(.system(size: 24)).opacity(0.75).lineLimit(1)
+                    .font(.system(size: 19)).opacity(0.75).lineLimit(1)
             }
         case .upcoming:
             if place.notStarted, let start = event.start {
                 Text(L10n.format("live_event_due_at", fallback: "due %@", shortClock.string(from: start)))
-                    .font(.system(size: 24)).opacity(0.75).lineLimit(1)
+                    .font(.system(size: 19)).opacity(0.75).lineLimit(1)
             } else if let start = event.start {
-                HStack(spacing: 10) {
-                    Text(clock.string(from: start)).font(.system(size: 24, weight: .heavy)).lineLimit(1)
+                HStack(spacing: 8) {
+                    Text(clock.string(from: start)).font(.system(size: 19, weight: .heavy)).lineLimit(1)
                     if let until = untilText(start) {
-                        Text(until).font(.system(size: 24)).opacity(0.7).lineLimit(1)
+                        Text(until).font(.system(size: 19)).opacity(0.7).lineLimit(1)
                     }
                 }
             }
         case .postponed:
             if let start = event.start {
                 Text(L10n.format("live_event_was_at", fallback: "was %@", clock.string(from: start)))
-                    .font(.system(size: 24)).opacity(0.7).lineLimit(1)
+                    .font(.system(size: 19)).opacity(0.7).lineLimit(1)
             }
         case .finished:
             if let ended = place.endedAt {
                 Text(L10n.format("live_event_ended_at", fallback: "ended %@", shortClock.string(from: ended)))
-                    .font(.system(size: 24)).opacity(0.7).lineLimit(1)
+                    .font(.system(size: 19)).opacity(0.7).lineLimit(1)
             }
         case .unknownTime:
             EmptyView()
@@ -1111,26 +1117,26 @@ struct LiveEventTile: View {
             cardMiddle
         } else if let top = place.top, let bottom = place.bottom {
             let leader = Self.leader(place.topScore, place.bottomScore)
-            VStack(alignment: .leading, spacing: 4) {
+            VStack(alignment: .leading, spacing: 2) {
                 sideLine(top, home: place.homeIsTop == true, score: place.topScore, leads: leader.map { $0 == 0 },
                          ball: place.possessionTop == true)
                 sideLine(bottom, home: place.homeIsTop == false, score: place.bottomScore, leads: leader.map { $0 == 1 },
                          ball: place.possessionTop == false)
             }
         } else {
-            HStack(spacing: 16) {
+            HStack(spacing: 14) {
                 Image(systemName: SportsNames.symbol(event.league))
-                    .font(.system(size: 30, weight: .semibold))
-                    .frame(width: 64, height: 64)
-                    .background(RoundedRectangle(cornerRadius: 14).fill(ink.opacity(focused ? 0.08 : 0.12)))
+                    .font(.system(size: 24, weight: .semibold))
+                    .frame(width: 52, height: 52)
+                    .background(RoundedRectangle(cornerRadius: 12).fill(ink.opacity(focused ? 0.08 : 0.12)))
                 VStack(alignment: .leading, spacing: 2) {
                     Text(place.title)
-                        .font(.system(size: 30, weight: .heavy))
+                        .font(.system(size: 24, weight: .heavy))
                         .lineLimit(2)
                         .minimumScaleFactor(0.75)
                     if let subtitle = place.subtitle {
                         Text(subtitle)
-                            .font(.system(size: 23))
+                            .font(.system(size: 18))
                             .opacity(0.7)
                             .lineLimit(1)
                     }
@@ -1146,43 +1152,43 @@ struct LiveEventTile: View {
     }
 
     private func sideLine(_ team: SportsTeam, home: Bool, score: String? = nil, leads: Bool? = nil, ball: Bool = false) -> some View {
-        HStack(spacing: 14) {
+        HStack(spacing: 11) {
             if let country = team.country {
                 countryChip(country, focused: focused)
-                    .frame(width: 40)
+                    .frame(width: 32)
             } else {
                 SideBadge(team: team, focused: focused)
             }
             if let rank = team.rank {
-                Text("\(rank)").font(.system(size: 22, weight: .heavy)).opacity(0.55)
+                Text("\(rank)").font(.system(size: 18, weight: .heavy)).opacity(0.55)
             }
             Text(SportsNames.short(team, soccer: event.game?.isSoccer ?? true))
-                .font(.system(size: 28, weight: .bold))
+                .font(.system(size: 23, weight: .bold))
                 .lineLimit(1)
                 .minimumScaleFactor(0.7)
             if home {
-                Text(L10n.string("live_event_home", fallback: "home")).font(.system(size: 20)).opacity(0.5)
+                Text(L10n.string("live_event_home", fallback: "home")).font(.system(size: 16)).opacity(0.5)
             }
             if let score {
                 Spacer(minLength: 6)
                 if ball {
-                    Image(systemName: "arrowtriangle.left.fill").font(.system(size: 13)).opacity(0.85)
+                    Image(systemName: "arrowtriangle.left.fill").font(.system(size: 11)).opacity(0.85)
                 }
                 Text(score)
-                    .font(.system(size: 34, weight: leads == false ? .bold : .heavy).monospacedDigit())
+                    .font(.system(size: 27, weight: leads == false ? .bold : .heavy).monospacedDigit())
                     .opacity(leads == false ? 0.55 : 1)
                     .lineLimit(1)
                     .fixedSize()
             }
         }
-        .frame(height: 48)
+        .frame(height: 40)
     }
 
     /// A fight card: its name, the headline bout, and its parts' timeline.
     private var cardMiddle: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 4) {
             Text(place.title)
-                .font(.system(size: 30, weight: .heavy))
+                .font(.system(size: 24, weight: .heavy))
                 .lineLimit(1)
                 .minimumScaleFactor(0.75)
             if let top = place.top, let bottom = place.bottom {
@@ -1190,13 +1196,13 @@ struct LiveEventTile: View {
                     if place.boutNow {
                         Text(L10n.string("live_card_now", fallback: "Now:")).opacity(0.6)
                     }
-                    if let country = top.country { countryChip(country, focused: focused, size: 14) }
+                    if let country = top.country { countryChip(country, focused: focused, size: 12) }
                     Text(lastName(top)).lineLimit(1)
                     Text("vs.").opacity(0.5)
-                    if let country = bottom.country { countryChip(country, focused: focused, size: 14) }
+                    if let country = bottom.country { countryChip(country, focused: focused, size: 12) }
                     Text(lastName(bottom)).lineLimit(1)
                 }
-                .font(.system(size: 22))
+                .font(.system(size: 18))
                 .minimumScaleFactor(0.8)
             }
             HStack(alignment: .top, spacing: 8) {
@@ -1205,11 +1211,11 @@ struct LiveEventTile: View {
                         ZStack(alignment: .leading) {
                             Capsule().fill(ink.opacity(0.14))
                             Capsule().fill(ink.opacity(part.current ? 1 : 0.4))
-                                .frame(width: part.fill > 0 ? max(8, partWidth * CGFloat(part.fill)) : 0)
+                                .frame(width: part.fill > 0 ? max(6, partWidth * CGFloat(part.fill)) : 0)
                         }
-                        .frame(width: partWidth, height: 8)
+                        .frame(width: partWidth, height: 6)
                         Text("\(part.label) \(shortClock.string(from: part.start))")
-                            .font(.system(size: 20, weight: part.current ? .heavy : .regular))
+                            .font(.system(size: 16, weight: part.current ? .heavy : .regular))
                             .opacity(part.current ? 1 : 0.65)
                             .lineLimit(1)
                             .minimumScaleFactor(0.7)
@@ -1217,14 +1223,14 @@ struct LiveEventTile: View {
                     }
                 }
             }
-            .padding(.top, 4)
+            .padding(.top, 3)
         }
     }
 
-    /// Each part's share of the 360-pt timeline.
+    /// Each part's share of the timeline (the tile's inner width).
     private var partWidth: CGFloat {
         let count = CGFloat(max(1, place.parts.count))
-        return (360 - 8 * (count - 1)) / count
+        return (LiveTileSize.width - 32 - 8 * (count - 1)) / count
     }
 
     private func lastName(_ fighter: SportsTeam) -> String {
@@ -1235,9 +1241,9 @@ struct LiveEventTile: View {
 
     @ViewBuilder
     private var footer: some View {
-        HStack(spacing: 12) {
+        HStack(spacing: 10) {
             if let display = place.channelDisplay {
-                ChannelLogoView(urls: place.logoURLs, width: 84, height: 30, focused: focused) {
+                ChannelLogoView(urls: place.logoURLs, width: 72, height: 26, focused: focused) {
                     channelPill(display, outlined: false)
                 }
             } else if let pill = place.pill {
@@ -1245,14 +1251,14 @@ struct LiveEventTile: View {
             }
             if let situation = place.situation {
                 Text(situation)
-                    .font(.system(size: 22, weight: .bold))
+                    .font(.system(size: 18, weight: .bold))
                     .foregroundColor(place.redZone ? (focused ? Color(red: 0.75, green: 0.1, blue: 0.15) : LiveStyle.watching) : ink)
                     .opacity(place.redZone ? 1 : 0.85)
                     .lineLimit(1)
                     .minimumScaleFactor(0.75)
             } else if !place.footer.isEmpty {
                 Text(place.footer)
-                    .font(.system(size: 22))
+                    .font(.system(size: 18))
                     .opacity(0.75)
                     .lineLimit(1)
                     .minimumScaleFactor(0.8)
@@ -1262,14 +1268,14 @@ struct LiveEventTile: View {
 
     private func channelPill(_ text: String, outlined: Bool) -> some View {
         Text(text)
-            .font(.system(size: 20, weight: .heavy))
+            .font(.system(size: 16, weight: .heavy))
             .lineLimit(1)
             .foregroundColor(outlined ? ink : .white)
-            .padding(.horizontal, 10)
-            .padding(.vertical, 3)
-            .background(RoundedRectangle(cornerRadius: 6).fill(outlined ? Color.clear
+            .padding(.horizontal, 8)
+            .padding(.vertical, 2)
+            .background(RoundedRectangle(cornerRadius: 5).fill(outlined ? Color.clear
                                                                 : (focused ? Color(red: 0.05, green: 0.1, blue: 0.17) : Color.white.opacity(0.18))))
-            .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(outlined ? ink.opacity(0.5) : .clear, lineWidth: 2))
+            .overlay(RoundedRectangle(cornerRadius: 5).strokeBorder(outlined ? ink.opacity(0.5) : .clear, lineWidth: 2))
     }
 }
 
@@ -1297,14 +1303,14 @@ struct LiveEventsHero: View {
                 }
                 HStack(spacing: 16) {
                     if let game = event.game {
-                        TeamBadge(team: game.isSoccer ? game.home : game.away, size: 62)
-                        TeamBadge(team: game.isSoccer ? game.away : game.home, size: 62)
+                        TeamBadge(team: game.isSoccer ? game.home : game.away, size: 52)
+                        TeamBadge(team: game.isSoccer ? game.away : game.home, size: 52)
                     } else if let teams = event.teams, teams.count == 2 {
-                        TeamBadge(team: teams[0], size: 62)
-                        TeamBadge(team: teams[1], size: 62)
+                        TeamBadge(team: teams[0], size: 52)
+                        TeamBadge(team: teams[1], size: 52)
                     }
                     Text(heroTitle(event, place))
-                        .font(.system(size: 44, weight: .bold).monospacedDigit())
+                        .font(.system(size: 36, weight: .bold).monospacedDigit())
                         .foregroundColor(.white)
                         .lineLimit(1)
                         .minimumScaleFactor(0.7)
@@ -1370,7 +1376,7 @@ struct LiveEventsHero: View {
                 EmptyView()
             }
             Text(statusText(event, state, place))
-                .font(.system(size: 24, weight: .semibold))
+                .font(.system(size: 21, weight: .semibold))
                 .foregroundColor(.white.opacity(0.85))
                 .lineLimit(1)
         }
@@ -1575,26 +1581,26 @@ struct LiveEventsBoard: View {
                 // A focus target in the margin: Left from the first tile
                 // lands here and opens the Sports column.
                 Color.white.opacity(0.001)
-                    .frame(width: 20, height: row.grouped ? 280 : 240)
+                    .frame(width: 20, height: row.grouped ? LiveTileSize.height + 34 : LiveTileSize.height)
                     .focusable(!columnOpen)
                     .focused($focus, equals: "h|\(row.id)")
                     .focusEffectDisabledIfAvailable()
                 ScrollView(.horizontal, showsIndicators: false) {
-                    LazyHStack(alignment: .bottom, spacing: 32) {
+                    LazyHStack(alignment: .bottom, spacing: 24) {
                         ForEach(row.events) { event in
                             if row.grouped {
                                 // A group label over the first tile of each
                                 // group, with a wider gap before it.
                                 let header = row.headers[event.id]
-                                VStack(alignment: .leading, spacing: 10) {
+                                VStack(alignment: .leading, spacing: 8) {
                                     Text(header ?? " ")
-                                        .font(.system(size: 25, weight: .bold))
+                                        .font(.system(size: 20, weight: .bold))
                                         .foregroundColor(.white.opacity(header == nil ? 0 : 0.7))
                                         .lineLimit(1)
-                                        .frame(height: 30, alignment: .leading)
+                                        .frame(height: 26, alignment: .leading)
                                     tileButton(event, row: row)
                                 }
-                                .padding(.leading, header != nil && event.id != row.events.first?.id ? 40 : 0)
+                                .padding(.leading, header != nil && event.id != row.events.first?.id ? 32 : 0)
                             } else {
                                 tileButton(event, row: row)
                             }
@@ -1664,38 +1670,38 @@ struct LiveEventsBoard: View {
         } label: {
             // The same layout as a game tile: status row, title, footer.
             VStack(alignment: .leading, spacing: 0) {
-                HStack(spacing: 12) {
+                HStack(spacing: 10) {
                     Text(L10n.format("live_family_count", fallback: "%d feeds", family.feeds.count))
-                        .font(.system(size: 24, weight: .semibold)).opacity(0.8)
+                        .font(.system(size: 19, weight: .semibold)).opacity(0.8)
                     Spacer(minLength: 8)
                     Text(family.league.isEmpty ? "" : SportsMatcher.shortLeague(family.league))
-                        .font(.system(size: 22, weight: .bold)).opacity(0.55).lineLimit(1)
+                        .font(.system(size: 18, weight: .bold)).opacity(0.55).lineLimit(1)
                 }
-                .frame(height: 32)
-                Spacer(minLength: 4)
-                HStack(spacing: 16) {
+                .frame(height: 28)
+                Spacer(minLength: 3)
+                HStack(spacing: 14) {
                     Image(systemName: "rectangle.stack.fill")
-                        .font(.system(size: 28, weight: .semibold))
-                        .frame(width: 64, height: 64)
-                        .background(RoundedRectangle(cornerRadius: 14).fill((isFocused ? Color.black : Color.white).opacity(isFocused ? 0.08 : 0.12)))
+                        .font(.system(size: 22, weight: .semibold))
+                        .frame(width: 52, height: 52)
+                        .background(RoundedRectangle(cornerRadius: 12).fill((isFocused ? Color.black : Color.white).opacity(isFocused ? 0.08 : 0.12)))
                     Text(family.name)
-                        .font(.system(size: 30, weight: .heavy))
+                        .font(.system(size: 24, weight: .heavy))
                         .lineLimit(2)
                         .minimumScaleFactor(0.75)
                 }
-                Spacer(minLength: 4)
+                Spacer(minLength: 3)
                 Text(L10n.string("live_family_surf", fallback: "Up/Down to surf"))
-                    .font(.system(size: 22)).opacity(0.7)
-                    .frame(height: 32)
+                    .font(.system(size: 18)).opacity(0.7)
+                    .frame(height: 28)
             }
             .foregroundColor(isFocused ? .black : .white)
-            .padding(.top, 18)
-            .padding(.horizontal, 20)
-            .padding(.bottom, 18)
-            .frame(width: 400, height: 240, alignment: .topLeading)
-            .background(RoundedRectangle(cornerRadius: 18, style: .continuous)
+            .padding(.top, 14)
+            .padding(.horizontal, 16)
+            .padding(.bottom, 15)
+            .frame(width: LiveTileSize.width, height: LiveTileSize.height, alignment: .topLeading)
+            .background(RoundedRectangle(cornerRadius: 16, style: .continuous)
                 .fill(isFocused ? Color.white : Color.white.opacity(0.09))
-                .shadow(color: .black.opacity(isFocused ? 0.55 : 0), radius: isFocused ? 20 : 0, y: isFocused ? 10 : 0))
+                .shadow(color: .black.opacity(isFocused ? 0.5 : 0), radius: isFocused ? 16 : 0, y: isFocused ? 8 : 0))
             .scaleEffect(isFocused ? 1.04 : 1)
             .animation(.easeOut(duration: 0.12), value: isFocused)
         }
