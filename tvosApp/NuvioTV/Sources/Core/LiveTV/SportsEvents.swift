@@ -467,7 +467,8 @@ enum SportsMatcher {
         var byVenue: [String: [Int]] = [:]
         var byCity: [String: [Int]] = [:]
         for gameIndex in relevant {
-            guard let venue = games[gameIndex].venue else { continue }
+            // A tennis "venue" is a court ("Centre Court"), not a place to find in listings.
+            guard games[gameIndex].tennis != true, let venue = games[gameIndex].venue else { continue }
             // "Golden 1 Center, Sacramento": the city follows the last comma.
             let parts = venue.components(separatedBy: ", ")
             let name = normalized(parts.count > 1 ? parts.dropLast().joined(separator: ", ") : venue).trimmingCharacters(in: .whitespaces)

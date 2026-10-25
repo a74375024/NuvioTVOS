@@ -66,6 +66,9 @@ struct SportsGame: Codable, Hashable, Identifiable {
     /// (fp1, fp2, fp3, sq, sprint, qual, race), both sides are the Grand
     /// Prix, `venue` is the circuit.
     var racing: Bool? = nil
+    /// A tennis match: both sides are players (or doubles pairs), `venue`
+    /// is the court, `note` the round and tournament ("SF · Brussels").
+    var tennis: Bool? = nil
 
     var title: String {
         if let customTitle { return customTitle }
@@ -103,6 +106,8 @@ final class SportsData: ObservableObject {
         var fights = false
         /// Racing: each event is a race weekend of sessions.
         var racing = false
+        /// Tennis: each event is a tournament of matches.
+        var tennis = false
         var college: Bool { group.hasPrefix("College") }
     }
 
@@ -154,21 +159,37 @@ final class SportsData: ObservableObject {
                mode: .current, keywords: ["formula 1", "f1"], racing: true)
     ]
 
-    static var allLeagues: [League] { leagues + fightLeagues + racingLeagues }
+    /// Tennis: this week's tournaments (one request per tour lists every match).
+    static let tennisLeagues: [League] = [
+        League(path: "tennis/atp", group: "Tennis", short: "ATP", name: "ATP", sport: "Tennis", soccer: false,
+               mode: .current, keywords: ["atp"], tennis: true),
+        League(path: "tennis/wta", group: "Tennis", short: "WTA", name: "WTA", sport: "Tennis", soccer: false,
+               mode: .current, keywords: ["wta"], tennis: true)
+    ]
+
+    static var allLeagues: [League] { leagues + fightLeagues + racingLeagues + tennisLeagues }
 
     /// The leagues looked up: My Sports' picks, or the standard set until
     /// it's set up.
     static var activeLeagues: [League] {
         let prefs = MySports.current
-        guard prefs.configured else { return leagues.filter(\.standard) + racingLeagues }
+        guard prefs.configured else { return leagues.filter(\.standard) + racingLeagues + (tennisSeen ? tennisLeagues : []) }
         let picked = Set(prefs.leagues)
         return leagues.filter { picked.contains($0.short) } + (picked.contains("S:Fighting") ? fightLeagues : [])
             + (picked.contains("S:Motorsport") || racingSeen ? racingLeagues : [])
+            + (picked.contains("S:Tennis") || tennisSeen ? tennisLeagues : [])
     }
 
     // MARK: F1 when your channels have it
 
     private static let racingSeenKey = "nuvio.tv.livetv.racingSeen"
+    private static let tennisSeenKey = "nuvio.tv.livetv.tennisSeen"
+
+    /// Tennis matches were in your channels' event feeds in the last two weeks.
+    static var tennisSeen: Bool {
+        guard let seen = UserDefaults.standard.object(forKey: tennisSeenKey) as? Date else { return false }
+        return Date().timeIntervalSince(seen) < 14 * 86_400
+    }
     private static var racingChecked: Date?
 
     /// F1 feeds were in your channels in the last two weeks: the F1
@@ -181,7 +202,7 @@ final class SportsData: ObservableObject {
 
     /// Live Events opened: look for F1 feeds among the event titles (at
     /// most every 6 hours). Newly found: the F1 schedule is fetched.
-    func noteRacingFeeds(_ events: [LiveEvent]) {
+    func noteSportFeeds(_ events: [LiveEvent]) {
         let now = Date()
         guard !events.isEmpty else { return }
         if let checked = Self.racingChecked, now.timeIntervalSince(checked) < 6 * 3600 { return }
@@ -194,10 +215,18 @@ final class SportsData: ObservableObject {
             return title.range(of: "formula 1", options: .caseInsensitive) != nil
                 || title.range(of: "\\bF1(TV)?\\b", options: [.regularExpression, .caseInsensitive]) != nil
         }
-        guard found else { return }
-        let wasSeen = Self.racingSeen
-        UserDefaults.standard.set(now, forKey: Self.racingSeenKey)
-        if !wasSeen { leaguesChanged() }
+        // Tennis: matches between two players among the event feeds.
+        let tennis = events.contains { $0.league == "Tennis" && SportsMatcher.looksLikeGame($0.title) }
+        var changed = false
+        if found {
+            changed = changed || !Self.racingSeen
+            UserDefaults.standard.set(now, forKey: Self.racingSeenKey)
+        }
+        if tennis {
+            changed = changed || !Self.tennisSeen
+            UserDefaults.standard.set(now, forKey: Self.tennisSeenKey)
+        }
+        if changed { leaguesChanged() }
     }
 
     static let enabledKey = "nuvio.tv.livetv.gameSchedule"
@@ -646,6 +675,14 @@ final class SportsData: ObservableObject {
             return nil
         }
         let data = result.data
+        if league.tennis {
+            let matches = await Task.detached(priority: .utility) { () -> [SportsGame]? in
+                autoreleasepool { SportsParse.tennisMatches(data, league: league) }
+            }.value
+            CrashRecorder.note("schedule \(league.short): \(data.count / 1024) KB, \(matches.map { "\($0.count) matches" } ?? "unreadable")")
+            guard let matches else { return nil }
+            return LeagueResult(games: matches.filter { $0.start >= from && $0.start <= to }, teams: [], total: matches.count)
+        }
         if league.racing {
             let weekends = await Task.detached(priority: .utility) { () -> [SportsGame]? in
                 autoreleasepool { SportsParse.raceWeekends(data, league: league) }
@@ -1170,6 +1207,7 @@ extension SportsParse {
 enum SportsLiveParse {
     static func statuses(_ data: Data, league: SportsData.League) -> [String: LiveStatus] {
         if league.racing { return SportsParse.liveRaceStatuses(data, league: league) }
+        if league.tennis { return SportsParse.liveTennisStatuses(data, league: league) }
         return league.fights ? SportsParse.liveFightStatuses(data, league: league) : SportsParse.liveStatuses(data, league: league)
     }
 }
@@ -1563,5 +1601,158 @@ enum RaceSession {
         for number in 1...3 where value.contains("practice \(number)") || value.contains(" fp\(number) ") { return "fp\(number)" }
         if value.contains(" race ") || value.contains(" grand prix ") || value.contains(" gp ") { return "race" }
         return nil
+    }
+}
+
+// MARK: - Tennis
+
+extension SportsParse {
+    /// "Quarterfinal" → "QF", "Qualifying 1st Round" → "Q1", "2nd Round" → "R2".
+    static func tennisRound(_ text: String?) -> String? {
+        guard let text, !text.isEmpty else { return nil }
+        let value = text.lowercased()
+        let number = value.first(where: \.isNumber).map(String.init)
+        if value.contains("qualif") { return "Q" + (number ?? "") }
+        if value.contains("semi") { return "SF" }
+        if value.contains("quarter") { return "QF" }
+        if value.contains("final") { return "F" }
+        if value.contains("round of"), let digits = Int(value.filter(\.isNumber)) { return "R\(digits)" }
+        if value.contains("round"), let number { return "R" + number }
+        return text.count <= 12 ? text : nil
+    }
+
+    /// ".../countries/500/ita.png" → "ITA".
+    private static func countryCode(_ athlete: [String: Any]) -> String? {
+        guard let flag = (athlete["flag"] as? [String: Any]).flatMap({ text($0["href"]) }),
+              let file = flag.split(separator: "/").last?.split(separator: ".").first,
+              (2...3).contains(file.count), file.allSatisfy(\.isLetter) else { return nil }
+        return file.uppercased()
+    }
+
+    /// A player, or a doubles pair ("Bucsa / Melichar-Martinez").
+    private static func tennisSide(_ competitor: [String: Any]) -> SportsTeam? {
+        var athletes: [[String: Any]] = []
+        if let athlete = competitor["athlete"] as? [String: Any] {
+            athletes = [athlete]
+        } else if let roster = competitor["roster"] as? [String: Any], let list = roster["athletes"] as? [[String: Any]] {
+            athletes = list
+        } else if let list = competitor["athletes"] as? [[String: Any]] {
+            athletes = list
+        }
+        let seed = text(competitor["seed"]).flatMap { Int($0) }
+            ?? (competitor["curatedRank"] as? [String: Any]).flatMap { text($0["current"]) }.flatMap { Int($0) }
+        func lastName(_ athlete: [String: Any]) -> String? {
+            text(athlete["lastName"]) ?? (text(athlete["displayName"])?.split(separator: " ").last).map(String.init)
+        }
+        if athletes.count == 1 {
+            let athlete = athletes[0]
+            guard let name = text(athlete["displayName"]) ?? text(athlete["fullName"]) else { return nil }
+            var alternates: [String] = []
+            if let short = text(athlete["shortName"]), short != name { alternates.append(short) }
+            var team = SportsTeam(id: "p" + (text(athlete["id"]) ?? text(competitor["id"]) ?? name), name: name, short: nil,
+                                  alternates: alternates, badge: nil, country: countryCode(athlete))
+            team.rank = seed.flatMap { $0 > 0 && $0 <= 64 ? $0 : nil }
+            return team
+        }
+        if athletes.count >= 2 {
+            let names = athletes.compactMap(lastName)
+            guard names.count == athletes.count else { return nil }
+            let codes = Set(athletes.compactMap(countryCode))
+            var team = SportsTeam(id: "d" + names.joined(separator: "-"), name: names.joined(separator: " / "), short: nil,
+                                  alternates: names.filter { $0.count >= 4 }, badge: nil, country: codes.count == 1 ? codes.first : nil)
+            team.rank = seed.flatMap { $0 > 0 && $0 <= 32 ? $0 : nil }
+            return team
+        }
+        if let team = competitor["team"] as? [String: Any], let name = text(team["displayName"]) {
+            return SportsTeam(id: "p" + (text(team["id"]) ?? name), name: name)
+        }
+        return nil
+    }
+
+    /// The surname a tile shows ("Rybakina"; doubles as is).
+    static func tennisShort(_ team: SportsTeam) -> String {
+        team.name.contains("/") ? team.name : (team.name.split(separator: " ").last.map(String.init) ?? team.name)
+    }
+
+    private static func tennisGroupings(_ event: [String: Any]) -> [[String: Any]] {
+        if let groupings = event["groupings"] as? [[String: Any]], !groupings.isEmpty { return groupings }
+        return [["competitions": event["competitions"] ?? []]]
+    }
+
+    /// One game per match of the tournaments in the listing.
+    static func tennisMatches(_ data: Data, league: SportsData.League) -> [SportsGame]? {
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let events = object["events"] as? [[String: Any]] else { return nil }
+        var games: [SportsGame] = []
+        for event in events {
+            guard let eventID = text(event["id"]) else { continue }
+            let tournament = text(event["shortName"]) ?? text(event["name"])
+            for grouping in tennisGroupings(event) {
+                for competition in grouping["competitions"] as? [[String: Any]] ?? [] {
+                    guard let matchID = text(competition["id"]),
+                          let start = date(text(competition["date"])) ?? date(text(competition["startDate"])),
+                          let competitors = competition["competitors"] as? [[String: Any]], competitors.count == 2 else { continue }
+                    var home: SportsTeam?
+                    var away: SportsTeam?
+                    for (index, competitor) in competitors.enumerated() {
+                        guard let side = tennisSide(competitor) else { continue }
+                        let homeAway = text(competitor["homeAway"])
+                        if homeAway == "home" || (homeAway == nil && index == 0) { home = side } else { away = side }
+                    }
+                    guard let home, let away else { continue }
+                    let venue = competition["venue"] as? [String: Any]
+                    let court = text(venue?["court"])
+                    let city = (venue?["address"] as? [String: Any]).flatMap { text($0["city"]) } ?? text(venue?["fullName"])
+                    let roundText = (competition["round"] as? [String: Any]).flatMap { text($0["displayName"]) ?? text($0["description"]) }
+                        ?? text(competition["round"])
+                    let place = city?.components(separatedBy: ",").first ?? tournament
+                    let tag = [tennisRound(roundText), place].compactMap { $0 }.joined(separator: " · ")
+                    let status = (competition["status"] as? [String: Any])?["type"] as? [String: Any]
+                    var game = SportsGame(
+                        id: "\(league.short)|\(eventID)|\(matchID)", league: league.group, leagueShort: league.short, isSoccer: false,
+                        weekLabel: nil, home: home, away: away, start: start, networks: networks(competition), venue: court,
+                        completed: (status?["completed"] as? Bool) == true || text(status?["state"])?.lowercased() == "post",
+                        customTitle: "\(tennisShort(away)) vs \(tennisShort(home))", note: tag.isEmpty ? nil : tag
+                    )
+                    game.tennis = true
+                    games.append(game)
+                }
+            }
+        }
+        return games
+    }
+
+    /// Each match's status ("Set 2", "Final") and games per set, by match id.
+    static func liveTennisStatuses(_ data: Data, league: SportsData.League) -> [String: LiveStatus] {
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let events = object["events"] as? [[String: Any]] else { return [:] }
+        var result: [String: LiveStatus] = [:]
+        for event in events {
+            guard let eventID = text(event["id"]) else { continue }
+            for grouping in tennisGroupings(event) {
+                for competition in grouping["competitions"] as? [[String: Any]] ?? [] {
+                    guard let matchID = text(competition["id"]) else { continue }
+                    let statusObject = competition["status"] as? [String: Any]
+                    let type = statusObject?["type"] as? [String: Any]
+                    var phase = livePhase(state: text(type?["state"]), name: text(type?["name"]) ?? "")
+                    if phase == .pre, (type?["completed"] as? Bool) == true { phase = .final }
+                    let period = text(statusObject?["period"]).flatMap { Int($0) } ?? 0
+                    var status = LiveStatus(phase: phase, detail: phase == .final ? "Final"
+                                            : (phase == .live || phase == .delayed ? (period > 0 ? "Set \(period)" : "Live") : ""))
+                    if phase != .pre {
+                        for (index, competitor) in (competition["competitors"] as? [[String: Any]] ?? []).enumerated() {
+                            let sets = (competitor["linescores"] as? [[String: Any]] ?? []).compactMap { line -> String? in
+                                guard let value = text(line["value"]) else { return nil }
+                                return value.hasSuffix(".0") ? String(value.dropLast(2)) : value
+                            }
+                            let homeAway = text(competitor["homeAway"])
+                            if homeAway == "home" || (homeAway == nil && index == 0) { status.homeSets = sets } else { status.awaySets = sets }
+                        }
+                    }
+                    result["\(league.short)|\(eventID)|\(matchID)"] = status
+                }
+            }
+        }
+        return result
     }
 }

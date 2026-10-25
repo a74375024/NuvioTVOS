@@ -11,6 +11,8 @@ enum SportsNames {
 
     /// "Rams" for "Los Angeles Rams", "Utah", "Man City".
     static func short(_ team: SportsTeam, soccer: Bool) -> String {
+        // A doubles pair: "Bucsa / Melichar-Martinez" as is.
+        if team.name.contains(" / ") { return team.name }
         if let first = team.alternates.first, first.count <= 16 { return first }
         if soccer { return team.name }
         let words = team.name.split(separator: " ").map(String.init)
@@ -194,6 +196,11 @@ struct EventWhere: Equatable {
     var liveProgress: Double?
     /// A studio show (pregame, countdown): no live status of its own.
     var studio = false
+    /// Tennis: games per set for the top and bottom lines (scores on), and
+    /// player photos on the sides.
+    var topSets: [String] = []
+    var bottomSets: [String] = []
+    var photos = false
     /// A race weekend: the latest finished session's top 3 (scores on), and its name.
     var podium: [RaceDriver] = []
     var podiumLabel: String?
@@ -272,7 +279,8 @@ final class LiveEventsModel: ObservableObject {
             store.$families.dropFirst().sink { [weak self] _ in self?.scheduleRecompute() },
             store.$logosRevision.dropFirst().sink { [weak self] _ in self?.scheduleRecompute() },
             LiveScores.shared.$revision.dropFirst().sink { [weak self] _ in self?.scheduleRecompute() },
-            RaceData.shared.$revision.dropFirst().sink { [weak self] _ in self?.scheduleRecompute() }
+            RaceData.shared.$revision.dropFirst().sink { [weak self] _ in self?.scheduleRecompute() },
+            PlayerPhotos.shared.$revision.dropFirst().sink { [weak self] _ in self?.scheduleRecompute() }
         ]
         LiveScores.shared.start()
         ticker = Timer.publish(every: 30, on: .main, in: .common).autoconnect().sink { [weak self] date in
@@ -527,6 +535,13 @@ final class LiveEventsModel: ObservableObject {
         event.game == nil && SpecialFeeds.isCameraName(event.title)
     }
 
+    /// An empty slot's name: "No Match Scheduled", "No Event Scheduled".
+    private static func isPlaceholder(_ event: SportsEvent) -> Bool {
+        guard event.game == nil, event.title.hasPrefix("No ") || event.title.hasPrefix("NO ") else { return false }
+        let lower = event.title.lowercased()
+        return lower.hasSuffix(" scheduled") || lower.contains("no event") || lower.contains("no match") || lower.contains("no game")
+    }
+
     /// Camera feeds that move to their race's cameras panel. An in-car feed
     /// or multiview only goes when a tile for its race is on the board (its
     /// name in another tile's title); otherwise it stays a tile of its own.
@@ -614,7 +629,8 @@ final class LiveEventsModel: ObservableObject {
         // Driver-cam feeds belong to their race (its cameras panel), not the rows.
         let source = store.sportsEvents.isEmpty ? store.plainSportsEvents : store.sportsEvents
         let cameras = Self.hiddenCameras(source)
-        let raw = cameras.isEmpty ? source : source.filter { !cameras.contains($0.id) }
+        // Placeholder slots ("No Match Scheduled") aren't events.
+        let raw = source.filter { !cameras.contains($0.id) && !Self.isPlaceholder($0) }
         // Where each game stands, from the live scoreboard.
         let scores = LiveScores.shared
         let statuses = scores.statuses
@@ -663,6 +679,8 @@ final class LiveEventsModel: ObservableObject {
             let state = states[event.id]
             guard state == .live || state == .mayHaveEnded || state == .upcoming || state == .postponed || recentFinal(event),
                   let start = event.start, start < horizon else { return false }
+            // Tennis lists every match on every court: only the ones you can watch.
+            if event.game?.tennis == true { return !event.sources.isEmpty }
             return !event.sources.isEmpty || showUnwatchable
         }
 
@@ -812,6 +830,16 @@ final class LiveEventsModel: ObservableObject {
                 return (kind: String(key[key.index(after: cut)...]), start: start)
             }, results: LiveScores.showsScores)
         }
+        // Tennis players on screen (singles, live or within a day): their photos.
+        var players: [String] = []
+        for row in result {
+            for event in row.events {
+                guard let game = event.game, game.tennis == true, !event.sources.isEmpty,
+                      let start = event.start, start < now.addingTimeInterval(24 * 3600) else { continue }
+                for team in [game.away, game.home] where !team.name.contains("/") { players.append(team.name) }
+            }
+        }
+        if !players.isEmpty { PlayerPhotos.shared.request(players) }
         mySports.scheduleTeamReminders(raw)
         // The top of the screen shows a game, not a whip-around.
         let watchable = all.filter { !$0.sources.isEmpty && !$0.id.hasPrefix("whip|") && !studio.contains($0.id) }
@@ -960,7 +988,7 @@ final class LiveEventsModel: ObservableObject {
             let second = game.isSoccer ? game.away : game.home
             place.top = first
             place.bottom = second
-            place.homeIsTop = game.cardKey == nil ? game.isSoccer : nil
+            place.homeIsTop = game.cardKey == nil && game.tennis != true ? game.isSoccer : nil
             let full = game.customTitle ?? event.title
             place.title = full.components(separatedBy: ":").first?.trimmingCharacters(in: .whitespaces) ?? full
         } else if let teams = event.teams, teams.count == 2 {
@@ -1071,7 +1099,13 @@ final class LiveEventsModel: ObservableObject {
                 place.tag = L10n.string("live_event_red_zone", fallback: "RED ZONE")
                 place.tagAlert = true
             }
-            if LiveScores.showsScores, status.phase != .pre {
+            if game.tennis == true {
+                // Games per set; the match has no single score.
+                if LiveScores.showsScores, status.phase != .pre {
+                    place.topSets = status.awaySets ?? []
+                    place.bottomSets = status.homeSets ?? []
+                }
+            } else if LiveScores.showsScores, status.phase != .pre {
                 let topIsHome = game.isSoccer
                 place.topScore = topIsHome ? status.homeScore : status.awayScore
                 place.bottomScore = topIsHome ? status.awayScore : status.homeScore
@@ -1129,6 +1163,11 @@ final class LiveEventsModel: ObservableObject {
                 : L10n.string("live_event_not_in_channels", fallback: "Not in your channels")
         } else {
             place.footer = L10n.string("live_event_not_in_channels", fallback: "Not in your channels")
+        }
+        // Tennis: the court where the feed's match is, and photos.
+        if let game = event.game, game.tennis == true {
+            if let court = game.venue { place.footer = court }
+            place.photos = true
         }
         // A whip-around: what it's showing across the sport.
         if let whip {
@@ -1205,6 +1244,47 @@ private func countryChip(_ code: String, focused: Bool, size: CGFloat = 13) -> s
         .padding(.horizontal, 5)
         .padding(.vertical, 1)
         .overlay(RoundedRectangle(cornerRadius: 5).strokeBorder((focused ? Color.black : Color.white).opacity(0.6), lineWidth: 2))
+}
+
+/// A tennis player's photo in a circle (TheSportsDB's small size first, the
+/// full one if that fails); initials until there is one.
+private struct PlayerPhotoView: View {
+    let name: String
+    let focused: Bool
+    @ObservedObject private var photos = PlayerPhotos.shared
+    @State private var full = false
+
+    var body: some View {
+        let url = photos.photo(for: name)
+        ZStack {
+            Circle().fill((focused ? Color.black : Color.white).opacity(0.14))
+            if name.contains("/") {
+                // Doubles: no single face.
+                Image(systemName: "person.2.fill").font(.system(size: 14)).opacity(0.6)
+            } else if let url {
+                AsyncImage(url: full ? url : url.appendingPathComponent("small")) { phase in
+                    switch phase {
+                    case .success(let image):
+                        image.resizable().scaledToFill()
+                    case .failure:
+                        initials.onAppear { if !full { full = true } }
+                    default:
+                        initials
+                    }
+                }
+            } else {
+                initials
+            }
+        }
+        .frame(width: 36, height: 36)
+        .clipShape(Circle())
+    }
+
+    private var initials: some View {
+        Text(name.split(separator: " ").prefix(2).compactMap { $0.first.map(String.init) }.joined())
+            .font(.system(size: 12, weight: .heavy))
+            .opacity(0.7)
+    }
 }
 
 /// Runners on first, second and third, as a small diamond.
@@ -1427,9 +1507,9 @@ struct LiveEventTile: View {
             let leader = Self.leader(place.topScore, place.bottomScore)
             VStack(alignment: .leading, spacing: 2) {
                 sideLine(top, home: place.homeIsTop == true, score: place.topScore, leads: leader.map { $0 == 0 },
-                         ball: place.possessionTop == true)
+                         ball: place.possessionTop == true, sets: place.topSets)
                 sideLine(bottom, home: place.homeIsTop == false, score: place.bottomScore, leads: leader.map { $0 == 1 },
-                         ball: place.possessionTop == false)
+                         ball: place.possessionTop == false, sets: place.bottomSets)
             }
         } else {
             HStack(spacing: 14) {
@@ -1459,8 +1539,12 @@ struct LiveEventTile: View {
         return a > b ? 0 : 1
     }
 
-    private func sideLine(_ team: SportsTeam, home: Bool, score: String? = nil, leads: Bool? = nil, ball: Bool = false) -> some View {
+    private func sideLine(_ team: SportsTeam, home: Bool, score: String? = nil, leads: Bool? = nil, ball: Bool = false,
+                          sets: [String] = []) -> some View {
         HStack(spacing: 11) {
+            if place.photos {
+                PlayerPhotoView(name: team.name, focused: focused)
+            }
             if let country = team.country {
                 countryChip(country, focused: focused)
                     .frame(width: 32)
@@ -1477,7 +1561,18 @@ struct LiveEventTile: View {
             if home {
                 Text(L10n.string("live_event_home", fallback: "home")).font(.system(size: 16)).opacity(0.5)
             }
-            if let score {
+            if !sets.isEmpty {
+                // Tennis: games per set, the current set bold.
+                Spacer(minLength: 6)
+                HStack(spacing: 9) {
+                    ForEach(Array(sets.enumerated()), id: \.offset) { index, value in
+                        Text(value)
+                            .font(.system(size: 24, weight: index == sets.count - 1 ? .heavy : .bold).monospacedDigit())
+                            .opacity(index == sets.count - 1 ? 1 : 0.55)
+                    }
+                }
+                .fixedSize()
+            } else if let score {
                 Spacer(minLength: 6)
                 if ball {
                     Image(systemName: "arrowtriangle.left.fill").font(.system(size: 11)).opacity(0.85)
@@ -1896,7 +1991,7 @@ struct LiveEventsBoard: View {
         .onAppear {
             CrashRecorder.note("events: open, \(store.sportsEvents.count) events, \(CrashRecorder.memoryMB()) MB")
             model.start()
-            SportsData.shared.noteRacingFeeds(store.events)
+            SportsData.shared.noteSportFeeds(store.events)
             SportsData.shared.refreshIfNeeded()
             store.sportsOpened()
             onFirstOpen()

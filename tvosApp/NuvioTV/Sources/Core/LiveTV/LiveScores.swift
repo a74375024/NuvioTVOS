@@ -45,6 +45,9 @@ struct LiveStatus: Equatable {
     var boutB: String?
     var boutACountry: String?
     var boutBCountry: String?
+    /// Tennis: games won in each set so far, per side.
+    var homeSets: [String]?
+    var awaySets: [String]?
 }
 
 @MainActor
@@ -150,7 +153,18 @@ final class LiveScores: ObservableObject {
         // player), unless the in-player guide is open.
         if LiveTVStore.shared.isWatching, !holders.contains("guide") { return 60 }
         var windows: [String: [SportsGame]] = [:]
+        // Tennis has matches all day on every court: only the ones you can
+        // watch keep a tour polled.
+        var watchableTennis: Set<String>?
         for game in SportsData.shared.games {
+            if game.tennis == true {
+                if watchableTennis == nil {
+                    watchableTennis = Set(LiveTVStore.shared.sportsEvents.compactMap { event in
+                        event.game?.tennis == true && !event.sources.isEmpty ? event.game?.id : nil
+                    })
+                }
+                guard watchableTennis?.contains(game.id) == true else { continue }
+            }
             let phase = statuses[game.id]?.phase
             if phase == .final || phase == .postponed { continue }
             if phase == nil, (missing[game.id] ?? 0) >= 3 { continue }
@@ -181,7 +195,7 @@ final class LiveScores: ObservableObject {
                 return 1800
             }
             // A race weekend's listing has every session: one request, no day.
-            let days = league.racing ? [""] : Set(games.map { Self.etDay.string(from: $0.start) }).sorted()
+            let days = league.racing || league.tennis ? [""] : Set(games.map { Self.etDay.string(from: $0.start) }).sorted()
             var merged: [String: LiveStatus] = [:]
             var ok = false
             var bytes = 0
