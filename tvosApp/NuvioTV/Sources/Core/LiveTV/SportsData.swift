@@ -1640,15 +1640,24 @@ extension SportsParse {
             athletes = list
         }
         let seed = text(competitor["seed"]).flatMap { Int($0) }
-            ?? (competitor["curatedRank"] as? [String: Any]).flatMap { text($0["current"]) }.flatMap { Int($0) }
         func lastName(_ athlete: [String: Any]) -> String? {
             text(athlete["lastName"]) ?? (text(athlete["displayName"])?.split(separator: " ").last).map(String.init)
         }
         if athletes.count == 1 {
             let athlete = athletes[0]
             guard let name = text(athlete["displayName"]) ?? text(athlete["fullName"]) else { return nil }
+            let upper = name.uppercased()
+            guard upper != "TBD", upper != "TBA", upper != "BYE", upper != "QUALIFIER" else { return nil }
             var alternates: [String] = []
             if let short = text(athlete["shortName"]), short != name { alternates.append(short) }
+            // Feeds write "Rybakina, Elena": surname first finds short
+            // surnames too ("Lys, Eva").
+            let parts = name.split(separator: " ")
+            if parts.count >= 2 {
+                let last = text(athlete["lastName"]) ?? String(parts[parts.count - 1])
+                let first = text(athlete["firstName"]) ?? parts.dropLast().joined(separator: " ")
+                alternates.append("\(last) \(first)")
+            }
             var team = SportsTeam(id: "p" + (text(athlete["id"]) ?? text(competitor["id"]) ?? name), name: name, short: nil,
                                   alternates: alternates, badge: nil, country: countryCode(athlete))
             team.rank = seed.flatMap { $0 > 0 && $0 <= 64 ? $0 : nil }
@@ -1676,7 +1685,8 @@ extension SportsParse {
 
     private static func tennisGroupings(_ event: [String: Any]) -> [[String: Any]] {
         if let groupings = event["groupings"] as? [[String: Any]], !groupings.isEmpty { return groupings }
-        return [["competitions": event["competitions"] ?? []]]
+        let competitions = event["competitions"] as? [[String: Any]] ?? [[String: Any]]()
+        return [["competitions": competitions]]
     }
 
     /// One game per match of the tournaments in the listing.
@@ -1710,7 +1720,9 @@ extension SportsParse {
                     let status = (competition["status"] as? [String: Any])?["type"] as? [String: Any]
                     var game = SportsGame(
                         id: "\(league.short)|\(eventID)|\(matchID)", league: league.group, leagueShort: league.short, isSoccer: false,
-                        weekLabel: nil, home: home, away: away, start: start, networks: networks(competition), venue: court,
+                        // No networks: a match is found through feeds and listings
+                        // naming its players, not every channel of its network.
+                        weekLabel: nil, home: home, away: away, start: start, networks: [], venue: court,
                         completed: (status?["completed"] as? Bool) == true || text(status?["state"])?.lowercased() == "post",
                         customTitle: "\(tennisShort(away)) vs \(tennisShort(home))", note: tag.isEmpty ? nil : tag
                     )

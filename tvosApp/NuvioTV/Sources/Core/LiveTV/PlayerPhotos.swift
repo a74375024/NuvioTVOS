@@ -39,6 +39,7 @@ final class PlayerPhotos: ObservableObject {
     private var queued = Set<String>()
     private var task: Task<Void, Never>?
     private var pausedUntil = Date.distantPast
+    private var lastRequestAt = Date.distantPast
     private var dirty = false
     private let file: URL
 
@@ -95,47 +96,69 @@ final class PlayerPhotos: ObservableObject {
     private func drain() async {
         var found = 0
         var asked = 0
-        while !queue.isEmpty, !Task.isCancelled {
+        while let name = queue.first, !Task.isCancelled {
+            let key = Self.key(name)
+            // Saved meanwhile (another pass): nothing to ask.
+            if let entry = saved.entries[key], Date().timeIntervalSince(entry.at) < 7 * 86_400 {
+                queue.removeFirst()
+                queued.remove(key)
+                continue
+            }
             let today = Self.dayKey.string(from: Date())
             if saved.requestDay != today { saved.requestDay = today; saved.requestCount = 0 }
-            guard saved.requestCount < Self.dailyCap else { break }
-            let name = queue.removeFirst()
-            queued.remove(Self.key(name))
-            if asked > 0 { try? await Task.sleep(nanoseconds: 6_000_000_000) }
+            guard saved.requestCount < Self.dailyCap else {
+                // Done for today: nothing until tomorrow.
+                pausedUntil = Calendar.current.startOfDay(for: Date()).addingTimeInterval(86_400)
+                break
+            }
+            // At least 6 s between searches, across passes too.
+            let wait = 6 - Date().timeIntervalSince(lastRequestAt)
+            if wait > 0 { try? await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000)) }
+            lastRequestAt = Date()
             asked += 1
             saved.requestCount += 1
+            dirty = true
             let query = name.folding(options: .diacriticInsensitive, locale: nil)
                 .replacingOccurrences(of: " ", with: "_")
                 .addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
-            guard let url = URL(string: Self.base + query) else { continue }
+            guard let url = URL(string: Self.base + query) else {
+                queue.removeFirst()
+                queued.remove(key)
+                continue
+            }
             var request = URLRequest(url: url)
             request.timeoutInterval = 15
             guard let result = try? await URLSession.shared.data(for: request),
                   (result.1 as? HTTPURLResponse)?.statusCode == 200 else {
-                // Rate limited or offline: pause, and ask again later.
+                // Rate limited or offline: pause; the name stays queued.
                 pausedUntil = Date().addingTimeInterval(30 * 60)
                 break
             }
             let data = result.0
-            let wanted = Self.key(name)
-            let photo = await Task.detached(priority: .utility) { Self.parse(data, wanted: wanted) }.value
-            saved.entries[wanted] = Entry(url: photo ?? "", at: Date())
+            let photo = await Task.detached(priority: .utility) { Self.parse(data, wanted: key) }.value
+            saved.entries[key] = Entry(url: photo ?? "", at: Date())
+            if let index = queue.firstIndex(of: name) { queue.remove(at: index) }
+            queued.remove(key)
             dirty = true
             if photo != nil {
                 found += 1
                 revision &+= 1
             }
+            // Saved as it goes (a long pass can be cut short).
+            if asked % 10 == 0 { persist() }
         }
-        if dirty {
-            dirty = false
-            // Keep the file small: drop entries past their life.
-            let now = Date()
-            saved.entries = saved.entries.filter { now.timeIntervalSince($0.value.at) < 120 * 86_400 }
-            if let data = try? JSONEncoder().encode(saved) { try? data.write(to: file, options: .atomic) }
-        }
+        persist()
         guard asked > 0 else { return }
         CrashRecorder.note("player photos: \(asked) searched, \(found) found, \(saved.entries.count) saved, "
                            + "\(saved.requestCount) today\(Date() < pausedUntil ? ", paused" : "")")
+    }
+
+    private func persist() {
+        guard dirty else { return }
+        dirty = false
+        let now = Date()
+        saved.entries = saved.entries.filter { now.timeIntervalSince($0.value.at) < 120 * 86_400 }
+        if let data = try? JSONEncoder().encode(saved) { try? data.write(to: file, options: .atomic) }
     }
 
     /// The tennis player whose name matches: cut-out first, else the photo.

@@ -383,7 +383,8 @@ enum SportsMatcher {
         for item in pending {
             guard let start = item.event.start, !item.event.guessed else { continue }
             var nearest: TimeInterval?
-            for gameIndex in item.candidates {
+            // Tennis times are a court's order of play: no clock to learn from.
+            for gameIndex in item.candidates where games[gameIndex].tennis != true {
                 let gap = start.timeIntervalSince(games[gameIndex].start)
                 if abs(gap) <= 14 * 3600, nearest.map({ abs(gap) < abs($0) }) ?? true { nearest = gap }
             }
@@ -420,15 +421,22 @@ enum SportsMatcher {
             autoreleasepool {
                 let event = corrected(item.event)
                 var chosen: Int?
+                // A singles feed (no "/") doesn't go to the same players' doubles.
+                var candidates = item.candidates
+                if !event.title.contains("/") {
+                    let singles = candidates.filter { games[$0].tennis != true || !(games[$0].home.name.contains(" / ") || games[$0].away.name.contains(" / ")) }
+                    if !singles.isEmpty { candidates = singles }
+                }
                 if let start = event.start, !event.guessed {
                     var best: (game: Int, gap: TimeInterval)?
-                    for gameIndex in item.candidates {
+                    for gameIndex in candidates {
                         let gap = abs(start.timeIntervalSince(games[gameIndex].start))
                         if best.map({ gap < $0.gap }) ?? true { best = (gameIndex, gap) }
                     }
-                    if let best, best.gap <= 3 * 3600 { chosen = best.game }
+                    // Tennis: a later match on a court can start hours after its listed time.
+                    if let best, best.gap <= (games[best.game].tennis == true ? 8 : 3) * 3600 { chosen = best.game }
                 } else {
-                    let open = item.candidates.filter {
+                    let open = candidates.filter {
                         !games[$0].completed && games[$0].start > now.addingTimeInterval(-6 * 3600)
                             && games[$0].start < now.addingTimeInterval(7 * 86_400)
                     }.sorted { games[$0].start < games[$1].start }

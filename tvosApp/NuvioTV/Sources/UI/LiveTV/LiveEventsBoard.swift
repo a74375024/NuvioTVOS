@@ -537,9 +537,10 @@ final class LiveEventsModel: ObservableObject {
 
     /// An empty slot's name: "No Match Scheduled", "No Event Scheduled".
     private static func isPlaceholder(_ event: SportsEvent) -> Bool {
-        guard event.game == nil, event.title.hasPrefix("No ") || event.title.hasPrefix("NO ") else { return false }
+        guard event.game == nil else { return false }
         let lower = event.title.lowercased()
-        return lower.hasSuffix(" scheduled") || lower.contains("no event") || lower.contains("no match") || lower.contains("no game")
+        return lower.hasSuffix("no match scheduled") || lower.hasSuffix("no event scheduled") || lower.hasSuffix("no events scheduled")
+            || lower.hasSuffix("no game scheduled") || lower.hasSuffix("no games scheduled")
     }
 
     /// Camera feeds that move to their race's cameras panel. An in-car feed
@@ -1548,7 +1549,7 @@ struct LiveEventTile: View {
             if let country = team.country {
                 countryChip(country, focused: focused)
                     .frame(width: 32)
-            } else {
+            } else if !place.photos {
                 SideBadge(team: team, focused: focused)
             }
             if let rank = team.rank {
