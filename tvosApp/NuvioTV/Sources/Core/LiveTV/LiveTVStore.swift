@@ -2111,6 +2111,7 @@ final class LiveTVStore: ObservableObject {
         }
         overlay = replacing ? nil : .tuning(display)
         candidates = list
+        mergedEventsRevision = -1
         sawFirstFrame = false
         // Events from the stream being replaced don't count any more.
         playingMetaID = nil
@@ -3222,6 +3223,7 @@ final class LiveTVStore: ObservableObject {
 
     private func setSportsEvents(_ value: [SportsEvent]) {
         sportsEvents = value
+        sportsEventsRevision &+= 1
         MySports.shared.scheduleTeamReminders(value)
         var index: [String: [Int]] = [:]
         for (position, event) in value.enumerated() {
@@ -3363,19 +3365,31 @@ final class LiveTVStore: ObservableObject {
     }
 
     /// An event shown as a channel (player, banner, tuning card).
-    func displayChannel(for event: SportsEvent) -> LiveTVChannel {
-        let first = eventCandidates(event).first
+    func displayChannel(for event: SportsEvent, startingWith lead: LiveTVChannel? = nil) -> LiveTVChannel {
+        let first = lead ?? eventCandidates(event).first
         return LiveTVChannel(
             id: event.id, serverID: first?.serverID ?? "", itemID: first?.itemID ?? "", name: event.title,
             number: nil, imageURL: nil, isFavorite: false, group: event.league, shortName: event.title
         )
     }
 
-    func watchSportsEvent(_ event: SportsEvent, preferring sourceID: String? = nil) {
-        let candidates = eventCandidates(event, preferring: sourceID)
+    func watchSportsEvent(_ tapped: SportsEvent, preferring sourceID: String? = nil) {
+        // The store's copy: guide listings are matched in the background, so
+        // a tile picked right after opening may still hold fewer sources.
+        // (Card and whip-around tiles aren't in the store; they stay as is.)
+        let event = sportsEvents.first(where: { $0.id == tapped.id }) ?? tapped
+        var candidates = eventCandidates(event, preferring: sourceID)
         guard !candidates.isEmpty else {
             flash(L10n.string("live_event_no_source", fallback: "Nothing in your channels is showing this yet"))
             return
+        }
+        // Back to a game watched in the last few hours: start on the source
+        // that was on screen when you left it (picked, or a backup).
+        var reason: String?
+        if sourceID == nil, let remembered = rememberedSource(for: event),
+           let at = candidates.firstIndex(where: { $0.id == remembered }) {
+            if at > 0 { candidates.insert(candidates.remove(at: at), at: 0) }
+            reason = "the source you were on"
         }
         // Starting a guide channel: watch the channel itself (the game's
         // event feeds back it up through versions(of:)).
@@ -3386,13 +3400,13 @@ final class LiveTVStore: ObservableObject {
             watchingEvent = event
             return
         }
-        let display = displayChannel(for: event)
+        let display = displayChannel(for: event, startingWith: candidates.first)
         flipList = [display]
         surfStep = 0
         watchingEventID = event.id
         watchingEvent = event
         watchingCamera = nil
-        tune(display, candidates: candidates, from: 0, followFeed: false)
+        tune(display, candidates: candidates, from: 0, followFeed: false, reason: reason)
         if !cameras(for: event).isEmpty {
             flash(L10n.string("live_cameras_hint", fallback: "Press ▼ for onboard cameras"))
         }
@@ -3489,9 +3503,12 @@ final class LiveTVStore: ObservableObject {
     }
 
     /// Another game picked in the player (event guide or Up / Down).
-    func switchToEvent(_ event: SportsEvent, preferring sourceID: String? = nil) {
+    func switchToEvent(_ tapped: SportsEvent, preferring sourceID: String? = nil) {
         closeMiniGuide()
         guard isWatching else { return }
+        // The same copy watchSportsEvent plays.
+        let event = sportsEvents.first(where: { $0.id == tapped.id }) ?? tapped
+        rememberEventSource()
         // Nothing to play: say so and keep the game on screen.
         guard !eventCandidates(event, preferring: sourceID).isEmpty else {
             flash(L10n.string("live_event_no_source", fallback: "Nothing in your channels is showing this yet"))
@@ -3562,6 +3579,7 @@ final class LiveTVStore: ObservableObject {
     }
 
     private func switchInPlayer(to target: LiveTVChannel) {
+        rememberEventSource()
         watchingEventID = nil
         playerOnScreen = false
         playerMetaID = nil
@@ -3575,6 +3593,7 @@ final class LiveTVStore: ObservableObject {
     func stopWatching() {
         LiveOverlayState.shared.miniGuideOpen = false
         LiveOverlayState.shared.camerasOpen = false
+        rememberEventSource()
         watchingEventID = nil
         watchingEvent = nil
         // The provider may take a moment to let go of the stream: the guide
@@ -3643,6 +3662,7 @@ final class LiveTVStore: ObservableObject {
     /// Every version of what's playing, for the player's Sources panel (none
     /// while surfing an event family, whose feeds are different events).
     func playingFeedSources() -> [NuvioStream] {
+        mergeFreshEventSources()
         guard isWatching, surfStep == 0, candidates.count > 1 else { return [] }
         return candidates.map { feed in
             var parts: [String] = []
@@ -3663,8 +3683,104 @@ final class LiveTVStore: ObservableObject {
 
     /// How many versions the Sources panel would list (0 when it has none).
     var playingFeedCount: Int {
+        mergeFreshEventSources()
         guard isWatching, surfStep == 0, candidates.count > 1 else { return 0 }
         return candidates.count
+    }
+
+    /// Sources found for the game on screen after it started (guide listings
+    /// are matched in the background) join the end of the list: they show in
+    /// Sources and back up the rest. Only looks again when the events change.
+    private var sportsEventsRevision = 0
+    private var mergedEventsRevision = -1
+
+    private func mergeFreshEventSources() {
+        // The game itself on screen (not one of its guide channels, whose
+        // Sources list that channel's own versions).
+        guard isWatching, surfStep == 0, watchingCamera == nil, let eventID = watchingEventID,
+              watching?.id == eventID, mergedEventsRevision != sportsEventsRevision else { return }
+        mergedEventsRevision = sportsEventsRevision
+        guard let fresh = sportsEvents.first(where: { $0.id == eventID }) else { return }
+        var known = Set(candidates.map(\.id))
+        var added = 0
+        for channel in eventCandidates(fresh) where known.insert(channel.id).inserted {
+            candidates.append(channel)
+            added += 1
+        }
+        if added > 0 {
+            watchingEvent = fresh
+            // Read from the player's controls: log after this update.
+            let detail = "\(added) found since the game started, \(candidates.count) in all"
+            Task { @MainActor [weak self] in
+                self?.log("more sources", detail: detail)
+            }
+        }
+    }
+
+    // MARK: Last source per game
+    //
+    // The version on screen when you leave a game (one you picked, or a
+    // backup recovery moved to) is where it starts next time. Small and
+    // short-lived: game → "feed id|time", at most 40 games, each forgotten
+    // after 6 hours; written only when leaving or switching games.
+
+    private static let eventSourcesKey = "nuvio.tv.livetv.eventSources"
+    private static let eventSourceLife: TimeInterval = 6 * 3600
+    private static let eventSourceCap = 40
+    private var eventSourceMemory: [String: String]?
+
+    private static func eventSourceStamp(_ value: String) -> (feedID: String, time: TimeInterval)? {
+        guard let bar = value.lastIndex(of: "|"), let time = TimeInterval(value[value.index(after: bar)...]) else { return nil }
+        return (String(value[..<bar]), time)
+    }
+
+    private func eventSourceKey(_ event: SportsEvent) -> String { event.game?.id ?? event.id }
+
+    private func loadedEventSources() -> [String: String] {
+        if let eventSourceMemory { return eventSourceMemory }
+        let stored = UserDefaults.standard.dictionary(forKey: Self.eventSourcesKey) as? [String: String] ?? [:]
+        eventSourceMemory = stored
+        return stored
+    }
+
+    private func rememberedSource(for event: SportsEvent) -> String? {
+        guard let value = loadedEventSources()[eventSourceKey(event)], let stamp = Self.eventSourceStamp(value),
+              Date().timeIntervalSince1970 - stamp.time < Self.eventSourceLife else { return nil }
+        return stamp.feedID
+    }
+
+    private func rememberEventSource() {
+        // Not a source that just failed (the failure card is up).
+        guard isWatching, overlay == nil, surfStep == 0, watchingCamera == nil,
+              let event = watchingEvent, event.id == watchingEventID, candidateIndex < candidates.count else { return }
+        // What's playing; or, before its picture came up, the one just
+        // picked in Sources.
+        let feedID: String
+        if sawFirstFrame {
+            feedID = candidates[candidateIndex].id
+        } else if let manualFeedID, candidates.contains(where: { $0.id == manualFeedID }) {
+            feedID = manualFeedID
+        } else {
+            return
+        }
+        let now = Date().timeIntervalSince1970
+        let key = eventSourceKey(event)
+        var map = loadedEventSources()
+        // Same source, saved in the last minute: nothing to write.
+        if let stamp = map[key].flatMap(Self.eventSourceStamp), stamp.feedID == feedID, now - stamp.time < 60 { return }
+        map = map.filter { entry in
+            guard let stamp = Self.eventSourceStamp(entry.value) else { return false }
+            return now - stamp.time < Self.eventSourceLife
+        }
+        map[key] = feedID + "|" + String(Int(now))
+        if map.count > Self.eventSourceCap {
+            let oldest = map.sorted { a, b in
+                (Self.eventSourceStamp(a.value)?.time ?? 0) < (Self.eventSourceStamp(b.value)?.time ?? 0)
+            }.prefix(map.count - Self.eventSourceCap).map(\.key)
+            for old in oldest { map[old] = nil }
+        }
+        eventSourceMemory = map
+        UserDefaults.standard.set(map, forKey: Self.eventSourcesKey)
     }
 
     nonisolated static func feedToken(_ feedID: String) -> String {
