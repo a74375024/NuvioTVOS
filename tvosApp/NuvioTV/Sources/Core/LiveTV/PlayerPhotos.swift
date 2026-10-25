@@ -2,7 +2,8 @@ import Foundation
 
 // MARK: - Tennis player photos
 //
-// Cut-out photos for the players on tennis tiles, from TheSportsDB's free
+// Cut-out photos for the players on tennis tiles (and F1 drivers when the
+// race data has none), from TheSportsDB's free
 // player search. Kept light:
 // - only players in matches you can watch, live or within the next day;
 // - one search per player, saved for 90 days (a miss is tried again after
@@ -165,7 +166,8 @@ final class PlayerPhotos: ObservableObject {
     nonisolated private static func parse(_ data: Data, wanted: String) -> String? {
         let root = autoreleasepool { (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] }
         for player in root?["player"] as? [[String: Any]] ?? [] {
-            guard (player["strSport"] as? String)?.lowercased() == "tennis",
+            // Tennis players, and racing drivers for the F1 cameras panel.
+            guard let sport = (player["strSport"] as? String)?.lowercased(), sport == "tennis" || sport == "motorsport",
                   let name = player["strPlayer"] as? String, key(name) == wanted else { continue }
             for field in ["strCutout", "strThumb"] {
                 if let url = player[field] as? String, url.hasPrefix("https://") { return url }

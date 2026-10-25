@@ -156,7 +156,11 @@ final class SportsData: ObservableObject {
     /// Racing: the current race weekend (one request lists every session).
     static let racingLeagues: [League] = [
         League(path: "racing/f1", group: "Motorsport", short: "F1", name: "Formula 1", sport: "Motorsport", soccer: false,
-               mode: .current, keywords: ["formula 1", "f1"], racing: true)
+               mode: .current, keywords: ["formula 1", "f1"], racing: true),
+        // NASCAR Cup: its race and TV network (NBC, FOX…), so your local
+        // stations carrying it are on the race's tile.
+        League(path: "racing/nascar-premier", group: "Motorsport", short: "NASCAR", name: "NASCAR Cup Series", sport: "Motorsport",
+               soccer: false, mode: .current, keywords: ["nascar"], racing: true)
     ]
 
     /// Tennis: this week's tournaments (one request per tour lists every match).
@@ -210,6 +214,7 @@ final class SportsData: ObservableObject {
         let found = events.contains { event in
             let title = event.title
             // Cheap test first; the pattern only for titles that might be F1.
+            if title.range(of: "nascar", options: .caseInsensitive) != nil { return true }
             guard title.range(of: "f1", options: .caseInsensitive) != nil
                     || title.range(of: "formula", options: .caseInsensitive) != nil else { return false }
             return title.range(of: "formula 1", options: .caseInsensitive) != nil
@@ -1489,11 +1494,14 @@ extension SportsParse {
             }
             let country = text(address?["country"]).flatMap { $0.count <= 3 ? $0.uppercased() : nil }
             let side = SportsTeam(id: "r\(id)", name: gp, country: country)
-            for competition in event["competitions"] as? [[String: Any]] ?? [] {
+            let competitions = event["competitions"] as? [[String: Any]] ?? []
+            for competition in competitions {
                 guard let sessionID = text(competition["id"]),
                       let start = date(text(competition["date"])) ?? date(text(competition["startDate"])) else { continue }
                 let type = competition["type"] as? [String: Any]
-                let kind = RaceSession.kind(text(type?["abbreviation"]) ?? text(type?["text"]) ?? "")
+                let typeText = text(type?["abbreviation"]) ?? text(type?["text"]) ?? ""
+                // A weekend listed as its race alone (NASCAR): the race.
+                let kind = typeText.isEmpty && competitions.count == 1 ? "race" : RaceSession.kind(typeText)
                 let status = (competition["status"] as? [String: Any])?["type"] as? [String: Any]
                 let state = text(status?["state"])?.lowercased()
                 var game = SportsGame(

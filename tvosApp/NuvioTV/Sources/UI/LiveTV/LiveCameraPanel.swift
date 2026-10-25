@@ -8,6 +8,8 @@ struct LiveCameraPanel: View {
     @ObservedObject private var store = LiveTVStore.shared
     /// Driver photos, numbers and official team colors (F1).
     @ObservedObject private var race = RaceData.shared
+    /// F1 drivers' photos when the race data can't be had (it's closed during sessions).
+    @ObservedObject private var photos = PlayerPhotos.shared
     @FocusState private var focus: String?
     @State private var followed = SpecialFeeds.followedDrivers
 
@@ -81,7 +83,14 @@ struct LiveCameraPanel: View {
         .onAppear {
             // Drivers, once a weekend (F1) or week (NASCAR); nothing when saved.
             let f1 = isF1
-            if f1 { race.refreshIfNeeded(sessions: [], results: false) } else { race.refreshNascarIfNeeded() }
+            if f1 {
+                race.refreshIfNeeded(sessions: [], results: false)
+                // Drivers without race data: their photos from the player search (saved 90 days).
+                let missing = feeds.filter { $0.kind == .driver && race.driver(named: $0.title)?.headshot == nil }.map(\.title)
+                if !missing.isEmpty { photos.request(missing) }
+            } else {
+                race.refreshNascarIfNeeded()
+            }
             let all = feeds
             let photos = all.filter { $0.kind == .driver && driverInfo($0, f1: f1)?.headshot != nil }.count
             CrashRecorder.note("cameras: open, \(all.count) feeds, \(all.filter { $0.kind == .driver }.count) drivers, "
@@ -99,7 +108,13 @@ struct LiveCameraPanel: View {
     /// Photo, number and color for a driver's camera.
     private func driverInfo(_ feed: CameraFeed, f1: Bool) -> RaceDriver? {
         guard feed.kind == .driver else { return nil }
-        return f1 ? race.driver(named: feed.title) : race.nascarDriver(named: feed.title)
+        guard f1 else { return race.nascarDriver(named: feed.title) }
+        if let driver = race.driver(named: feed.title), driver.headshot != nil { return driver }
+        // No race data: the photo from the player search, the team's color.
+        guard let photo = photos.photo(for: feed.title) else { return race.driver(named: feed.title) }
+        let initials = feed.title.split(separator: " ").prefix(2).compactMap { $0.first.map(String.init) }.joined().uppercased()
+        return RaceDriver(number: 0, code: initials, name: feed.title, team: feed.team ?? "",
+                          color: SpecialFeeds.teamColor(feed.team), headshot: photo.absoluteString)
     }
 
     private func isOnScreen(_ feed: CameraFeed) -> Bool {

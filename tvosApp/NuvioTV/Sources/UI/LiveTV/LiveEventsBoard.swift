@@ -824,7 +824,7 @@ final class LiveEventsModel: ObservableObject {
         }
         // Race weekends you can watch: their drivers and results (a few
         // requests a weekend; nothing for weekends not in your channels).
-        for (id, parts) in newCards where parts.first?.game?.racing == true
+        for (id, parts) in newCards where parts.first?.game?.leagueShort == "F1"
             && newPlaces[id] != nil && all.contains(where: { $0.id == id && !$0.sources.isEmpty }) {
             RaceData.shared.refreshIfNeeded(sessions: parts.compactMap { part -> (kind: String, start: Date)? in
                 guard let start = part.start, let key = part.game?.cardKey, let cut = key.lastIndex(of: "|") else { return nil }
@@ -1074,7 +1074,7 @@ final class LiveEventsModel: ObservableObject {
             }
             place.top = nil
             place.bottom = nil
-            if LiveScores.showsScores {
+            if LiveScores.showsScores, parts.first?.game?.leagueShort == "F1" {
                 for part in parts.reversed() {
                     guard let start = part.start, start < now, let key = part.game?.cardKey,
                           let cut = key.lastIndex(of: "|") else { continue }

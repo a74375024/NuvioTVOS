@@ -128,6 +128,7 @@ enum SpecialFeeds {
     }
 
     static func isNASCAR(_ event: SportsEvent) -> Bool {
+        if event.leagueShort == "NASCAR" || event.game?.leagueShort == "NASCAR" { return true }
         let text = (event.title + " " + event.league).lowercased()
         if text.contains("nascar") || text.contains("cup series") || text.contains("xfinity") || text.contains("truck series") { return true }
         // A race named only by its sponsor ("YellaWood 500", league

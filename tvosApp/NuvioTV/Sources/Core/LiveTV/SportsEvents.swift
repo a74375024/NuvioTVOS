@@ -308,10 +308,20 @@ enum SportsMatcher {
         }
         // Race weekend sessions, for feeds named after a session.
         let raceSessions = games.indices.filter { games[$0].racing == true }
+        // Other races (NASCAR) are found by their name's words ("YellaWood").
+        var raceWords: [Int: Set<String>] = [:]
+        for index in raceSessions where games[index].leagueShort != "F1" {
+            let words = Set(normalized(games[index].home.name).split(separator: " ").map(String.init).filter {
+                $0.count >= 5 && !["nascar", "series", "racing", "speedway", "motor", "sports", "grand"].contains($0)
+            })
+            if !words.isEmpty { raceWords[index] = words }
+        }
+        let raceWordList = Array(Set(raceWords.values.flatMap { $0 }))
         for event in events {
             autoreleasepool {
                 let inWindow = event.start.map { $0 > low && $0 < high } ?? true
-                if inWindow, !raceSessions.isEmpty, let target = raceTarget(event, sessions: raceSessions, games: games) {
+                if inWindow, !raceSessions.isEmpty, let target = raceTarget(event, sessions: raceSessions, games: games,
+                                                                                 raceWords: raceWords, raceWordList: raceWordList) {
                     stats.filtered += 1
                     var value = entry(target)
                     // The main broadcast first, then Sky and other feeds.
@@ -417,6 +427,10 @@ enum SportsMatcher {
         // within 3 h of it; further away it's a replay (hidden). A title
         // with no day goes to that matchup's next game (at its clock time
         // when one is given).
+        // Per channel group, titles with no day that named a finished game
+        // (yesterday's slate still in its slots) vs. a game still to come.
+        var staleByFamily: [String: Int] = [:]
+        var freshByFamily: [String: Int] = [:]
         for item in pending {
             autoreleasepool {
                 let event = corrected(item.event)
@@ -445,7 +459,12 @@ enum SportsMatcher {
                     } else {
                         chosen = open.first
                     }
-                    if chosen != nil { stats.guessedMatched += 1 }
+                    if chosen != nil {
+                        stats.guessedMatched += 1
+                        freshByFamily[event.family, default: 0] += 1
+                    } else {
+                        staleByFamily[event.family, default: 0] += 1
+                    }
                 }
                 guard let gameIndex = chosen else {
                     stats.replays += 1
@@ -546,6 +565,13 @@ enum SportsMatcher {
         for original in unmatched {
             autoreleasepool {
                 let event = corrected(original)
+                // A group whose day-less titles are mostly yesterday's games:
+                // its other day-less titles are too.
+                let staleCount = staleByFamily[event.family] ?? 0
+                if event.guessed, staleCount >= 3, staleCount > 3 * (freshByFamily[event.family] ?? 0) {
+                    stats.stale += 1
+                    return
+                }
                 let key = pairKey(event.title)
                 if let key, let index = byPair[key]?.first(where: { closeEnough(loose[$0].start, event.start) }) {
                     for feed in event.feeds where !loose[index].sources.contains(where: { $0.channelID == feed }) {
@@ -1078,30 +1104,38 @@ enum SportsMatcher {
     /// The race session a provider feed is: an F1 feed naming the session
     /// ("Formula 1: United States: Race [Main Broadcast]", "2617 GP F1
     /// Qualifying") at about its time, or the session on at the feed's time.
-    private static func raceTarget(_ event: ProviderEvent, sessions: [Int], games: [SportsGame]) -> Int? {
-        // Cheap test first: most feeds aren't racing.
+    private static func raceTarget(_ event: ProviderEvent, sessions: [Int], games: [SportsGame],
+                                   raceWords: [Int: Set<String>], raceWordList: [String]) -> Int? {
+        // Cheap tests first: most feeds aren't racing.
         let raw = event.title + " " + event.family
-        guard raw.range(of: "f1", options: .caseInsensitive) != nil || raw.range(of: "formula", options: .caseInsensitive) != nil else {
-            return nil
-        }
+        let maybeF1 = raw.range(of: "f1", options: .caseInsensitive) != nil || raw.range(of: "formula", options: .caseInsensitive) != nil
+        let lowered = raceWordList.isEmpty ? "" : raw.lowercased()
+        let maybeOther = !raceWordList.isEmpty && raceWordList.contains { lowered.contains($0) }
+        guard maybeF1 || maybeOther else { return nil }
         let text = normalized(raw)
-        guard text.contains(" f1 ") || text.contains(" formula 1 ") || text.contains(" formula one ") || text.contains(" f1tv ") else {
-            return nil
-        }
+        let isF1 = maybeF1 && (text.contains(" f1 ") || text.contains(" formula 1 ") || text.contains(" formula one ") || text.contains(" f1tv "))
+        guard isF1 || maybeOther else { return nil }
         // Cameras go to the race's cameras panel; shows around it aren't it.
         if SpecialFeeds.isCameraName(event.title) || isStudioShow(event.title) { return nil }
-        let kind = RaceSession.kind(inTitle: normalized(event.title))
+        let kind = isF1 ? RaceSession.kind(inTitle: normalized(event.title)) : nil
         // A guessed day isn't a time to go by.
         let start = event.guessed ? nil : event.start
         guard kind != nil || start != nil else { return nil }
+        let titleWords = maybeOther ? Set(text.split(separator: " ").map(String.init)) : []
         var best: (index: Int, gap: TimeInterval)?
         for index in sessions {
             let game = games[index]
-            if let kind, game.cardKey?.hasSuffix("|" + kind) != true { continue }
             let gap = start.map { abs($0.timeIntervalSince(game.start)) } ?? 0
-            // A named session: the nearest of its kind (they're a week apart;
-            // a feed's clock may be hours off). Otherwise the one on then.
-            guard gap <= (kind == nil ? 90 * 60 : 14 * 3600) else { continue }
+            if game.leagueShort == "F1" {
+                guard isF1 else { continue }
+                if let kind, game.cardKey?.hasSuffix("|" + kind) != true { continue }
+                // A named session: the nearest of its kind (they're a week apart;
+                // a feed's clock may be hours off). Otherwise the one on then.
+                guard gap <= (kind == nil ? 90 * 60 : 14 * 3600) else { continue }
+            } else {
+                // Another race: a word of its name in the feed, at about its time.
+                guard start != nil, let words = raceWords[index], !words.isDisjoint(with: titleWords), gap <= 3 * 3600 else { continue }
+            }
             if best.map({ gap < $0.gap }) ?? true { best = (index, gap) }
         }
         return best?.index
