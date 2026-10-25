@@ -92,9 +92,9 @@ struct LiveCameraPanel: View {
                 race.refreshNascarIfNeeded()
             }
             let all = feeds
-            let photos = all.filter { $0.kind == .driver && driverInfo($0, f1: f1)?.headshot != nil }.count
+            let withPhotos = all.filter { $0.kind == .driver && driverInfo($0, f1: f1)?.headshot != nil }.count
             CrashRecorder.note("cameras: open, \(all.count) feeds, \(all.filter { $0.kind == .driver }.count) drivers, "
-                               + "\(photos) with photos (\(f1 ? "F1" : "NASCAR"))")
+                               + "\(withPhotos) with photos (\(f1 ? "F1" : "NASCAR"))")
             let current = store.playingFeedID
             let target = feeds.first { $0.channel.id == current || $0.alternates.contains { $0.id == current } }?.id
                 ?? quickList.first?.id ?? driverList.first?.id
@@ -109,9 +109,15 @@ struct LiveCameraPanel: View {
     private func driverInfo(_ feed: CameraFeed, f1: Bool) -> RaceDriver? {
         guard feed.kind == .driver else { return nil }
         guard f1 else { return race.nascarDriver(named: feed.title) }
-        if let driver = race.driver(named: feed.title), driver.headshot != nil { return driver }
-        // No race data: the photo from the player search, the team's color.
-        guard let photo = photos.photo(for: feed.title) else { return race.driver(named: feed.title) }
+        let known = race.driver(named: feed.title)
+        if let known, known.headshot != nil { return known }
+        // No photo in the race data: the one from the player search (the
+        // race data's number and color kept when it has them).
+        guard let photo = photos.photo(for: feed.title) else { return known }
+        if let known {
+            return RaceDriver(number: known.number, code: known.code, name: known.name, team: known.team,
+                              color: known.color, headshot: photo.absoluteString)
+        }
         let initials = feed.title.split(separator: " ").prefix(2).compactMap { $0.first.map(String.init) }.joined().uppercased()
         return RaceDriver(number: 0, code: initials, name: feed.title, team: feed.team ?? "",
                           color: SpecialFeeds.teamColor(feed.team), headshot: photo.absoluteString)

@@ -557,10 +557,22 @@ final class LiveEventsModel: ObservableObject {
             }
         }
         guard !byRace.isEmpty else { return hidden }
+        // Each race's keys: its distinctive words and number ("yellawood",
+        // "500"); a tile you can watch whose title has one is that race.
+        let stop: Set<String> = ["nascar", "series", "racing", "speedway", "motor", "sports", "grand"]
+        var keys: [String: [String]] = [:]
+        for race in byRace.keys {
+            let tokens = race.split { !$0.isLetter && !$0.isNumber }.map(String.init)
+            let list = tokens.filter { token in
+                (token.count >= 5 && !stop.contains(token)) || (token.count >= 3 && token.allSatisfy { $0.isNumber })
+            }
+            keys[race] = list.isEmpty ? [race] : list
+        }
         var found = Set<String>()
-        for event in events where !isCameraFeed(event) {
+        for event in events where !event.sources.isEmpty && !isCameraFeed(event)
+            && (event.league == "Motorsport" || event.league == "Other" || event.league.isEmpty) {
             let title = event.title.lowercased()
-            for race in byRace.keys where !found.contains(race) && title.contains(race) { found.insert(race) }
+            for (race, list) in keys where !found.contains(race) && list.contains(where: { title.contains($0) }) { found.insert(race) }
             if found.count == byRace.count { break }
         }
         for race in found { hidden.formUnion(byRace[race] ?? []) }

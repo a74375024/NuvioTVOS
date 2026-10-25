@@ -94,6 +94,8 @@ struct SportsEvent: Identifiable, Hashable, Codable {
             return 5 * 3600
         case "Motorsport":
             // A race weekend session: its own usual length.
+            // A NASCAR Cup race runs 3–4 hours.
+            if game?.leagueShort == "NASCAR" { return 3.75 * 3600 }
             if game?.racing == true, let key = game?.cardKey, let cut = key.lastIndex(of: "|") {
                 return RaceSession.length(String(key[key.index(after: cut)...]))
             }
@@ -309,14 +311,18 @@ enum SportsMatcher {
         // Race weekend sessions, for feeds named after a session.
         let raceSessions = games.indices.filter { games[$0].racing == true }
         // Other races (NASCAR) are found by their name's words ("YellaWood").
-        var raceWords: [Int: Set<String>] = [:]
+        // Its distinctive words and its number ("YellaWood 500" → yellawood, 500).
+        var raceWords: [Int: (words: Set<String>, number: String?)] = [:]
         for index in raceSessions where games[index].leagueShort != "F1" {
-            let words = Set(normalized(games[index].home.name).split(separator: " ").map(String.init).filter {
-                $0.count >= 5 && !["nascar", "series", "racing", "speedway", "motor", "sports", "grand"].contains($0)
+            let tokens = normalized(games[index].home.name).split(separator: " ").map(String.init)
+            let words = Set(tokens.filter {
+                $0.count >= 5 && !$0.allSatisfy(\.isNumber)
+                    && !["nascar", "series", "racing", "speedway", "motor", "sports", "grand"].contains($0)
             })
-            if !words.isEmpty { raceWords[index] = words }
+            let number = tokens.first { $0.count >= 3 && $0.allSatisfy(\.isNumber) }
+            if !words.isEmpty || number != nil { raceWords[index] = (words, number) }
         }
-        let raceWordList = Array(Set(raceWords.values.flatMap { $0 }))
+        let raceWordList = raceWords.isEmpty ? [] : Array(Set(raceWords.values.flatMap { $0.words } + ["nascar"]))
         for event in events {
             autoreleasepool {
                 let inWindow = event.start.map { $0 > low && $0 < high } ?? true
@@ -431,6 +437,7 @@ enum SportsMatcher {
         // (yesterday's slate still in its slots) vs. a game still to come.
         var staleByFamily: [String: Int] = [:]
         var freshByFamily: [String: Int] = [:]
+        let startOfToday = Calendar.current.startOfDay(for: now)
         for item in pending {
             autoreleasepool {
                 let event = corrected(item.event)
@@ -459,11 +466,16 @@ enum SportsMatcher {
                     } else {
                         chosen = open.first
                     }
+                    // Counted per group and sport, for day-less titles only:
+                    // fresh when it names a game still to come, stale when the
+                    // game it names was before today (not earlier today).
+                    let familyKey = event.family + "|" + event.league
                     if chosen != nil {
                         stats.guessedMatched += 1
-                        freshByFamily[event.family, default: 0] += 1
-                    } else {
-                        staleByFamily[event.family, default: 0] += 1
+                        if event.guessed, !event.family.isEmpty { freshByFamily[familyKey, default: 0] += 1 }
+                    } else if event.guessed, !event.family.isEmpty,
+                              candidates.contains(where: { games[$0].start < startOfToday }) {
+                        staleByFamily[familyKey, default: 0] += 1
                     }
                 }
                 guard let gameIndex = chosen else {
@@ -567,8 +579,9 @@ enum SportsMatcher {
                 let event = corrected(original)
                 // A group whose day-less titles are mostly yesterday's games:
                 // its other day-less titles are too.
-                let staleCount = staleByFamily[event.family] ?? 0
-                if event.guessed, staleCount >= 3, staleCount > 3 * (freshByFamily[event.family] ?? 0) {
+                let familyKey = event.family + "|" + event.league
+                let staleCount = staleByFamily[familyKey] ?? 0
+                if event.guessed, !event.family.isEmpty, staleCount >= 3, staleCount > 3 * (freshByFamily[familyKey] ?? 0) {
                     stats.stale += 1
                     return
                 }
@@ -645,6 +658,19 @@ enum SportsMatcher {
         var hidden = Set<Int>()
         if !rosters.isEmpty {
             let indexes = rosters.map { (league: $0, index: TeamIndex(teams: $0.teams, college: $0.college)) }
+            // College: the schedule has every game between the schools it
+            // knows (FBS; all of Division I in basketball), so two of them
+            // with no game is a leftover too. Only while that schedule is
+            // loaded; basketball only with both men's and women's (a game
+            // of the one not looked up isn't in it). Schools it doesn't
+            // know (FCS and below) are left alone.
+            let scheduled = Set(games.map(\.league))
+            var complete = completeLeagues
+            if scheduled.contains("College Football") { complete.insert("College Football") }
+            let shorts = Set(rosters.map(\.short))
+            if scheduled.contains("College Basketball"), shorts.contains("NCAAM"), shorts.contains("NCAAW") {
+                complete.insert("College Basketball")
+            }
             for position in others.indices where others[position].game == nil {
                 autoreleasepool {
                     let event = others[position]
@@ -660,7 +686,7 @@ enum SportsMatcher {
                         if let pair = item.index.pair(event.title) { found.append((item.league, pair.0, pair.1)) }
                     }
                     guard let hit = found.first, Set(found.map { $0.league.group }).count == 1 else { return }
-                    if completeLeagues.contains(hit.league.group) {
+                    if complete.contains(hit.league.group) {
                         hidden.insert(position)
                         stats.stale += 1
                         return
@@ -1105,7 +1131,7 @@ enum SportsMatcher {
     /// ("Formula 1: United States: Race [Main Broadcast]", "2617 GP F1
     /// Qualifying") at about its time, or the session on at the feed's time.
     private static func raceTarget(_ event: ProviderEvent, sessions: [Int], games: [SportsGame],
-                                   raceWords: [Int: Set<String>], raceWordList: [String]) -> Int? {
+                                   raceWords: [Int: (words: Set<String>, number: String?)], raceWordList: [String]) -> Int? {
         // Cheap tests first: most feeds aren't racing.
         let raw = event.title + " " + event.family
         let maybeF1 = raw.range(of: "f1", options: .caseInsensitive) != nil || raw.range(of: "formula", options: .caseInsensitive) != nil
@@ -1118,11 +1144,16 @@ enum SportsMatcher {
         // Cameras go to the race's cameras panel; shows around it aren't it.
         if SpecialFeeds.isCameraName(event.title) || isStudioShow(event.title) { return nil }
         let kind = isF1 ? RaceSession.kind(inTitle: normalized(event.title)) : nil
-        // A guessed day isn't a time to go by.
+        // A guessed day isn't a time to go by (other races compare the clock).
         let start = event.guessed ? nil : event.start
-        guard kind != nil || start != nil else { return nil }
+        guard kind != nil || start != nil || (maybeOther && event.start != nil) else { return nil }
         let titleWords = maybeOther ? Set(text.split(separator: " ").map(String.init)) : []
+        // Another race (NASCAR) only from a racing feed, not a game.
+        let otherAllowed = maybeOther && (event.league == "Motorsport" || event.league == "Other" || event.league.isEmpty)
+            && !looksLikeGame(event.title)
+        let saysNascar = text.contains(" nascar ") || text.contains(" cup series ")
         var best: (index: Int, gap: TimeInterval)?
+        var bestOther: (index: Int, gap: TimeInterval)?
         for index in sessions {
             let game = games[index]
             let gap = start.map { abs($0.timeIntervalSince(game.start)) } ?? 0
@@ -1132,13 +1163,25 @@ enum SportsMatcher {
                 // A named session: the nearest of its kind (they're a week apart;
                 // a feed's clock may be hours off). Otherwise the one on then.
                 guard gap <= (kind == nil ? 90 * 60 : 14 * 3600) else { continue }
+                if best.map({ gap < $0.gap }) ?? true { best = (index, gap) }
             } else {
-                // Another race: a word of its name in the feed, at about its time.
-                guard start != nil, let words = raceWords[index], !words.isDisjoint(with: titleWords), gap <= 3 * 3600 else { continue }
+                // Another race: its name's word or number, with "NASCAR" or
+                // both, at about its time (a day-less time: the same clock today).
+                guard otherAllowed, let info = raceWords[index] else { continue }
+                let hasWord = !info.words.isDisjoint(with: titleWords)
+                let hasNumber = info.number.map { titleWords.contains($0) } ?? false
+                guard (hasWord && (hasNumber || saysNascar)) || (hasNumber && saysNascar) else { continue }
+                if event.guessed, let when = event.start {
+                    let raw = abs(when.timeIntervalSince(game.start)).truncatingRemainder(dividingBy: 86_400)
+                    guard min(raw, 86_400 - raw) <= 75 * 60, abs(when.timeIntervalSince(game.start)) < 36 * 3600 else { continue }
+                } else {
+                    guard start != nil, gap <= 3 * 3600 else { continue }
+                }
+                if bestOther.map({ gap < $0.gap }) ?? true { bestOther = (index, gap) }
             }
-            if best.map({ gap < $0.gap }) ?? true { best = (index, gap) }
         }
-        return best?.index
+        // A NASCAR feed in a mixed "F1 / NASCAR" group goes to its race.
+        return bestOther?.index ?? best?.index
     }
 
     /// A studio show (pregame, countdown, kickoff show, weigh-ins…) rather

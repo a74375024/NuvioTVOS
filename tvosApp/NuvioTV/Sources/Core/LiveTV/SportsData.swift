@@ -180,7 +180,9 @@ final class SportsData: ObservableObject {
         guard prefs.configured else { return leagues.filter(\.standard) + racingLeagues + (tennisSeen ? tennisLeagues : []) }
         let picked = Set(prefs.leagues)
         return leagues.filter { picked.contains($0.short) } + (picked.contains("S:Fighting") ? fightLeagues : [])
-            + (picked.contains("S:Motorsport") || racingSeen ? racingLeagues : [])
+            + racingLeagues.filter { league in
+                picked.contains("S:Motorsport") || (league.short == "F1" ? racingSeen : nascarSeen)
+            }
             + (picked.contains("S:Tennis") || tennisSeen ? tennisLeagues : [])
     }
 
@@ -188,6 +190,13 @@ final class SportsData: ObservableObject {
 
     private static let racingSeenKey = "nuvio.tv.livetv.racingSeen"
     private static let tennisSeenKey = "nuvio.tv.livetv.tennisSeen"
+    private static let nascarSeenKey = "nuvio.tv.livetv.nascarSeen"
+
+    /// NASCAR feeds were in your channels in the last two weeks.
+    static var nascarSeen: Bool {
+        guard let seen = UserDefaults.standard.object(forKey: nascarSeenKey) as? Date else { return false }
+        return Date().timeIntervalSince(seen) < 14 * 86_400
+    }
 
     /// Tennis matches were in your channels' event feeds in the last two weeks.
     static var tennisSeen: Bool {
@@ -214,7 +223,6 @@ final class SportsData: ObservableObject {
         let found = events.contains { event in
             let title = event.title
             // Cheap test first; the pattern only for titles that might be F1.
-            if title.range(of: "nascar", options: .caseInsensitive) != nil { return true }
             guard title.range(of: "f1", options: .caseInsensitive) != nil
                     || title.range(of: "formula", options: .caseInsensitive) != nil else { return false }
             return title.range(of: "formula 1", options: .caseInsensitive) != nil
@@ -222,7 +230,12 @@ final class SportsData: ObservableObject {
         }
         // Tennis: matches between two players among the event feeds.
         let tennis = events.contains { $0.league == "Tennis" && SportsMatcher.looksLikeGame($0.title) }
+        let nascar = events.contains { $0.title.range(of: "nascar", options: .caseInsensitive) != nil }
         var changed = false
+        if nascar {
+            changed = changed || !Self.nascarSeen
+            UserDefaults.standard.set(now, forKey: Self.nascarSeenKey)
+        }
         if found {
             changed = changed || !Self.racingSeen
             UserDefaults.standard.set(now, forKey: Self.racingSeenKey)
@@ -1501,7 +1514,7 @@ extension SportsParse {
                 let type = competition["type"] as? [String: Any]
                 let typeText = text(type?["abbreviation"]) ?? text(type?["text"]) ?? ""
                 // A weekend listed as its race alone (NASCAR): the race.
-                let kind = typeText.isEmpty && competitions.count == 1 ? "race" : RaceSession.kind(typeText)
+                let kind = competitions.count == 1 && (typeText.isEmpty || league.short != "F1") ? "race" : RaceSession.kind(typeText)
                 let status = (competition["status"] as? [String: Any])?["type"] as? [String: Any]
                 let state = text(status?["state"])?.lowercased()
                 var game = SportsGame(
