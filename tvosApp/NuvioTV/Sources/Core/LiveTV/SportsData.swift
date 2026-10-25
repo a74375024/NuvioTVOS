@@ -163,7 +163,37 @@ final class SportsData: ObservableObject {
         guard prefs.configured else { return leagues.filter(\.standard) + racingLeagues }
         let picked = Set(prefs.leagues)
         return leagues.filter { picked.contains($0.short) } + (picked.contains("S:Fighting") ? fightLeagues : [])
-            + (picked.contains("S:Motorsport") ? racingLeagues : [])
+            + (picked.contains("S:Motorsport") || racingSeen ? racingLeagues : [])
+    }
+
+    // MARK: F1 when your channels have it
+
+    private static let racingSeenKey = "nuvio.tv.livetv.racingSeen"
+    private static var racingChecked: Date?
+
+    /// F1 feeds were in your channels in the last two weeks: the F1
+    /// schedule is looked up even when Racing isn't picked in My Sports
+    /// (one request a day).
+    static var racingSeen: Bool {
+        guard let seen = UserDefaults.standard.object(forKey: racingSeenKey) as? Date else { return false }
+        return Date().timeIntervalSince(seen) < 14 * 86_400
+    }
+
+    /// Live Events opened: look for F1 feeds among the event titles (at
+    /// most every 6 hours). Newly found: the F1 schedule is fetched.
+    func noteRacingFeeds(_ events: [LiveEvent]) {
+        let now = Date()
+        if let checked = Self.racingChecked, now.timeIntervalSince(checked) < 6 * 3600 { return }
+        Self.racingChecked = now
+        let found = events.contains { event in
+            let title = event.title
+            return title.range(of: "formula 1", options: .caseInsensitive) != nil
+                || title.range(of: "\\bF1(TV)?\\b", options: [.regularExpression, .caseInsensitive]) != nil
+        }
+        guard found else { return }
+        let wasSeen = Self.racingSeen
+        UserDefaults.standard.set(now, forKey: Self.racingSeenKey)
+        if !wasSeen { leaguesChanged() }
     }
 
     static let enabledKey = "nuvio.tv.livetv.gameSchedule"
@@ -342,7 +372,10 @@ final class SportsData: ObservableObject {
 
     private func publish() {
         if Self.isEnabled {
-            let cutoff = Date().addingTimeInterval(-12 * 3600)
+            // Finished games stay a day and a half: a leftover feed naming
+            // one ("Texas A&M @ Alabama 330PM" the day after) matches it and
+            // is hidden instead of looking like today's game.
+            let cutoff = Date().addingTimeInterval(-36 * 3600)
             let active = Set(Self.activeLeagues.map(\.short))
             games = Self.keeping(saved.games, after: cutoff).filter { active.contains($0.leagueShort) }.sorted { $0.start < $1.start }
             updatedAt = saved.fetchedAt
@@ -422,7 +455,7 @@ final class SportsData: ObservableObject {
         let now = Date()
         networkTrouble = false
         let calendar = Calendar.current
-        let from = calendar.date(byAdding: .day, value: -1, to: now) ?? now
+        let from = calendar.date(byAdding: .day, value: -2, to: now) ?? now
         let to = calendar.date(byAdding: .day, value: 8, to: now) ?? now
         // Date ranges stopped working (HTTP 400) in Sept 2026; a whole month,
         // a week number or a single day still do.

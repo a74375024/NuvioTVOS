@@ -80,7 +80,13 @@ struct LiveCameraPanel: View {
         .ignoresSafeArea()
         .onAppear {
             // Drivers, once a weekend (nothing when they're already saved).
-            if isF1 { race.refreshIfNeeded(sessions: [], results: false) }
+            // Drivers, once a weekend (F1) or week (NASCAR); nothing when saved.
+            let f1 = isF1
+            if f1 { race.refreshIfNeeded(sessions: [], results: false) } else { race.refreshNascarIfNeeded() }
+            let all = feeds
+            let photos = all.filter { $0.kind == .driver && driverInfo($0, f1: f1)?.headshot != nil }.count
+            CrashRecorder.note("cameras: open, \(all.count) feeds, \(all.filter { $0.kind == .driver }.count) drivers, "
+                               + "\(photos) with photos (\(f1 ? "F1" : "NASCAR"))")
             let current = store.playingFeedID
             let target = feeds.first { $0.channel.id == current || $0.alternates.contains { $0.id == current } }?.id
                 ?? quickList.first?.id ?? driverList.first?.id
@@ -90,6 +96,12 @@ struct LiveCameraPanel: View {
     }
 
     private var isF1: Bool { store.watchingEvent.map(SpecialFeeds.isF1) ?? false }
+
+    /// Photo, number and color for a driver's camera.
+    private func driverInfo(_ feed: CameraFeed, f1: Bool) -> RaceDriver? {
+        guard feed.kind == .driver else { return nil }
+        return f1 ? race.driver(named: feed.title) : race.nascarDriver(named: feed.title)
+    }
 
     private func isOnScreen(_ feed: CameraFeed) -> Bool {
         guard let current = store.playingFeedID else { return false }
@@ -121,10 +133,11 @@ struct LiveCameraPanel: View {
 
     private func driverButton(_ feed: CameraFeed) -> some View {
         let focused = focus == feed.id
-        let info = isF1 ? race.driver(named: feed.title) : nil
+        let info = driverInfo(feed, f1: isF1)
         let color = Self.color(info?.color ?? SpecialFeeds.teamColor(feed.team)) ?? Color.white.opacity(0.4)
         let isFollowed = followed.contains(feed.title)
-        let detail = info.map { "\(feed.detail) · #\($0.number)" } ?? feed.detail
+        // NASCAR feeds already say "No. 5"; F1 adds the number to the team.
+        let detail = feed.number == nil ? (info.map { "\(feed.detail) · #\($0.number)" } ?? feed.detail) : feed.detail
         return Button {
             store.watchCamera(feed)
         } label: {

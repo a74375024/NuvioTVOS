@@ -16,6 +16,8 @@ struct CameraFeed: Identifiable, Equatable {
     let team: String?
     /// Other channels carrying the same camera (automatic backups).
     var alternates: [LiveTVChannel] = []
+    /// The car number (NASCAR in-car feeds).
+    var number: Int? = nil
     var id: String { channel.id }
 }
 
@@ -67,6 +69,20 @@ enum SpecialFeeds {
         let lower = name.lowercased()
         return lower.contains("f1 cam") || lower.contains("f1 tv cam") || lower.contains("driver cam")
             || (lower.contains("multiview") && (lower.contains("nascar") || lower.contains("driver")))
+            || carCamera(lower) != nil
+    }
+
+    /// An in-car camera named by car: "YellaWood 500: No. 5 Kyle Larson
+    /// (10.25 1:45PM ET)" → (5, "Kyle Larson"). Cheap test first.
+    static func carCamera(_ title: String) -> (number: Int, driver: String)? {
+        // Not a ranked game ("No. 5 Texas vs No. 8 Ohio State").
+        guard title.range(of: ": no", options: .caseInsensitive) != nil, !SportsMatcher.looksLikeGame(title),
+              let range = title.range(of: ": ?No\\.? ?[0-9]{1,3} ", options: [.regularExpression, .caseInsensitive]) else { return nil }
+        let number = Int(title[range].filter(\.isNumber)) ?? 0
+        let rest = title[range.upperBound...]
+        let name = (rest.components(separatedBy: "(").first ?? String(rest)).trimmingCharacters(in: .whitespaces)
+        guard number > 0, name.count >= 3, name.contains(" ") else { return nil }
+        return (number, name)
     }
 
     /// 2026 teams, longest names first (so "Red Bull Racing" wins over "Red Bull").
@@ -89,7 +105,10 @@ enum SpecialFeeds {
 
     static func isNASCAR(_ event: SportsEvent) -> Bool {
         let text = (event.title + " " + event.league).lowercased()
-        return text.contains("nascar") || text.contains("cup series") || text.contains("xfinity") || text.contains("truck series")
+        if text.contains("nascar") || text.contains("cup series") || text.contains("xfinity") || text.contains("truck series") { return true }
+        // A race named only by its sponsor ("YellaWood 500"): its cameras
+        // still have to share its name to be found.
+        return event.league == "Motorsport" && !isF1(event)
     }
 
     private static let stopWords: Set<String> = [
@@ -172,7 +191,11 @@ enum SpecialFeeds {
             let title = channel.name.components(separatedBy: "|").last ?? channel.name
             let lower = title.lowercased()
             guard !words(title).isDisjoint(with: key) else { continue }
-            if lower.contains("multiview") {
+            if let car = carCamera(title) {
+                // "YellaWood 500: No. 5 Kyle Larson" (HBO's in-car feeds).
+                result.append(CameraFeed(channel: channel, title: car.driver, detail: "No. \(car.number)", kind: .driver,
+                                         team: nil, number: car.number))
+            } else if lower.contains("multiview") {
                 // "YellaWood 500: NASCAR Chase Leaders Multiview (10.25 1:40PM ET)" → "Chase Leaders Multiview".
                 let bare = title.components(separatedBy: "(").first ?? title
                 var label = (bare.components(separatedBy: ":").last ?? bare).trimmingCharacters(in: .whitespaces)
@@ -189,7 +212,9 @@ enum SpecialFeeds {
                                          kind: .driver, team: nil))
             }
         }
-        return sorted(result)
+        // Drivers by car number.
+        let drivers = result.filter { $0.kind == .driver }.sorted { ($0.number ?? 999) < ($1.number ?? 999) }
+        return sorted(result.filter { $0.kind != .driver } + drivers)
     }
 
     /// One entry per camera (the same driver on several feeds keeps the

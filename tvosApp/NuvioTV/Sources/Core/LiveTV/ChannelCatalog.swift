@@ -1023,20 +1023,27 @@ enum ChannelCatalog {
         } else if let (_, r) = groups("\\b[A-Za-z]{3}[a-z]*\\.? \\d{1,2},? \\d{1,2}:\\d{2}\\s*(AM|PM)(?:\\s*ET)?") {
             title.removeSubrange(r)
         }
-        // "12PM" / "730PM" / "7:30 PM ET" / "8.30 PM ET" → today (Eastern)
+        // "12PM" / "730PM" / "7:30 PM ET" / "8.30 PM ET" → that day when the
+        // title names one ("02:00PM UFC 333 … (OCT 24)"), else today (Eastern).
         if start == nil, let (p, r) = groups("\\b(\\d{1,2})(?:[:.]?(\\d{2}))?\\s*(AM|PM)(?:\\s*ET)?\\b") {
+            title.removeSubrange(r)
             if let h = Int(p[0]) {
                 let mi = Int(p[1]) ?? 0
                 let zone = zoneOf(r)
-                var cal = Calendar(identifier: .gregorian)
-                cal.timeZone = zone
-                let today = cal.dateComponents([.year, .month, .day], from: now)
-                if let y = today.year, let mo = today.month, let d = today.day {
-                    start = date(y, mo, d, hour24(h, p[2]), mi, zone)
-                    guessed = start != nil
+                if let (dp, dr) = groups("\\(?\\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|sep(?:t|tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\\.?\\s+(\\d{1,2})\\b\\)?"),
+                   let mo = months[String(dp[0].lowercased().prefix(3))], let d = Int(dp[1]), d >= 1, d <= 31 {
+                    start = nearestYear(mo, d, hour24(h, p[2]), mi, zone)
+                    title.removeSubrange(dr)
+                } else {
+                    var cal = Calendar(identifier: .gregorian)
+                    cal.timeZone = zone
+                    let today = cal.dateComponents([.year, .month, .day], from: now)
+                    if let y = today.year, let mo = today.month, let d = today.day {
+                        start = date(y, mo, d, hour24(h, p[2]), mi, zone)
+                        guessed = start != nil
+                    }
                 }
             }
-            title.removeSubrange(r)
         }
 
         // Tidy: drop a trailing "(X)" that repeats the title, leading "ESPN+:"

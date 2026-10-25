@@ -227,6 +227,8 @@ enum SportsMatcher {
         /// Two teams of a complete league with no game between them.
         var stale = 0
         var guessedMatched = 0
+        /// Plain feeds merged into another tile with the same title and time.
+        var mergedPlain = 0
         var venueListings = 0
         var describedListings = 0
         var trimmedStations = 0
@@ -239,7 +241,7 @@ enum SportsMatcher {
         var summary: String {
             let steps = milliseconds.sorted { $0.key < $1.key }.map { "\($0.key) \($0.value)" }.joined(separator: ", ")
             return "games \(games), events \(events) → \(filtered) game-like, \(matchedEvents) matched, "
-                + "\(guessedMatched) by day, \(replays) replays and \(stale) stale hidden, "
+                + "\(guessedMatched) by day, \(replays) replays and \(stale) stale hidden, \(mergedPlain) duplicate feeds merged, "
                 + "listings \(listings) → \(matchedListings) matched (\(venueListings) by venue, \(describedListings) by description), "
                 + "\(trimmedStations) extra stations folded, school pairs \(schoolPairs), name pairs \(namePairs), fight feeds \(fightFeeds)"
                 + (offsets.isEmpty ? "" : ", offsets " + offsets.joined(separator: "; "))
@@ -553,11 +555,28 @@ enum SportsMatcher {
         // Prelims" in English, Spanish and from another provider).
         var plainTiles: [SportsEvent] = []
         var byCard: [String: [Int]] = [:]
+        // The same feed title from several channel groups ("HBO 05" and
+        // "HBO 07"), at the same time: one tile with every feed.
+        var byTitle: [String: [Int]] = [:]
+        func sameTime(_ a: Date?, _ b: Date?) -> Bool {
+            guard let a, let b else { return a == nil && b == nil }
+            return abs(a.timeIntervalSince(b)) <= 10 * 60
+        }
         for original in plain {
             autoreleasepool {
                 let event = corrected(original)
                 guard event.league == "Fighting", let key = fightKey(event.title), !key.number.isEmpty else {
+                    let titleKey = normalized(event.title) + "|" + event.league
+                    if let index = byTitle[titleKey]?.first(where: { sameTime(plainTiles[$0].start, event.start) }) {
+                        for feed in event.feeds where !plainTiles[index].sources.contains(where: { $0.channelID == feed }) {
+                            plainTiles[index].sources.append(EventSource(channelID: feed, kind: .provider, spanish: event.spanish,
+                                                                         detail: "Provider event channel"))
+                        }
+                        stats.mergedPlain += 1
+                        return
+                    }
                     plainTiles.append(plainEvent(event))
+                    byTitle[titleKey, default: []].append(plainTiles.count - 1)
                     return
                 }
                 let cardID = "\(key.org)|\(key.number)|\(key.part ?? "")"
@@ -1094,7 +1113,8 @@ enum SportsMatcher {
         " game day ", " sportscenter ", " nfl today ", " inside the nfl ", " good morning football ", " first take ",
         " get up ", " nfl live ", " warm up ", " warmup ", " weigh in ", " weigh ins ", " media day ", " embedded ",
         " studio ", " fantasy ", " the herd ", " pti ", " pre race ", " post race ", " build up ", " buildup ",
-        " notebook ", " paddock ", " race show ", " pre show ", " post show "
+        " notebook ", " paddock ", " race show ", " pre show ", " post show ", " prerace ", " postrace ", " post fight ",
+        " pre fight ", " fight conference ", " qualifying replay "
     ]
 
     /// Studio and highlight shows around a game, not the game itself.

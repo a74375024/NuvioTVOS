@@ -523,8 +523,8 @@ final class LiveEventsModel: ObservableObject {
 
     /// A provider feed that's one driver's camera (it lives in its race's cameras panel).
     private static func isCameraFeed(_ event: SportsEvent) -> Bool {
-        let lower = event.title.lowercased()
-        return lower.contains("driver cam") || lower.contains("f1 cam") || lower.contains("f1 tv cam")
+        // F1 and NASCAR cameras, in-car feeds by car ("No. 5 Kyle Larson") and race multiviews.
+        event.game == nil && SpecialFeeds.isCameraName(event.title)
     }
 
     private static let eastern: Calendar = {
@@ -1870,6 +1870,7 @@ struct LiveEventsBoard: View {
         .onAppear {
             CrashRecorder.note("events: open, \(store.sportsEvents.count) events, \(CrashRecorder.memoryMB()) MB")
             model.start()
+            SportsData.shared.noteRacingFeeds(store.events)
             SportsData.shared.refreshIfNeeded()
             store.sportsOpened()
             onFirstOpen()

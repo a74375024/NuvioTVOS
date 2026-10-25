@@ -110,6 +110,9 @@ final class RaceData: ObservableObject {
         guard task == nil, now >= nextAllowed else { return }
         let plan = due(sessions: sessions, results: results, now: now)
         guard plan.sessions || plan.drivers || !plan.results.isEmpty else { return }
+        CrashRecorder.note("race data: asking for " + [plan.sessions ? "sessions" : nil, plan.drivers ? "drivers" : nil,
+                                                      plan.results.isEmpty ? nil : "\(plan.results.count) results"]
+            .compactMap { $0 }.joined(separator: ", "))
         task = Task { [weak self] in
             await self?.run(plan)
             self?.task = nil
@@ -283,6 +286,107 @@ final class RaceData: ObservableObject {
         return RaceDriver(number: number, code: item["name_acronym"] as? String ?? String(last.prefix(3)).uppercased(),
                           name: name, team: item["team_name"] as? String ?? "", color: color,
                           headshot: item["headshot_url"] as? String)
+    }
+
+    // MARK: NASCAR drivers
+    //
+    // Photos and car numbers for the cameras panel's in-car feeds, from
+    // NASCAR's driver list: fetched at most once a week (6 hours after a
+    // failure), only when a NASCAR race's cameras panel opens.
+
+    private struct NascarSaved: Codable {
+        var drivers: [RaceDriver] = []
+        var fetchedAt: Date?
+    }
+    private var nascarSaved: NascarSaved?
+    private var nascarByName: [String: RaceDriver] = [:]
+    private var nascarTask: Task<Void, Never>?
+    private var nascarNextAllowed = Date.distantPast
+    private var nascarFile: URL { file.deletingLastPathComponent().appendingPathComponent("nascar-drivers.json") }
+
+    /// A NASCAR driver by an in-car feed's name ("Kyle Larson").
+    func nascarDriver(named name: String) -> RaceDriver? {
+        loadNascar()
+        return nascarByName[Self.fold(Self.bareName(name))]
+    }
+
+    /// The cameras panel opened on a NASCAR race: the driver list if it's
+    /// missing or a week old.
+    func refreshNascarIfNeeded() {
+        loadNascar()
+        let now = Date()
+        guard nascarTask == nil, now >= nascarNextAllowed else { return }
+        if let fetched = nascarSaved?.fetchedAt, now.timeIntervalSince(fetched) < 7 * 86_400, !(nascarSaved?.drivers.isEmpty ?? true) { return }
+        CrashRecorder.note("race data: asking for NASCAR drivers")
+        nascarTask = Task { [weak self] in
+            guard let self else { return }
+            var drivers: [RaceDriver] = []
+            if let url = URL(string: "https://cf.nascar.com/cacher/drivers.json") {
+                var request = URLRequest(url: url)
+                request.timeoutInterval = 20
+                if let result = try? await URLSession.shared.data(for: request),
+                   (result.1 as? HTTPURLResponse)?.statusCode == 200 {
+                    let data = result.0
+                    drivers = await Task.detached(priority: .utility) { Self.parseNascar(data) }.value
+                }
+            }
+            if drivers.isEmpty {
+                self.nascarNextAllowed = Date().addingTimeInterval(6 * 3600)
+            } else {
+                self.nascarSaved = NascarSaved(drivers: drivers, fetchedAt: Date())
+                self.rebuildNascarNames()
+                if let data = try? JSONEncoder().encode(self.nascarSaved) { try? data.write(to: self.nascarFile, options: .atomic) }
+                self.revision &+= 1
+            }
+            CrashRecorder.note("race data: NASCAR \(drivers.count) drivers with photos\(drivers.isEmpty ? ", failed" : "")")
+            self.nascarTask = nil
+        }
+    }
+
+    private func loadNascar() {
+        guard nascarSaved == nil else { return }
+        if let data = try? Data(contentsOf: nascarFile), let value = try? JSONDecoder().decode(NascarSaved.self, from: data) {
+            nascarSaved = value
+        } else {
+            nascarSaved = NascarSaved()
+        }
+        rebuildNascarNames()
+    }
+
+    private func rebuildNascarNames() {
+        var names: [String: RaceDriver] = [:]
+        for driver in nascarSaved?.drivers ?? [] where names[Self.fold(driver.name)] == nil {
+            names[Self.fold(driver.name)] = driver
+        }
+        nascarByName = names
+    }
+
+    /// "Sammy Smith (C)" → "Sammy Smith".
+    nonisolated private static func bareName(_ name: String) -> String {
+        (name.components(separatedBy: "(").first ?? name).trimmingCharacters(in: .whitespaces)
+    }
+
+    /// Drivers with a real photo, Cup Series first (the same name can be in
+    /// several series).
+    nonisolated private static func parseNascar(_ data: Data) -> [RaceDriver] {
+        let root = autoreleasepool { (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] }
+        let items = (root?["response"] as? [[String: Any]]) ?? []
+        var cup: [RaceDriver] = []
+        var other: [RaceDriver] = []
+        for item in items {
+            let name = bareName(item["Full_Name"] as? String ?? "")
+            guard name.contains(" ") else { continue }
+            let small = item["Image_Small"] as? String
+            let large = item["Image"] as? String
+            guard let photo = [small, large].compactMap({ $0 }).first(where: { url in
+                url.hasPrefix("https://") && !url.contains("default.png") && !url.lowercased().contains("silhouette")
+            }) else { continue }
+            let badge = (item["Badge"] as? String) ?? int(item["Badge"]).map(String.init) ?? ""
+            let driver = RaceDriver(number: Int(badge) ?? 0, code: badge, name: name, team: item["Team"] as? String ?? "",
+                                    color: nil, headshot: photo)
+            if (item["Driver_Series"] as? String) == "nascar-cup-series" { cup.append(driver) } else { other.append(driver) }
+        }
+        return cup + other
     }
 
     // MARK: Storage
